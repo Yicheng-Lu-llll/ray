@@ -17,7 +17,7 @@ from ray._private.test_utils import (
     find_free_port,
     generate_system_config_map,
 )
-from ray._common.network_utils import parse_address
+from ray._raylet import parse_address
 import ray._private.ray_constants as ray_constants
 
 # Import asyncio timeout depends on python version

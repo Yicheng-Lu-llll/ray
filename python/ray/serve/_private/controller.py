@@ -6,9 +6,8 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import ray
-from ray._common.network_utils import build_address
 from ray._common.utils import run_background_task
-from ray._raylet import GcsClient
+from ray._raylet import GcsClient, build_address
 from ray.actor import ActorHandle
 from ray.serve._private.application_state import ApplicationStateManager, StatusOverview
 from ray.serve._private.autoscaling_state import AutoscalingStateManager
@@ -659,6 +658,9 @@ class ServeController:
             if SERVE_ROOT_URL_ENV_KEY in os.environ:
                 return os.environ[SERVE_ROOT_URL_ENV_KEY]
             else:
+                # HTTP is disabled
+                if http_config.host is None:
+                    return ""
                 return (
                     f"http://{build_address(http_config.host, http_config.port)}"
                     f"{http_config.root_path}"

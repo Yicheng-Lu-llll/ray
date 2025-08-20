@@ -21,7 +21,7 @@ from ray._private.test_utils import (
     run_string_as_driver,
     kill_raylet,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.cluster_utils import Cluster, cluster_not_supported
 from ray.core.generated import (
     gcs_service_pb2,

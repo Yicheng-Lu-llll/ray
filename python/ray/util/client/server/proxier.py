@@ -28,7 +28,7 @@ from ray._private.runtime_env.context import RuntimeEnvContext
 from ray._private.services import ProcessInfo, start_ray_client_server
 from ray._private.tls_utils import add_port_to_grpc_server
 from ray._private.utils import detect_fate_sharing_support
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.cloudpickle.compat import pickle
 from ray.job_config import JobConfig
 from ray.util.client.common import (

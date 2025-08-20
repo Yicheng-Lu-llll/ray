@@ -17,7 +17,7 @@ from ray._private.ray_constants import (
     KV_NAMESPACE_JOB,
     RAY_ADDRESS_ENVIRONMENT_VARIABLE,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray._common.test_utils import (
     async_wait_for_condition,
 )

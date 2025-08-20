@@ -18,7 +18,7 @@ from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 import ray._private.gcs_utils as gcs_utils
 from ray._private import ray_constants
-from ray._common.network_utils import parse_address
+from ray._raylet import parse_address
 from ray._private.test_utils import (
     convert_actor_state,
     external_redis_test_enabled,

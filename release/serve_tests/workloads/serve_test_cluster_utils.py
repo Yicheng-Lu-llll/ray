@@ -5,7 +5,7 @@ import ray
 import requests
 from ray._private.test_utils import monitor_memory_usage
 from ray.cluster_utils import Cluster
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 from ray import serve
 from ray.serve.config import DeploymentMode

@@ -9,7 +9,7 @@ import yaml
 
 import ray._private.services as services
 from ray._private.thirdparty.tabulate.tabulate import tabulate
-from ray._common.network_utils import parse_address
+from ray._raylet import parse_address
 from ray.util.state import (
     StateApiClient,
     get_log,

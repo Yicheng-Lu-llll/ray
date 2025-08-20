@@ -6,9 +6,8 @@ import ray._private.profiling as profiling
 import ray._private.services as services
 import ray._private.utils as utils
 import ray._private.worker
-from ray._common.network_utils import build_address
 from ray._private.state import GlobalState
-from ray._raylet import GcsClientOptions
+from ray._raylet import GcsClientOptions, build_address
 from ray.core.generated import common_pb2
 
 __all__ = ["free", "global_gc"]

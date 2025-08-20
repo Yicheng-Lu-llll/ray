@@ -1,5 +1,11 @@
+from ray.includes.network_util cimport (
+    BuildAddress,
+    ParseAddress,
+    array_string_2,
+    optional,
+)
+from libcpp.string cimport string
 from typing import Optional, Tuple, Union
-
 
 def parse_address(address: str) -> Optional[Tuple[str, str]]:
     """Parse a network address string into host and port.
@@ -10,21 +16,12 @@ def parse_address(address: str) -> Optional[Tuple[str, str]]:
     Returns:
         Tuple with (host, port) if port found, None if no colon separator.
     """
-    pos = address.rfind(":")
-    if pos == -1:
+    cdef optional[array_string_2] res = ParseAddress(address.encode('utf-8'))
+    if not res.has_value():
         return None
 
-    host = address[:pos]
-    port = address[pos + 1 :]
-
-    if ":" in host:
-        if host.startswith("[") and host.endswith("]"):
-            host = host[1:-1]
-        else:
-            # Invalid IPv6 (missing brackets) or colon is part of the address, not a host:port split.
-            return None
-
-    return (host, port)
+    cdef array_string_2 ip_port = res.value()
+    return (ip_port[0].decode('utf-8'), ip_port[1].decode('utf-8'))
 
 
 def build_address(host: str, port: Union[int, str]) -> str:
@@ -37,8 +34,14 @@ def build_address(host: str, port: Union[int, str]) -> str:
     Returns:
         Formatted address string (e.g., "localhost:8000" or "[::1]:8000").
     """
-    if host is not None and ":" in host:
-        # IPv6 address
-        return f"[{host}]:{port}"
-    # IPv4 address or hostname
-    return f"{host}:{port}"
+    cdef string host_c = host.encode('utf-8')
+    cdef string result
+    cdef string port_c
+
+    if isinstance(port, int):
+        result = BuildAddress(host_c, <int>port)
+    else:
+        port_c = str(port).encode('utf-8')
+        result = BuildAddress(host_c, port_c)
+
+    return result.decode('utf-8')

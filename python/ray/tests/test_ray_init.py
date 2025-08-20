@@ -7,7 +7,7 @@ import signal
 import subprocess
 import tempfile
 from pathlib import Path
-from ray._common.network_utils import parse_address, build_address
+from ray._raylet import parse_address, build_address
 
 import grpc
 import pytest

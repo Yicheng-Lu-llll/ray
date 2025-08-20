@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple, Type
 
 import ray
 from ray import ObjectRef
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.actor import ActorHandle
 from ray.exceptions import GetTimeoutError, RayActorError
 from ray.serve._private.cluster_node_info_cache import ClusterNodeInfoCache

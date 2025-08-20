@@ -25,7 +25,7 @@ from ray._private.test_utils import (
     run_string_as_driver_nonblocking,
     wait_until_server_available,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.dashboard.modules.job.common import (
     JOB_ACTOR_NAME_TEMPLATE,
     SUPERVISOR_ACTOR_RAY_NAMESPACE,

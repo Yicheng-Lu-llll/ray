@@ -13,7 +13,7 @@ import pytest
 import ray
 from ray._common.test_utils import wait_for_condition
 import ray.core.generated.ray_client_pb2 as ray_client_pb2
-from ray._common.network_utils import parse_address
+from ray._raylet import parse_address
 import ray.util.client.server.proxier as proxier
 from ray._private.ray_constants import REDIS_DEFAULT_PASSWORD
 from ray._private.test_utils import run_string_as_driver

@@ -184,6 +184,11 @@ from ray.includes.optional cimport (
     optional, nullopt
 )
 
+cimport cpython
+
+# Include network utilities before importing ray.exceptions to avoid circular imports
+include "includes/network_util.pxi"
+
 import ray
 from ray.exceptions import (
     RayActorError,
@@ -230,11 +235,8 @@ import ray._private.profiling as profiling
 from ray._common.utils import decode
 from ray._private.utils import DeferSigint
 from ray._private.object_ref_generator import DynamicObjectRefGenerator
-from ray._common.network_utils import build_address, parse_address
 from ray.util.annotations import PublicAPI
 from ray._private.custom_types import TensorTransportEnum
-
-cimport cpython
 
 include "includes/object_ref.pxi"
 include "includes/unique_ids.pxi"

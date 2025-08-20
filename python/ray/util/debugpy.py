@@ -5,7 +5,7 @@ import threading
 import importlib
 
 import ray
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.util.annotations import DeveloperAPI
 
 log = logging.getLogger(__name__)

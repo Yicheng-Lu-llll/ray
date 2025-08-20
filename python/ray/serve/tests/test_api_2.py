@@ -2,7 +2,7 @@ import pytest
 
 import ray
 from ray import serve
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.serve._private.common import RequestProtocol
 from ray.serve._private.test_utils import get_application_urls
 

@@ -15,7 +15,7 @@ from ray._private.test_utils import (
     check_spilled_mb,
     fetch_prometheus,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 MB = 1024 * 1024
 

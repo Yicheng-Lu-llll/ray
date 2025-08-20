@@ -11,7 +11,7 @@ import ray.dashboard.consts as dashboard_consts
 import ray.dashboard.utils as dashboard_utils
 from ray._common.utils import get_or_create_event_loop
 from ray._private import logging_utils
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray._private.process_watcher import create_check_raylet_task
 from ray._private.ray_constants import AGENT_GRPC_MAX_MESSAGE_LENGTH
 from ray._private.ray_logging import setup_component_logger

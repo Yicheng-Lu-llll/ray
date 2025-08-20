@@ -30,7 +30,7 @@ from ray._common.ray_constants import (
     LOGGING_ROTATE_BYTES,
     LOGGING_ROTATE_BACKUP_COUNT,
 )
-from ray._common.network_utils import build_address, parse_address
+from ray._raylet import build_address, parse_address
 from ray._private.ray_constants import (
     DEBUG_AUTOSCALING_ERROR,
     DEBUG_AUTOSCALING_STATUS_LEGACY,

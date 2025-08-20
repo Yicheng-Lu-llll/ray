@@ -27,7 +27,7 @@ import ray.dashboard.consts as dashboard_consts
 import ray._private.state as global_state
 import ray._private.ray_constants as ray_constants
 from ray._raylet import GcsClient, ActorID, JobID, TaskID
-from ray._common.network_utils import parse_address
+from ray._raylet import parse_address
 from ray._private.test_utils import (
     run_string_as_driver,
     find_free_port,

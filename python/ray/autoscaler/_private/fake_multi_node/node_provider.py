@@ -13,7 +13,7 @@ import yaml
 
 import ray
 import ray._private.ray_constants as ray_constants
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.autoscaler._private.fake_multi_node.command_runner import (
     FakeDockerCommandRunner,
 )

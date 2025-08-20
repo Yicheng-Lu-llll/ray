@@ -18,7 +18,7 @@ from enum import Enum
 
 
 import ray
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 import ray._private.utils
 import ray._common.usage.usage_lib as ray_usage_lib
 

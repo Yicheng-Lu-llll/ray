@@ -8,7 +8,7 @@ import time
 import pytest
 import requests
 
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 _proxy_bypass = {
     "http": None,

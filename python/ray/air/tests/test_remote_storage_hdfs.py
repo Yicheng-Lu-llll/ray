@@ -5,7 +5,7 @@ import os
 import pytest
 
 from ray import train
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.train.base_trainer import TrainingFailedError
 from ray.train.data_parallel_trainer import DataParallelTrainer
 from ray.train.tests.test_new_persistence import (

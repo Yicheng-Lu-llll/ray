@@ -11,7 +11,7 @@ import ray
 import ray._private.ray_constants as ray_constants
 import ray._private.utils
 from ray._private.ray_constants import DEBUG_AUTOSCALING_ERROR
-from ray._common.network_utils import parse_address
+from ray._raylet import parse_address
 from ray._private.test_utils import (
     get_error_message,
     get_log_batch,

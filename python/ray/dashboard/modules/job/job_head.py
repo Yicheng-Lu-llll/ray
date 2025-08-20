@@ -23,7 +23,7 @@ from ray._private.runtime_env.packaging import (
     pin_runtime_env_uri,
     upload_package_to_gcs,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.dashboard.consts import (
     DASHBOARD_AGENT_ADDR_NODE_ID_PREFIX,
     GCS_RPC_TIMEOUT_SECONDS,

@@ -21,10 +21,9 @@ from filelock import FileLock
 # Ray modules
 import ray
 import ray._private.ray_constants as ray_constants
-from ray._common.network_utils import build_address, parse_address
 from ray._private.ray_constants import RAY_NODE_IP_FILENAME
 from ray._private.resource_isolation_config import ResourceIsolationConfig
-from ray._raylet import GcsClient, GcsClientOptions
+from ray._raylet import GcsClient, GcsClientOptions, build_address, parse_address
 from ray.core.generated.common_pb2 import Language
 
 # Import psutil after ray so the packaged version is used.

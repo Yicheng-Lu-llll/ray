@@ -13,7 +13,7 @@ from ray.serve.schema import ProxyStatus
 from serve_test_cluster_utils import NUM_CPU_PER_NODE
 from subprocess import PIPE
 from typing import Dict, List, Optional, Union
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 logger = logging.getLogger(__file__)
 

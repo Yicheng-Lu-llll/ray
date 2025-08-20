@@ -13,7 +13,7 @@ import ray.dashboard.optional_utils as dashboard_optional_utils
 import ray.dashboard.utils as dashboard_utils
 from ray import ActorID, NodeID
 from ray._private.metrics_agent import PrometheusServiceDiscoveryWriter
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray._private.ray_constants import (
     DEBUG_AUTOSCALING_ERROR,
     DEBUG_AUTOSCALING_STATUS,

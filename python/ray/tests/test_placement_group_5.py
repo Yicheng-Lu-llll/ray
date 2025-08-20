@@ -15,7 +15,7 @@ from ray.util.state import list_actors, list_placement_groups
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray._private.runtime_env.plugin import RuntimeEnvPlugin
 from ray._private.test_utils import fetch_prometheus_metrics
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 import ray.scripts.scripts as scripts
 
 

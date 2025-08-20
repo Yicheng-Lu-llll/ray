@@ -11,7 +11,7 @@ import socket
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 from ray.autoscaler._private.local.node_provider import LocalNodeProvider
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)

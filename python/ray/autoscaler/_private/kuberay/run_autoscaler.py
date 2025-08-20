@@ -11,7 +11,7 @@ from ray._common.ray_constants import (
 )
 from ray._private.ray_logging import setup_component_logger
 from ray._private.services import get_node_ip_address
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray._common.utils import try_to_create_directory
 from ray._raylet import GcsClient
 from ray.autoscaler._private.kuberay.autoscaling_config import AutoscalingConfigProducer

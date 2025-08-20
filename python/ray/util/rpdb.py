@@ -3,7 +3,7 @@
 # (BSD 2-Clause "Simplified" License)
 
 import errno
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 import inspect
 import json
 import logging

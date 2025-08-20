@@ -8,7 +8,7 @@ import numpy as np
 import tensorflow as tf
 from typing import List, Tuple
 
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 CONFIG = {"lr": 1e-3, "batch_size": 64}
 VANILLA_RESULT_JSON = "/tmp/vanilla_out.json"

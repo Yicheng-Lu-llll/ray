@@ -34,13 +34,12 @@ from prometheus_client.core import (
 )
 
 import ray
-from ray._common.network_utils import build_address
 from ray._private.ray_constants import env_bool
 from ray._private.telemetry.metric_cardinality import (
     WORKER_ID_TAG_KEY,
     MetricCardinality,
 )
-from ray._raylet import GcsClient
+from ray._raylet import GcsClient, build_address
 from ray.core.generated.metrics_pb2 import Metric
 from ray.util.metrics import _is_invalid_metric_name
 

@@ -25,7 +25,7 @@ from ray.dashboard.modules.job.common import (
 )
 from ray.dashboard.modules.job.job_log_storage_client import JobLogStorageClient
 from ray.job_submission import JobStatus
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 import psutil
 

@@ -35,7 +35,7 @@ from ray._private.utils import (
     get_ray_client_dependency_error,
     parse_resources_json,
 )
-from ray._common.network_utils import parse_address, build_address
+from ray._raylet import parse_address, build_address
 from ray._private.internal_api import memory_summary
 from ray._common.usage import usage_lib
 import ray._common.usage.usage_constants as usage_constant

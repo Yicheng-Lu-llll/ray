@@ -11,7 +11,7 @@ from fairseq import options
 from fairseq_cli.train import main
 
 import ray
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 _original_save_checkpoint = fairseq.checkpoint_utils.save_checkpoint
 

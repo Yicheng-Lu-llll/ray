@@ -11,7 +11,7 @@ from ray._private.test_utils import (
     fetch_prometheus_metrics,
     wait_for_assertion,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray._private.telemetry.metric_cardinality import (
     WORKER_ID_TAG_KEY,
     TASK_OR_ACTOR_NAME_TAG_KEY,

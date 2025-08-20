@@ -38,7 +38,7 @@ from ray._private.test_utils import (
     raw_metrics,
     find_free_port,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.autoscaler._private.constants import AUTOSCALER_METRIC_PORT
 from ray.dashboard.consts import DASHBOARD_METRIC_PORT
 from ray.util.metrics import Counter, Gauge, Histogram, Metric

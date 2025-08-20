@@ -13,7 +13,7 @@ import pytest
 import ray
 from ray._common.test_utils import wait_for_condition
 from ray._private import ray_constants, services
-from ray._common.network_utils import parse_address
+from ray._raylet import parse_address
 from ray._private.test_utils import run_string_as_driver
 from ray.cluster_utils import Cluster, cluster_not_supported
 

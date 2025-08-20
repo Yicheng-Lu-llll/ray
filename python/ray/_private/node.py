@@ -22,7 +22,6 @@ from filelock import FileLock
 import ray
 import ray._private.ray_constants as ray_constants
 import ray._private.services
-from ray._common.network_utils import build_address, parse_address
 from ray._common.ray_constants import LOGGING_ROTATE_BACKUP_COUNT, LOGGING_ROTATE_BYTES
 from ray._common.utils import try_to_create_directory
 from ray._private.resource_and_label_spec import ResourceAndLabelSpec
@@ -34,7 +33,12 @@ from ray._private.utils import (
     try_to_symlink,
     validate_socket_filepath,
 )
-from ray._raylet import GcsClient, get_session_key_from_storage
+from ray._raylet import (
+    GcsClient,
+    build_address,
+    get_session_key_from_storage,
+    parse_address,
+)
 
 # Logger for this module. It should be configured at the entry point
 # into the program using Ray. Ray configures it by default automatically

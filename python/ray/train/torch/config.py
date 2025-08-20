@@ -9,7 +9,7 @@ import torch.distributed as dist
 from packaging.version import Version
 
 import ray
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.air._internal.device_manager import register_custom_torch_dist_backend
 from ray.train._internal.utils import get_address_and_port
 from ray.train._internal.worker_group import WorkerGroup

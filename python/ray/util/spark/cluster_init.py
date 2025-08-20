@@ -20,7 +20,7 @@ import ray._private.services
 from ray.autoscaler._private.spark.node_provider import HEAD_NODE_ID
 from ray.util.annotations import DeveloperAPI, PublicAPI
 from ray._common.utils import load_class
-from ray._common.network_utils import build_address, parse_address
+from ray._raylet import build_address, parse_address
 
 from .utils import (
     exec_cmd,

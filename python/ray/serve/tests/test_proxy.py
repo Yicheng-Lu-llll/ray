@@ -6,8 +6,8 @@ import pytest
 
 import ray
 from ray import serve
-from ray._common.network_utils import build_address
 from ray._common.test_utils import wait_for_condition
+from ray._raylet import build_address
 from ray.actor import ActorHandle
 from ray.serve._private.constants import (
     DEFAULT_UVICORN_KEEP_ALIVE_TIMEOUT_S,

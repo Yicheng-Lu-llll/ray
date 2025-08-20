@@ -5,7 +5,7 @@ from pytest_docker_tools import wrappers
 import subprocess
 import docker
 from typing import List
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 # If you need to debug tests using fixtures in this file,
 # comment in the volume

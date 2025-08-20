@@ -15,7 +15,7 @@ from starlette.requests import Request
 import ray
 import ray.util.state as state_api
 from ray import serve
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.actor import ActorHandle
 from ray.serve._private.client import ServeControllerClient
 from ray.serve._private.common import (

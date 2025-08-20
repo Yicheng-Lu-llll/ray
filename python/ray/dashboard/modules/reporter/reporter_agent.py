@@ -30,7 +30,7 @@ from ray._common.utils import (
     get_or_create_event_loop,
     get_user_temp_dir,
 )
-from ray._common.network_utils import parse_address
+from ray._raylet import parse_address
 from ray._private.utils import get_system_memory
 from ray.dashboard.modules.reporter.gpu_providers import (
     GpuMetricProvider,

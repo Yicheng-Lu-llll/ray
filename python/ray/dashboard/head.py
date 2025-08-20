@@ -24,7 +24,7 @@ from ray.dashboard.utils import (
     DashboardHeadModuleConfig,
     async_loop_forever,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 import psutil
 

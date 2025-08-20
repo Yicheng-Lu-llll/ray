@@ -90,7 +90,7 @@ from ray.rllib.utils.test_utils import (
     add_rllib_example_script_args,
     run_rllib_example_script_experiment,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 parser = add_rllib_example_script_args()
 parser.set_defaults(

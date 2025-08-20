@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import List
 
 import ray
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.train._internal.utils import get_address_and_port
 from ray.train._internal.worker_group import WorkerGroup
 from ray.train.backend import Backend, BackendConfig

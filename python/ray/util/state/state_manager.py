@@ -54,7 +54,7 @@ from ray.util.state.common import (
     SupportedFilterType,
 )
 from ray.util.state.exception import DataSourceUnavailable
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 logger = logging.getLogger(__name__)
 

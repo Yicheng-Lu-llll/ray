@@ -7,7 +7,7 @@ import signal
 import subprocess as sp
 import time
 
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 _proxy_bypass = {
     "http": None,

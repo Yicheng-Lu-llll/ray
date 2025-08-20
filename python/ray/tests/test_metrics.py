@@ -12,7 +12,7 @@ from ray._private.test_utils import (
     wait_until_succeeded_without_exception,
     get_node_stats,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.core.generated import common_pb2
 
 _WIN32 = os.name == "nt"

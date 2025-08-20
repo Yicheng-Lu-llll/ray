@@ -11,7 +11,7 @@ import logging
 from collections import defaultdict
 from ray.util.state import list_nodes
 from ray._private.test_utils import fetch_prometheus_metrics
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from pydantic import BaseModel
 from ray.dashboard.consts import DASHBOARD_METRIC_PORT

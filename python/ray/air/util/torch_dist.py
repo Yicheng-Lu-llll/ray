@@ -18,7 +18,7 @@ import ray
 from ray.actor import ActorHandle
 from ray.air._internal.torch_utils import get_devices
 from ray.train._internal.utils import get_address_and_port
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 
 class TorchDistributedWorker(ABC):

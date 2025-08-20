@@ -10,7 +10,7 @@ from ray._private.test_utils import (
     fetch_prometheus_metrics,
     run_string_as_driver_nonblocking,
 )
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 
 
 METRIC_CONFIG = {

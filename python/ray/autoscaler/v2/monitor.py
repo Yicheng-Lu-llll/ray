@@ -22,7 +22,7 @@ from ray._private.ray_logging import setup_component_logger
 from ray._common.usage.usage_lib import record_extra_usage_tag
 from ray._private.worker import SCRIPT_MODE
 from ray._raylet import GcsClient
-from ray._common.network_utils import parse_address, build_address
+from ray._raylet import parse_address, build_address
 from ray.autoscaler._private.constants import (
     AUTOSCALER_METRIC_PORT,
     AUTOSCALER_UPDATE_INTERVAL_S,

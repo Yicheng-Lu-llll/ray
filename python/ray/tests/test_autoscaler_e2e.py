@@ -5,7 +5,7 @@ import pytest
 
 import ray
 from ray.autoscaler._private.constants import AUTOSCALER_METRIC_PORT
-from ray._common.network_utils import build_address
+from ray._raylet import build_address
 from ray._private.test_utils import (
     get_metric_check_condition,
     MetricSamplePattern,

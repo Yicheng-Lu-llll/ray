@@ -127,6 +127,11 @@ TEST(NetworkUtilTest, TestIsIPv6) {
   EXPECT_FALSE(IsIPv6(""));
   EXPECT_FALSE(IsIPv6("not-an-ip"));
   EXPECT_FALSE(IsIPv6("::1::2"));
+
+  // Hostname resolution: localhost should prioritize IPv4
+  // When localhost resolves to both IPv4 (127.0.0.1) and IPv6 (::1),
+  // it should return false (prefer IPv4)
+  EXPECT_FALSE(IsIPv6("localhost"));
 }
 
 }  // namespace ray

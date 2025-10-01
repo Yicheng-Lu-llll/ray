@@ -53,11 +53,17 @@ def node_ip_address_from_perspective(address: Optional[str] = None) -> str:
 def is_ipv6(host: str) -> bool:
     """Check if a host is resolved to IPv6.
 
+    For literal IP addresses, returns True if it's an IPv6 address.
+    For domain names, performs DNS resolution with IPv4 preference:
+    - Returns False if the hostname resolves to any IPv4 address
+    - Returns True only if the hostname resolves exclusively to IPv6
+    - Returns False if resolution fails or no addresses are found
+
     Args:
         host: The IP or domain name to check (must be without port).
 
     Returns:
-        True if the host is resolved to IPv6, False if IPv4.
+        True if the host is resolved to IPv6 only, False if IPv4 or unresolved.
     """
     return _is_ipv6(host)
 

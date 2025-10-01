@@ -60,8 +60,13 @@ std::string GetNodeIpAddressFromPerspective(
     const std::optional<std::string> &address = std::nullopt);
 
 /// Check if a host is resolved to IPv6.
+/// For literal IP addresses, returns true if it's an IPv6 address.
+/// For domain names, performs DNS resolution with IPv4 preference:
+/// - Returns false if the hostname resolves to any IPv4 address
+/// - Returns true only if the hostname resolves exclusively to IPv6
+/// - Returns false if resolution fails or no addresses are found
 /// \param host The IP or domain name to check (must be without port).
-/// \return true if the host is resolved to IPv6, false if IPv4.
+/// \return true if the host is resolved to IPv6 only, false if IPv4 or unresolved.
 bool IsIPv6(const std::string &host);
 
 /// Check whether the given port is available for the specified address family.

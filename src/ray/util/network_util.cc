@@ -48,33 +48,39 @@ using boost::asio::ip::tcp;
 namespace ray {
 
 bool IsIPv6(const std::string &host) {
+  // Check if host is a literal IP address
   boost::system::error_code ec;
   auto addr = boost::asio::ip::make_address(host, ec);
   if (!ec) {
     return addr.is_v6();
   }
 
-  // host is domain name.
+  // Host is a domain name - perform DNS resolution with IPv4 preference.
+  // This ensures compatibility with mixed IPv4/IPv6 environments by prioritizing
+  // IPv4 connections when both are available, which is the common behavior in
+  // most network libraries and applications.
   boost::asio::io_service io_service;
   boost::asio::ip::tcp::resolver resolver(io_service);
 
-  // try IPv4 first, then IPv6 resolution
+  // Try IPv4 resolution first - if successful, prefer IPv4
   boost::system::error_code ec_v4;
   auto results_v4 = resolver.resolve(boost::asio::ip::tcp::v4(), host, "0", ec_v4);
   if (!ec_v4 && !results_v4.empty()) {
-    return false;
+    return false;  // Has IPv4 - prefer it over IPv6
   }
 
+  // No IPv4 available, try IPv6 resolution
   boost::system::error_code ec_v6;
   auto results_v6 = resolver.resolve(boost::asio::ip::tcp::v6(), host, "0", ec_v6);
   if (!ec_v6 && !results_v6.empty()) {
-    return true;
+    return true;  // Only IPv6 available
   }
 
+  // Both resolutions failed - log for debugging
   RAY_LOG(WARNING) << "Failed to resolve hostname '" << host
                    << "': IPv4 error: " << ec_v4.message()
                    << ", IPv6 error: " << ec_v6.message();
-  return false;
+  return false;  // Default to IPv4 (false) on failure
 }
 
 std::string BuildAddress(const std::string &host, const std::string &port) {

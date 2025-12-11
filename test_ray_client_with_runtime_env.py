@@ -1,12 +1,3 @@
-"""
-Test that ray_client_server works correctly with dynamic runtime env agent port.
-This verifies the end-to-end flow where:
-1. Ray starts with agent on dynamic port
-2. ray_client_server receives agent port via pipe
-3. Client connects with runtime_env
-4. ProxyManager._create_runtime_env successfully communicates with agent
-"""
-
 import subprocess
 import sys
 

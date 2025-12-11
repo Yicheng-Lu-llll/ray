@@ -7,10 +7,10 @@ This verifies the end-to-end flow where:
 4. ProxyManager._create_runtime_env successfully communicates with agent
 """
 
-import ray
 import subprocess
-import time
 import sys
+
+import ray
 
 
 def test_ray_client_with_runtime_env():

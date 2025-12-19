@@ -227,4 +227,44 @@ collecting ...
 Results (345.27s):
       10 passed
        1 skipped
+(ray) PS C:\Users\Administrator\yicheng\ray> python -m pytest python/ray/serve/tests/test_grpc.py -v 2>&1
+Test session starts (platform: win32, Python 3.9.7, pytest 7.4.4, pytest-sugar 0.9.5)
+cachedir: .pytest_cache
+rootdir: C:\Users\Administrator\yicheng\ray
+configfile: pytest.ini
+plugins: anyio-3.7.1, aiohttp-1.1.0, asyncio-0.17.2, docker-tools-3.1.3, forked-1.4.0, pytest_httpserver-1.1.3, lazy-fixtures-1.1.2, mock-3.14.0, rerunfailures-11.1.2, shutil-1.8.1, sphinx-0.5.1.dev0, sugar-0.9.5, timeout-2.1.0, virtualenv-1.8.1
+asyncio: mode=auto
+timeout: 180.0s
+timeout method: thread
+timeout func_only: False
+collecting ... 
+ python\ray\serve\tests\test_grpc.py::test_serving_grpc_requests ✓                                                                                                                      5% ▌
+ python\ray\serve\tests\test_grpc.py::test_serve_start_dictionary_grpc_options ✓                                                                                                       11% █▏
+ python\ray\serve\tests\test_grpc.py::test_grpc_routing_without_metadata ✓                                                                                                             16% █▋
+ python\ray\serve\tests\test_grpc.py::test_grpc_request_with_request_id ✓                                                                                                              21% ██▏
+ python\ray\serve\tests\test_grpc.py::test_grpc_request_timeouts[False] ✓                                                                                                              26% ██▋
+ python\ray\serve\tests\test_grpc.py::test_grpc_request_timeouts[True] ✓                                                                                                               32% ███▎
+ python\ray\serve\tests\test_grpc.py::test_grpc_request_internal_error[False] ✓                                                                                                        37% ███▊
+ python\ray\serve\tests\test_grpc.py::test_grpc_request_internal_error[True] ✓                                                                                                         42% ████▎
+ python\ray\serve\tests\test_grpc.py::test_grpc_request_cancellation[False] ✓                                                                                                          47% ████▊
+ python\ray\serve\tests\test_grpc.py::test_grpc_request_cancellation[True] ✓                                                                                                           53% █████▍
+ python\ray\serve\tests\test_grpc.py::test_using_grpc_context[False] ✓                                                                                                                 58% █████▊
+ python\ray\serve\tests\test_grpc.py::test_using_grpc_context[True] ✓                                                                                                                  63% ██████▍
+ python\ray\serve\tests\test_grpc.py::test_using_grpc_context_exception[False] ✓                                                                                                       68% ██████▉
+ python\ray\serve\tests\test_grpc.py::test_using_grpc_context_exception[True] ✓                                                                                                        74% ███████▍
+ python\ray\serve\tests\test_grpc.py::test_using_grpc_context_bad_function_signature[incorrect_spelling-False] ✓                                                                       79% ███████▉
+ python\ray\serve\tests\test_grpc.py::test_using_grpc_context_bad_function_signature[incorrect_spelling-True] ✓                                                                        84% ████████▌
+ python\ray\serve\tests\test_grpc.py::test_using_grpc_context_bad_function_signature[more_args-False] ✓                                                                                89% ████████▉
+ python\ray\serve\tests\test_grpc.py::test_using_grpc_context_bad_function_signature[more_args-True] ✓                                                                                 95% █████████▌ 
+ python\ray\serve\tests\test_grpc.py::test_grpc_client_sending_large_payload ✓                                                                                                        100% ██████████
+
+Results (776.22s):
+      19 passed
+(ray) PS C:\Users\Administrator\yicheng\ray>
+
+
+
+
+
+
 

@@ -225,6 +225,11 @@ void ActorTaskSubmitter::SubmitTask(TaskSpecification task_spec) {
                       } else {
                         fail_or_retry_task = true;
                         actor_submit_queue->MarkDependencyFailed(send_pos);
+                        queue->second.cur_pending_calls_--;
+                        // The failed task may have been at the head of the
+                        // SequentialActorSubmitQueue, blocking subsequent tasks
+                        // that already have their dependencies resolved.
+                        SendPendingTasks(actor_id);
                       }
                     }
                   }
@@ -990,6 +995,11 @@ void ActorTaskSubmitter::CancelTask(TaskSpecification task_spec, bool recursive)
       RAY_LOG(DEBUG).WithField(task_id)
           << "Task was queued. Mark a task is canceled from a queue.";
       queue->second.actor_submit_queue_->MarkTaskCanceled(send_pos);
+      queue->second.cur_pending_calls_--;
+      // The cancelled task may have been at the head of the
+      // SequentialActorSubmitQueue, blocking subsequent tasks that already have
+      // their dependencies resolved.
+      SendPendingTasks(actor_id);
     }
   }
 

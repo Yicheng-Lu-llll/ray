@@ -54,10 +54,12 @@ class ReferenceCounter : public ReferenceCounterInterface,
           free_object_on_nodes_async,
       ray::observability::MetricInterface &owned_object_by_state_counter,
       ray::observability::MetricInterface &owned_object_sizes_by_state_counter,
+      std::function<void(std::function<void()>, const std::string &)> post_to_io_thread,
       bool lineage_pinning_enabled = false)
       : rpc_address_(std::move(rpc_address)),
         lineage_pinning_enabled_(lineage_pinning_enabled),
         object_info_publisher_(object_info_publisher),
+        post_to_io_thread_(std::move(post_to_io_thread)),
         object_info_subscriber_(object_info_subscriber),
         is_node_dead_(std::move(is_node_dead)),
         free_object_on_nodes_async_(std::move(free_object_on_nodes_async)),
@@ -759,6 +761,8 @@ class ReferenceCounter : public ReferenceCounterInterface,
   /// reference counting protocol. It is not guarded by a lock because the class itself is
   /// thread-safe.
   pubsub::PublisherInterface *object_info_publisher_;
+
+  std::function<void(std::function<void()>, const std::string &)> post_to_io_thread_;
 
   /// Object status subscriber. It is used to subscribe the ref removed information from
   /// other workers.

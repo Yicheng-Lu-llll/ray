@@ -60,7 +60,9 @@ class ReferenceCountTest : public ::testing::Test {
         [](const NodeID &node_id) { return false; },
         [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
         *owned_object_count_metric_,
-        *owned_object_size_metric_);
+        *owned_object_size_metric_,
+        /*post_to_io_thread=*/
+        [](std::function<void()> fn, const std::string &) { fn(); });
   }
 
   virtual void TearDown() {
@@ -96,6 +98,8 @@ class ReferenceCountLineageEnabledTest : public ::testing::Test {
         [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
         *owned_object_count_metric_,
         *owned_object_size_metric_,
+        /*post_to_io_thread=*/
+        [](std::function<void()> fn, const std::string &) { fn(); },
         /*lineage_pinning_enabled=*/true);
   }
 
@@ -330,6 +334,8 @@ class MockWorkerClient : public MockCoreWorkerClientInterface {
             [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
             *owned_object_count_metric_,
             *owned_object_size_metric_,
+            /*post_to_io_thread=*/
+            [](std::function<void()> fn, const std::string &) { fn(); },
             /*lineage_pinning_enabled=*/false) {}
 
   ~MockWorkerClient() override {
@@ -896,7 +902,9 @@ TEST(MemoryStoreIntegrationTest, TestSimple) {
       /*free_object_on_nodes_async=*/
       [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
       *owned_object_count_metric,
-      *owned_object_size_metric);
+      *owned_object_size_metric,
+      /*post_to_io_thread=*/
+      [](std::function<void()> fn, const std::string &) { fn(); });
   InstrumentedIOContextWithThread io_context("TestSimple");
   CoreWorkerMemoryStore store(io_context.GetIoService());
 

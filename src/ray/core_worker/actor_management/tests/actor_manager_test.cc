@@ -95,6 +95,8 @@ class ActorManagerTest : public ::testing::Test {
             [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
             fake_owned_object_count_gauge_,
             fake_owned_object_size_gauge_,
+            /*post_to_io_thread=*/
+            [](std::function<void()> fn, const std::string &) { fn(); },
             /*lineage_pinning_enabled=*/true)) {
     gcs_client_mock_->Init(actor_info_accessor_);
   }

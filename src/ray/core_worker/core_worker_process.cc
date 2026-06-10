@@ -342,6 +342,10 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
       },
       *owned_objects_counter_,
       *owned_objects_size_counter_,
+      /*post_to_io_thread=*/
+      [this](std::function<void()> fn, const std::string &name) {
+        io_service_.post(std::move(fn), name);
+      },
       RayConfig::instance().lineage_pinning_enabled());
   std::shared_ptr<LeaseRequestRateLimiter> lease_request_rate_limiter;
   if (RayConfig::instance().max_pending_lease_requests_per_scheduling_category() > 0) {

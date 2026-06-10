@@ -148,6 +148,8 @@ class ObjectRecoveryManagerTestBase : public ::testing::Test {
             [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
             *std::make_shared<ray::observability::FakeGauge>(),
             *std::make_shared<ray::observability::FakeGauge>(),
+            /*post_to_io_thread=*/
+            [](std::function<void()> fn, const std::string &) { fn(); },
             /*lineage_pinning_enabled=*/lineage_enabled)),
         manager_(
             rpc::Address(),

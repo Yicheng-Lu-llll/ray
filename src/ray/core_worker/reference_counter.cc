@@ -789,8 +789,13 @@ void ReferenceCounter::DeleteReferenceInternal(ReferenceTable::iterator it,
 void ReferenceCounter::EraseReference(ReferenceTable::iterator it) {
   // It is possible that when ref count reaches zero, there are still subscribers.
   // See https://github.com/ray-project/ray/pull/63560 for details
-  object_info_publisher_->PublishFailure(
-      rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL, it->first.Binary());
+  // Avoids contending on pubsub::Publisher::mutex_ when this runs on the Python thread.
+  post_to_io_thread_(
+      [publisher = object_info_publisher_, key_id = it->first.Binary()]() {
+        publisher->PublishFailure(rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL,
+                                  key_id);
+      },
+      "ReferenceCounter.PublishObjectLocationFailure");
 
   RAY_CHECK(it->second.ShouldDelete(lineage_pinning_enabled_));
   auto index_it = reconstructable_owned_objects_index_.find(it->first);

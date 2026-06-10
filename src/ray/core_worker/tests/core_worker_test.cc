@@ -155,6 +155,8 @@ class CoreWorkerTest : public ::testing::Test {
         [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
         fake_owned_object_count_gauge_,
         fake_owned_object_size_gauge_,
+        /*post_to_io_thread=*/
+        [](std::function<void()> fn, const std::string &) { fn(); },
         false);
 
     // Mock reference counter as enabled
@@ -653,13 +655,16 @@ TEST(BatchingPassesTwoTwoOneIntoPlasmaGet, CallsPlasmaGetInCorrectBatches) {
   auto is_node_dead = [](const NodeID &) { return false; };
   auto free_object_on_nodes_async = [](const ObjectID &,
                                        const absl::flat_hash_set<NodeID> &) {};
-  ReferenceCounter ref_counter(addr,
-                               /*object_info_publisher=*/nullptr,
-                               /*object_info_subscriber=*/nullptr,
-                               is_node_dead,
-                               free_object_on_nodes_async,
-                               *std::make_shared<ray::observability::FakeGauge>(),
-                               *std::make_shared<ray::observability::FakeGauge>());
+  ReferenceCounter ref_counter(
+      addr,
+      /*object_info_publisher=*/nullptr,
+      /*object_info_subscriber=*/nullptr,
+      is_node_dead,
+      free_object_on_nodes_async,
+      *std::make_shared<ray::observability::FakeGauge>(),
+      *std::make_shared<ray::observability::FakeGauge>(),
+      /*post_to_io_thread=*/
+      [](std::function<void()> fn, const std::string &) { fn(); });
 
   // Fake plasma client that records Get calls.
   std::vector<std::vector<ObjectID>> observed_batches;

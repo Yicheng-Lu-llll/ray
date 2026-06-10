@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -62,6 +63,8 @@ class DirectTaskTransportTest : public ::testing::Test {
         [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
         fake_owned_object_count_gauge,
         fake_owned_object_size_gauge,
+        /*post_to_io_thread=*/
+        [](std::function<void()> fn, const std::string &) { fn(); },
         /*lineage_pinning_enabled=*/false);
     actor_task_submitter = std::make_unique<ActorTaskSubmitter>(
         *client_pool,

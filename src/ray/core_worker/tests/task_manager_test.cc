@@ -158,6 +158,8 @@ class TaskManagerTest : public ::testing::Test {
             [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
             *std::make_shared<ray::observability::FakeGauge>(),
             *std::make_shared<ray::observability::FakeGauge>(),
+            /*post_to_io_thread=*/
+            [](std::function<void()> fn, const std::string &) { fn(); },
             lineage_pinning_enabled)),
         io_context_("TaskManagerTest"),
         store_(std::make_shared<CoreWorkerMemoryStore>(io_context_.GetIoService())),
@@ -1497,6 +1499,8 @@ TEST_F(TaskManagerTest, PlasmaPut_ObjectStoreFull_FailsTaskAndWritesError) {
       [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
       *std::make_shared<ray::observability::FakeGauge>(),
       *std::make_shared<ray::observability::FakeGauge>(),
+      /*post_to_io_thread=*/
+      [](std::function<void()> fn, const std::string &) { fn(); },
       lineage_pinning_enabled_);
   auto local_store = std::make_shared<CoreWorkerMemoryStore>(io_context_.GetIoService());
 
@@ -1562,6 +1566,8 @@ TEST_F(TaskManagerTest, PlasmaPut_TransientFull_RetriesThenSucceeds) {
       [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
       *std::make_shared<ray::observability::FakeGauge>(),
       *std::make_shared<ray::observability::FakeGauge>(),
+      /*post_to_io_thread=*/
+      [](std::function<void()> fn, const std::string &) { fn(); },
       lineage_pinning_enabled_);
   auto local_store = std::make_shared<CoreWorkerMemoryStore>(io_context_.GetIoService());
   TaskManager retry_mgr(
@@ -1628,6 +1634,8 @@ TEST_F(TaskManagerTest, DynamicReturn_PlasmaPutFailure_FailsTaskImmediately) {
       [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
       *std::make_shared<ray::observability::FakeGauge>(),
       *std::make_shared<ray::observability::FakeGauge>(),
+      /*post_to_io_thread=*/
+      [](std::function<void()> fn, const std::string &) { fn(); },
       lineage_pinning_enabled_);
   auto local_store = std::make_shared<CoreWorkerMemoryStore>(io_context_.GetIoService());
   TaskManager dyn_mgr(
@@ -3127,6 +3135,8 @@ TEST_F(TaskManagerTest, TestRetryErrorMessageSentToCallback) {
       [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
       *std::make_shared<ray::observability::FakeGauge>(),
       *std::make_shared<ray::observability::FakeGauge>(),
+      /*post_to_io_thread=*/
+      [](std::function<void()> fn, const std::string &) { fn(); },
       false);
   auto local_store = std::make_shared<CoreWorkerMemoryStore>(io_context_.GetIoService());
 
@@ -3212,6 +3222,8 @@ TEST_F(TaskManagerTest, TestErrorLogWhenPushErrorCallbackFails) {
       [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
       *std::make_shared<ray::observability::FakeGauge>(),
       *std::make_shared<ray::observability::FakeGauge>(),
+      /*post_to_io_thread=*/
+      [](std::function<void()> fn, const std::string &) { fn(); },
       false);
   auto local_store = std::make_shared<CoreWorkerMemoryStore>(io_context_.GetIoService());
 

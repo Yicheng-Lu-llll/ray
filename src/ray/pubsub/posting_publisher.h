@@ -28,6 +28,16 @@ namespace pubsub {
 
 /// PublisherInterface decorator: posts Publish and PublishFailure to the given
 /// io_context so callers don't take the publisher's mutex on their own thread.
+///
+/// Calls made from the io_context's own thread run inline instead (dispatch
+/// semantics). This is a correctness requirement, not an optimization: messages
+/// on these channels carry absolute state and subscribers keep the last one they
+/// receive, so a message must be sequenced at the time its content is built.
+/// Posting from within a handler running on this io_context would put the message
+/// on asio's thread-private queue, which is appended to the shared queue only when
+/// the current handler finishes. Any message posted by another thread in the
+/// meantime would then be delivered first, letting a stale snapshot (e.g. the one
+/// published on subscriber registration) overwrite a newer location update.
 class PostingPublisher : public PublisherInterface {
  public:
   PostingPublisher(std::shared_ptr<PublisherInterface> inner,
@@ -35,6 +45,15 @@ class PostingPublisher : public PublisherInterface {
       : inner_(std::move(inner)), io_service_(io_service) {}
 
   void Publish(rpc::PubMessage pub_message) override {
+    if (io_service_.get_executor().running_in_this_thread()) {
+      // A caller on this thread may hold ReferenceCounter::mutex_ (e.g.
+      // PublishObjectLocationSnapshot), so this inline path takes the inner
+      // Publisher's mutex under it: the lock order is ReferenceCounter -> Publisher.
+      // Keep Publisher a leaf lock (it must never call back into ReferenceCounter) or
+      // this becomes a deadlock.
+      inner_->Publish(std::move(pub_message));
+      return;
+    }
     const auto channel_type = pub_message.channel_type();
     io_service_.post(
         [inner = inner_, pub_message = std::move(pub_message)]() mutable {
@@ -45,6 +64,10 @@ class PostingPublisher : public PublisherInterface {
 
   void PublishFailure(const rpc::ChannelType channel_type,
                       const std::string &key_id) override {
+    if (io_service_.get_executor().running_in_this_thread()) {
+      inner_->PublishFailure(channel_type, key_id);
+      return;
+    }
     io_service_.post(
         [inner = inner_, channel_type, key_id]() {
           inner->PublishFailure(channel_type, key_id);

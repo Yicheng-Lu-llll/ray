@@ -13,6 +13,18 @@ ray_cc_test(
 )
 
 ray_cc_test(
+    name = "posting_publisher_test",
+    size = "small",
+    srcs = ["posting_publisher_test.cc"],
+    tags = ["team:core"],
+    deps = [
+        "//src/mock/ray/pubsub:mock_publisher",
+        "//src/ray/asio:instrumented_io_context",
+        "//src/ray/pubsub:posting_publisher",
+    ],
+)
+
+ray_cc_test(
     name = "subscriber_test",
     size = "small",
     srcs = [

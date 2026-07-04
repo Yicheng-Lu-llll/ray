@@ -374,6 +374,8 @@ void Publisher::ConnectToSubscriber(
   absl::MutexLock lock(&mutex_);
   auto it = subscribers_.find(subscriber_id);
   if (it == subscribers_.end()) {
+    RAY_LOG(INFO) << "[pubsub-dbg] NEW SubscriberState on connect subscriber="
+                  << subscriber_id.Hex();
     it = subscribers_
              .emplace(subscriber_id,
                       std::make_unique<SubscriberState>(subscriber_id,
@@ -395,6 +397,8 @@ StatusSet<StatusT::InvalidArgument> Publisher::RegisterSubscription(
     const UniqueID &subscriber_id,
     const std::optional<std::string> &key_id) {
   absl::MutexLock lock(&mutex_);
+  RAY_LOG(INFO) << "[pubsub-dbg] REGISTER sub=" << subscriber_id.Hex()
+                << " key=" << (key_id ? *key_id : std::string("<all>"));
   auto subscription_index_it = subscription_index_map_.find(channel_type);
   if (subscription_index_it == subscription_index_map_.end()) {
     return StatusT::InvalidArgument(
@@ -404,6 +408,8 @@ StatusSet<StatusT::InvalidArgument> Publisher::RegisterSubscription(
   }
   auto it = subscribers_.find(subscriber_id);
   if (it == subscribers_.end()) {
+    RAY_LOG(INFO) << "[pubsub-dbg] NEW SubscriberState on connect subscriber="
+                  << subscriber_id.Hex();
     it = subscribers_
              .emplace(subscriber_id,
                       std::make_unique<SubscriberState>(subscriber_id,
@@ -458,7 +464,7 @@ void Publisher::UnregisterSubscriber(const UniqueID &subscriber_id) {
 }
 
 void Publisher::UnregisterSubscriberInternal(const UniqueID &subscriber_id) {
-  RAY_LOG(DEBUG) << "Unregistering subscriber " << subscriber_id.Hex();
+  RAY_LOG(INFO) << "[pubsub-dbg] UNREGISTER subscriber " << subscriber_id.Hex();
   for (auto &index : subscription_index_map_) {
     index.second.EraseSubscriber(subscriber_id);
   }

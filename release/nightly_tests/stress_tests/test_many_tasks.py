@@ -49,26 +49,32 @@ def stage0(smoke=False):
         try:
             ray.get([f.remote(size) for _ in range(num_tasks)])
         except Exception as e:
-            import re as _re, subprocess as _sp
+            import re as _re, glob as _glob
             m = _re.search(r"object ([0-9a-f]+)", str(e))
-            oid = m.group(1) if m else ""
-            short = oid[:16]
-            print("=====DBG_BEGIN===== failing_object=" + oid, flush=True)
-            _sp.run(
-                "L=$(ls -t /tmp/ray/session_latest/logs/python-core-driver-*.log | head -1); "
-                "echo '### DEDICATED-TICK timeline (did the thread stop?) ###'; grep -ah 'DEDICATED-TICK' $L | awk 'NR%1==0' | tail -80; echo '### LONGPOLL servicing timeline (last 60) ###'; grep -ah 'pubsub-dbg. LONGPOLL' $L | tail -60; echo '### REGISTER/UNREGISTER/NEW (uncapped) ###'; "
-                "grep -ah 'pubsub-dbg' $L | grep -aE 'REGISTER|UNREGISTER|NEW |seq reset' ; "
-                "echo '### failing object %s pubsub-dbg ###'; "
-                "grep -ah '%s' $L | head -50; "
-                "echo '### LAST full Event stats dump (worker.io + dedicated queueing) ###'; "
-                "python3 -c \"import re,glob; t=open(sorted(glob.glob('/tmp/ray/session_latest/logs/python-core-driver-*.log'))[0]).read(); "
-                "ss=[m.start() for m in re.finditer(r'core_worker.cc:[0-9]+: Event stats:', t)]; "
-                "print(t[ss[-1]:ss[-1]+8000] if ss else 'NO EVENT STATS')\" ; "
-                "echo '### raylet.out: object + no-location + subscribe ###'; "
-                "grep -ahE '%s|no location|OBJECT_FETCH|Subscribe' /tmp/ray/session_latest/logs/raylet.out | tail -40"
-                % (short, short, short),
-                shell=True,
-            )
+            short = (m.group(1)[:16] if m else "")
+            print("=====DBG_BEGIN===== failing_object=" + (m.group(1) if m else "?"), flush=True)
+
+            def _emit(title, lines):
+                print("### " + title + " (" + str(len(lines)) + ") ###", flush=True)
+                for _l in lines:
+                    print(_l, flush=True)
+
+            dglob = _glob.glob("/tmp/ray/session_latest/logs/python-core-driver-*.log")
+            dtext = open(sorted(dglob)[0], errors="replace").read() if dglob else ""
+            dlines = dtext.splitlines()
+            _emit("DEDICATED-TICK timeline ALL (did the thread stop?)",
+                  [l for l in dlines if "DEDICATED-TICK" in l])
+            _emit("LONGPOLL last 80",
+                  [l for l in dlines if "pubsub-dbg] LONGPOLL" in l][-80:])
+            _emit("REGISTER/UNREGISTER/NEW last 120",
+                  [l for l in dlines if any(k in l for k in ("REGISTER", "UNREGISTER", "NEW SubscriberState"))][-120:])
+            _emit("failing object " + short + " in driver log",
+                  [l for l in dlines if short and short in l][:80])
+            rglob = _glob.glob("/tmp/ray/session_latest/logs/raylet.out")
+            rtext = open(sorted(rglob)[0], errors="replace").read() if rglob else ""
+            _emit("raylet.out failing-object / no-location",
+                  [l for l in rtext.splitlines()
+                   if (short and short in l) or "no location" in l or "OBJECT_FETCH" in l][-40:])
             print("=====DBG_END=====", flush=True)
             raise
         stage_0_iterations.append(time.time() - iteration_start)

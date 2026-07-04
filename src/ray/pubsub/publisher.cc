@@ -395,8 +395,17 @@ StatusSet<StatusT::InvalidArgument> Publisher::RegisterSubscription(
     const UniqueID &subscriber_id,
     const std::optional<std::string> &key_id) {
   absl::MutexLock lock(&mutex_);
-  RAY_LOG(INFO) << "[pubsub-dbg] REGISTER sub=" << subscriber_id.Hex() << " key="
-                << (key_id ? ObjectID::FromBinary(*key_id).Hex() : std::string("<all>"));
+  std::string dbg_keyhex = "<all>";
+  if (key_id) {
+    static const char *hx = "0123456789abcdef";
+    dbg_keyhex.clear();
+    for (unsigned char ch : *key_id) {
+      dbg_keyhex.push_back(hx[ch >> 4]);
+      dbg_keyhex.push_back(hx[ch & 0xf]);
+    }
+  }
+  RAY_LOG(INFO) << "[pubsub-dbg] REGISTER sub=" << subscriber_id.Hex()
+                << " key=" << dbg_keyhex;
   auto subscription_index_it = subscription_index_map_.find(channel_type);
   if (subscription_index_it == subscription_index_map_.end()) {
     return StatusT::InvalidArgument(

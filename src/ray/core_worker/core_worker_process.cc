@@ -344,17 +344,15 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
                 addr));
       });
 
-  // The object-info publisher's periodic dead-subscriber check runs on the dedicated
-  // publish thread, like every other operation on the publisher.
   auto object_info_publish_periodical_runner =
-      PeriodicalRunner::Create(object_info_publish_service_);
+      PeriodicalRunner::Create(io_service_);
   auto object_info_publisher = std::make_unique<pubsub::PostingPublisher>(
       std::make_shared<pubsub::Publisher>(
           /*channels=*/
           std::vector<rpc::ChannelType>{
               rpc::ChannelType::WORKER_REF_REMOVED_CHANNEL,
               rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL},
-          /*periodical_runner=*/*object_info_publish_periodical_runner,
+          /*periodical_runner=*/*object_info_publish_periodical_runner,  // io_service_ runner (v2a bisect)
           /*clock=*/clock_,
           /*subscriber_timeout_ms=*/RayConfig::instance().subscriber_timeout_ms(),
           /*publish_batch_size_=*/RayConfig::instance().publish_batch_size(),

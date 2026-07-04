@@ -46,7 +46,31 @@ def stage0(smoke=False):
     for i in range(10):
         iteration_start = time.time()
         logger.info("Iteration %s", i)
-        ray.get([f.remote(size) for _ in range(num_tasks)])
+        try:
+            ray.get([f.remote(size) for _ in range(num_tasks)])
+        except Exception as e:
+            import re as _re, subprocess as _sp
+            m = _re.search(r"object ([0-9a-f]+)", str(e))
+            oid = m.group(1) if m else ""
+            short = oid[:16]
+            print("=====DBG_BEGIN===== failing_object=" + oid, flush=True)
+            _sp.run(
+                "L=$(ls -t /tmp/ray/session_latest/logs/python-core-driver-*.log | head -1); "
+                "echo '### DEDICATED-TICK timeline (did the thread stop?) ###'; grep -ah 'DEDICATED-TICK' $L | awk 'NR%1==0' | tail -80; echo '### LONGPOLL servicing timeline (last 60) ###'; grep -ah 'pubsub-dbg. LONGPOLL' $L | tail -60; echo '### REGISTER/UNREGISTER/NEW (uncapped) ###'; "
+                "grep -ah 'pubsub-dbg' $L | grep -aE 'REGISTER|UNREGISTER|NEW |seq reset' ; "
+                "echo '### failing object %s pubsub-dbg ###'; "
+                "grep -ah '%s' $L | head -50; "
+                "echo '### LAST full Event stats dump (worker.io + dedicated queueing) ###'; "
+                "python3 -c \"import re,glob; t=open(sorted(glob.glob('/tmp/ray/session_latest/logs/python-core-driver-*.log'))[0]).read(); "
+                "ss=[m.start() for m in re.finditer(r'core_worker.cc:[0-9]+: Event stats:', t)]; "
+                "print(t[ss[-1]:ss[-1]+8000] if ss else 'NO EVENT STATS')\" ; "
+                "echo '### raylet.out: object + no-location + subscribe ###'; "
+                "grep -ahE '%s|no location|OBJECT_FETCH|Subscribe' /tmp/ray/session_latest/logs/raylet.out | tail -40"
+                % (short, short, short),
+                shell=True,
+            )
+            print("=====DBG_END=====", flush=True)
+            raise
         stage_0_iterations.append(time.time() - iteration_start)
 
     return time.time() - start_time

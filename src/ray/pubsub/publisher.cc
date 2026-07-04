@@ -369,8 +369,8 @@ void Publisher::ConnectToSubscriber(
   RAY_CHECK(send_reply_callback != nullptr);
 
   const auto subscriber_id = UniqueID::FromBinary(request.subscriber_id());
-  RAY_LOG(DEBUG) << "Long polling connection initiated by " << subscriber_id.Hex()
-                 << ", publisher_id " << publisher_id_.Hex();
+  dbg_longpoll_count_.fetch_add(1);
+  RAY_LOG(INFO) << "[pubsub-dbg] LONGPOLL sub=" << subscriber_id.Hex();
   absl::MutexLock lock(&mutex_);
   auto it = subscribers_.find(subscriber_id);
   if (it == subscribers_.end()) {
@@ -395,6 +395,8 @@ StatusSet<StatusT::InvalidArgument> Publisher::RegisterSubscription(
     const UniqueID &subscriber_id,
     const std::optional<std::string> &key_id) {
   absl::MutexLock lock(&mutex_);
+  RAY_LOG(INFO) << "[pubsub-dbg] REGISTER sub=" << subscriber_id.Hex() << " key="
+                << (key_id ? ObjectID::FromBinary(*key_id).Hex() : std::string("<all>"));
   auto subscription_index_it = subscription_index_map_.find(channel_type);
   if (subscription_index_it == subscription_index_map_.end()) {
     return StatusT::InvalidArgument(
@@ -431,6 +433,7 @@ void Publisher::Publish(rpc::PubMessage pub_message) {
 
   subscription_index.Publish(std::make_shared<rpc::PubMessage>(std::move(pub_message)),
                              msg_size);
+  dbg_publish_count_.fetch_add(1);
 }
 
 void Publisher::PublishFailure(const rpc::ChannelType channel_type,

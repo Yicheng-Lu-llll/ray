@@ -27,6 +27,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/synchronization/mutex.h"
+#include <atomic>
 #include "ray/asio/periodical_runner_interface.h"
 #include "ray/common/id.h"
 #include "ray/pubsub/publisher_interface.h"
@@ -388,6 +389,16 @@ class Publisher : public PublisherInterface {
     periodical_runner_->RunFnPeriodically([this] { CheckDeadSubscribers(); },
                                           subscriber_timeout_ms,
                                           "Publisher.CheckDeadSubscribers");
+    // [pubsub-dbg] dedicated-thread liveness heartbeat: if ticks STOP the thread hung;
+    // if ticks continue while long-poll servicing is sparse it starved.
+    periodical_runner_->RunFnPeriodically(
+        [this] {
+          RAY_LOG(INFO) << "[pubsub-dbg] DEDICATED-TICK n=" << dbg_tick_.fetch_add(1)
+                        << " publishes=" << dbg_publish_count_.load()
+                        << " longpolls=" << dbg_longpoll_count_.load();
+        },
+        2000,
+        "Publisher.DbgHeartbeat");
   }
 
   void ConnectToSubscriber(
@@ -478,6 +489,9 @@ class Publisher : public PublisherInterface {
   // The pointer must outlive the Publisher.
   // Nonnull in production, may be nullptr in tests.
   PeriodicalRunnerInterface *periodical_runner_;
+  std::atomic<int64_t> dbg_tick_{0};
+  std::atomic<int64_t> dbg_publish_count_{0};
+  std::atomic<int64_t> dbg_longpoll_count_{0};
 
   /// Clock used to read the current time.
   ClockInterface &clock_;

@@ -275,13 +275,23 @@ void SubscriberState::ConnectToSubscriber(
   if (request.publisher_id().empty() || publisher_id_binary_ != request.publisher_id()) {
     // in case the publisher_id mismatches, we should ignore the
     // max_processed_sequence_id.
+    RAY_LOG(INFO) << "[pubsub-dbg] seq reset: subscriber=" << subscriber_id_.Hex()
+                  << " req_publisher_id_empty=" << request.publisher_id().empty()
+                  << " req_max_seq=" << request.max_processed_sequence_id();
     max_processed_sequence_id = 0;
   }
 
   // clean up messages that have already been processed.
+  int64_t trimmed = 0;
   while (!mailbox_.empty() &&
          mailbox_.front()->sequence_id() <= max_processed_sequence_id) {
     mailbox_.pop_front();
+    trimmed++;
+  }
+  if (trimmed > 0) {
+    RAY_LOG(INFO) << "[pubsub-dbg] trim: subscriber=" << subscriber_id_.Hex()
+                  << " max_seq=" << max_processed_sequence_id << " trimmed=" << trimmed
+                  << " mailbox_left=" << mailbox_.size();
   }
 
   if (long_polling_connection_) {
@@ -374,6 +384,8 @@ void Publisher::ConnectToSubscriber(
   absl::MutexLock lock(&mutex_);
   auto it = subscribers_.find(subscriber_id);
   if (it == subscribers_.end()) {
+    RAY_LOG(INFO) << "[pubsub-dbg] NEW SubscriberState on connect: subscriber="
+                  << subscriber_id.Hex();
     it = subscribers_
              .emplace(subscriber_id,
                       std::make_unique<SubscriberState>(subscriber_id,
@@ -404,6 +416,8 @@ StatusSet<StatusT::InvalidArgument> Publisher::RegisterSubscription(
   }
   auto it = subscribers_.find(subscriber_id);
   if (it == subscribers_.end()) {
+    RAY_LOG(INFO) << "[pubsub-dbg] NEW SubscriberState on connect: subscriber="
+                  << subscriber_id.Hex();
     it = subscribers_
              .emplace(subscriber_id,
                       std::make_unique<SubscriberState>(subscriber_id,
@@ -458,7 +472,7 @@ void Publisher::UnregisterSubscriber(const UniqueID &subscriber_id) {
 }
 
 void Publisher::UnregisterSubscriberInternal(const UniqueID &subscriber_id) {
-  RAY_LOG(DEBUG) << "Unregistering subscriber " << subscriber_id.Hex();
+  RAY_LOG(INFO) << "[pubsub-dbg] UNREGISTER subscriber " << subscriber_id.Hex();
   for (auto &index : subscription_index_map_) {
     index.second.EraseSubscriber(subscriber_id);
   }

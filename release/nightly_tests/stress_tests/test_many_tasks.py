@@ -46,7 +46,22 @@ def stage0(smoke=False):
     for i in range(10):
         iteration_start = time.time()
         logger.info("Iteration %s", i)
-        ray.get([f.remote(size) for _ in range(num_tasks)])
+        try:
+            ray.get([f.remote(size) for _ in range(num_tasks)])
+        except Exception:
+            import subprocess
+
+            print("=====PUBSUB_DBG_EVIDENCE_BEGIN=====", flush=True)
+            subprocess.run(
+                "echo '--- driver core log pubsub-dbg ---'; "
+                "grep -ah 'pubsub-dbg' /tmp/ray/session_latest/logs/python-core-driver-*.log | tail -200; "
+                "echo '--- raylet.out pull/location tail ---'; "
+                "grep -aiE 'OBJECT_FETCH|no locations|Pull of object|location' /tmp/ray/session_latest/logs/raylet.out | tail -60; "
+                "echo '--- raylet.err tail ---'; tail -30 /tmp/ray/session_latest/logs/raylet.err",
+                shell=True,
+            )
+            print("=====PUBSUB_DBG_EVIDENCE_END=====", flush=True)
+            raise
         stage_0_iterations.append(time.time() - iteration_start)
 
     return time.time() - start_time

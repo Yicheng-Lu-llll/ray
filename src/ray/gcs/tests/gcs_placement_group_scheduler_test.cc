@@ -24,6 +24,7 @@
 #include "mock/ray/pubsub/publisher.h"
 #include "ray/asio/instrumented_io_context.h"
 #include "ray/asio/periodical_runner.h"
+#include "ray/common/ray_config.h"
 #include "ray/common/test_utils.h"
 #include "ray/gcs/gcs_node_manager.h"
 #include "ray/gcs/gcs_placement_group.h"
@@ -374,6 +375,44 @@ TEST_F(GcsPlacementGroupSchedulerTest, TestPackSchedulePlacementGroupSuccess) {
 
 TEST_F(GcsPlacementGroupSchedulerTest, TestStrictPackSchedulePlacementGroupSuccess) {
   SchedulePlacementGroupSuccessTest(rpc::PlacementStrategy::STRICT_PACK);
+}
+
+TEST_F(GcsPlacementGroupSchedulerTest, TestCentralizedBypassRayletNoTwoPhaseCommit) {
+  // v2 (gcs_centralized_bypass_raylet): the placement group is placed purely from GCS's
+  // own authoritative ledger, with NO raylet PREPARE/COMMIT RPCs. Raylets hold no bundle
+  // group resources in this mode; centralized actor leases unwrap them to plain resources
+  // at grant time.
+  RayConfig::instance().initialize(R"({"gcs_centralized_bypass_raylet": true})");
+
+  auto node = GenNodeInfo();
+  AddNode(node);
+  ASSERT_EQ(1, gcs_node_manager_->GetAllAliveNodes().size());
+
+  auto request = GenCreatePlacementGroupRequest();
+  auto placement_group =
+      std::make_shared<GcsPlacementGroup>(request, "", counter_, clock_);
+
+  scheduler_->ScheduleUnplacedBundles(SchedulePgRequest{
+      placement_group,
+      [this](std::shared_ptr<GcsPlacementGroup> pg, bool /*is_infeasible*/) {
+        absl::MutexLock lock(&placement_group_requests_mutex_);
+        failure_placement_groups_.emplace_back(std::move(pg));
+      },
+      [this](std::shared_ptr<GcsPlacementGroup> pg) {
+        absl::MutexLock lock(&placement_group_requests_mutex_);
+        success_placement_groups_.emplace_back(std::move(pg));
+      }});
+
+  // No raylet two-phase-commit RPC is sent; the commit path is driven directly from
+  // GCS's ledger.
+  ASSERT_EQ(0, raylet_clients_[0]->num_lease_requested);
+  ASSERT_TRUE(raylet_clients_[0]->commit_callbacks.empty());
+  // The placement group is placed successfully from GCS's own view.
+  WaitPlacementGroupPendingDone(1, GcsPlacementGroupStatus::SUCCESS);
+  CheckEqWithPlacementGroupFront(placement_group, GcsPlacementGroupStatus::SUCCESS);
+
+  // Reset config so subsequent tests are unaffected.
+  RayConfig::instance().initialize("{}");
 }
 
 TEST_F(GcsPlacementGroupSchedulerTest, TestSchedulePlacementGroupReplyFailure) {

@@ -81,17 +81,24 @@ void LocalLeaseManager::QueueAndScheduleLease(std::shared_ptr<internal::Work> wo
   // guarantee that the local node is not selected for scheduling.
   RAY_CHECK(!cluster_resource_scheduler_.GetLocalResourceManager().IsLocalNodeDraining());
   // The local node must be feasible if the cluster lease manager decides to run the task
-  // locally.
-  RAY_CHECK(cluster_resource_scheduler_.GetClusterResourceManager().HasFeasibleResources(
-      self_scheduling_node_id_,
-      ResourceMapToResourceRequest(work->lease_.GetLeaseSpecification()
-                                       .GetRequiredPlacementResources()
-                                       .GetResourceMap(),
-                                   /*requires_object_store_memory=*/false)))
-      << work->lease_.GetLeaseSpecification().DebugString() << " "
-      << cluster_resource_scheduler_.GetClusterResourceManager()
-             .GetNodeResources(self_scheduling_node_id_)
-             .DebugString();
+  // locally. In centralized mode GCS is the authoritative scheduler and this raylet holds
+  // no placement-group bundle resources, so the feasibility check (expressed in
+  // bundle-formatted resources) does not apply — the lease is granted with the bundle
+  // resources unwrapped to plain resources in ScheduleAndGrantLeases().
+  if (!(RayConfig::instance().gcs_centralized_bypass_raylet() &&
+        work->grant_or_reject_)) {
+    RAY_CHECK(
+        cluster_resource_scheduler_.GetClusterResourceManager().HasFeasibleResources(
+            self_scheduling_node_id_,
+            ResourceMapToResourceRequest(work->lease_.GetLeaseSpecification()
+                                             .GetRequiredPlacementResources()
+                                             .GetResourceMap(),
+                                         /*requires_object_store_memory=*/false)))
+        << work->lease_.GetLeaseSpecification().DebugString() << " "
+        << cluster_resource_scheduler_.GetClusterResourceManager()
+               .GetNodeResources(self_scheduling_node_id_)
+               .DebugString();
+  }
   WaitForLeaseArgsRequests(std::move(work));
   ScheduleAndGrantLeases();
 }
@@ -356,11 +363,35 @@ void LocalLeaseManager::GrantScheduledLeasesToWorkers() {
       // Check if the node is still schedulable. It may not be if dependency resolution
       // took a long time.
       auto allocated_instances = std::make_shared<TaskResourceInstances>();
+      absl::flat_hash_map<std::string, double> required_resources =
+          spec.GetRequiredResources().GetResourceMap();
+      if (RayConfig::instance().gcs_centralized_bypass_raylet() &&
+          work->grant_or_reject_) {
+        // Centralized mode: this raylet holds no placement-group bundle resources (GCS
+        // skipped the 2PC commit), so unwrap the bundle-formatted resources to their
+        // plain underlying resources and allocate those for the worker. Drop the wildcard
+        // entry (bundle_index == -1) to avoid double-counting the indexed entry, and drop
+        // the "bundle" placeholder marker (not an allocatable node resource).
+        absl::flat_hash_map<std::string, double> unwrapped;
+        for (const auto &[name, amount] : required_resources) {
+          auto pg = ParsePgFormattedResource(
+              name, /*for_wildcard_resource=*/true, /*for_indexed_resource=*/true);
+          if (pg.has_value()) {
+            if (pg->bundle_index == -1 ||
+                pg->original_resource == kBundle_ResourceLabel) {
+              continue;
+            }
+            unwrapped[pg->original_resource] += amount;
+          } else {
+            unwrapped[name] += amount;
+          }
+        }
+        required_resources = std::move(unwrapped);
+      }
       bool schedulable =
           !cluster_resource_scheduler_.GetLocalResourceManager().IsLocalNodeDraining() &&
           cluster_resource_scheduler_.GetLocalResourceManager()
-              .AllocateLocalTaskResources(spec.GetRequiredResources().GetResourceMap(),
-                                          allocated_instances);
+              .AllocateLocalTaskResources(required_resources, allocated_instances);
       if (!schedulable) {
         ReleaseLeaseArgs(lease_id);
         // The local node currently does not have the resources to grant the lease, so we
@@ -558,7 +589,12 @@ bool LocalLeaseManager::PoppedWorkerHandler(
   const auto &lease = work->lease_;
   bool granted = false;
 
-  if (!canceled) {
+  // In centralized mode this raylet holds no placement-group bundle resources (the lease
+  // was granted with its resources unwrapped to plain), so this PG-resource-existence
+  // sanity check does not apply.
+  const bool centralized_bypass =
+      RayConfig::instance().gcs_centralized_bypass_raylet() && work->grant_or_reject_;
+  if (!canceled && !centralized_bypass) {
     const auto &required_resource =
         lease.GetLeaseSpecification().GetRequiredResources().GetResourceMap();
     for (auto &entry : required_resource) {

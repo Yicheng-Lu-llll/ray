@@ -67,7 +67,7 @@ class GcsActorSchedulerMockTest : public Test {
                                          fake_observability_publisher_.get(),
                                          clock_);
     local_node_id = NodeID::FromRandom();
-    auto cluster_resource_scheduler = std::make_shared<ClusterResourceScheduler>(
+    cluster_resource_scheduler = std::make_shared<ClusterResourceScheduler>(
         PeriodicalRunner::Create(io_context),
         scheduling::NodeID(local_node_id.Binary()),
         NodeResources(),
@@ -84,6 +84,7 @@ class GcsActorSchedulerMockTest : public Test {
         io_context,
         *actor_table,
         *gcs_node_manager,
+        *cluster_resource_scheduler,
         [this](auto a, auto b, auto c) { schedule_failure_handler(a); },
         [this](auto a, const rpc::PushTaskReply) { schedule_success_handler(a); },
         *client_pool,
@@ -104,6 +105,7 @@ class GcsActorSchedulerMockTest : public Test {
   std::unique_ptr<GcsActorTable> actor_table;
   std::unique_ptr<pubsub::ObservabilityPublisher> fake_observability_publisher_;
   std::unique_ptr<GcsNodeManager> gcs_node_manager;
+  std::shared_ptr<ClusterResourceScheduler> cluster_resource_scheduler;
   std::unique_ptr<GcsActorScheduler> actor_scheduler;
   std::shared_ptr<rpc::MockCoreWorkerClientInterface> core_worker_client;
   std::unique_ptr<rpc::CoreWorkerClientPool> worker_client_pool_;

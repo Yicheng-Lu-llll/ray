@@ -21,6 +21,7 @@
 
 #include "ray/asio/asio_util.h"
 #include "ray/common/ray_config.h"
+#include "ray/common/scheduling/cluster_resource_data.h"
 
 namespace ray {
 namespace gcs {
@@ -29,6 +30,7 @@ GcsActorScheduler::GcsActorScheduler(
     instrumented_io_context &io_context,
     GcsActorTable &gcs_actor_table,
     const GcsNodeManager &gcs_node_manager,
+    ClusterResourceScheduler &cluster_resource_scheduler,
     GcsActorSchedulerFailureCallback schedule_failure_handler,
     GcsActorSchedulerSuccessCallback schedule_success_handler,
     rpc::RayletClientPool &raylet_client_pool,
@@ -38,6 +40,7 @@ GcsActorScheduler::GcsActorScheduler(
     : io_context_(io_context),
       gcs_actor_table_(gcs_actor_table),
       gcs_node_manager_(gcs_node_manager),
+      cluster_resource_scheduler_(cluster_resource_scheduler),
       schedule_failure_handler_(std::move(schedule_failure_handler)),
       schedule_success_handler_(std::move(schedule_success_handler)),
       raylet_client_pool_(raylet_client_pool),
@@ -77,11 +80,41 @@ void GcsActorScheduler::Schedule(std::shared_ptr<GcsActor> actor) {
                 .second);
 
   // Lease worker directly from the node.
-  actor->SetGrantOrReject(false);
+  if (RayConfig::instance().gcs_actor_scheduling_centralized()) {
+    // Authoritative GCS ledger: deduct the actor's resources on the node we just picked
+    // and grant the lease directly (no spillback), since the GCS made the placement
+    // decision using its own up-to-date resource view.
+    const auto &lease_spec = actor->GetLeaseSpecification();
+    auto resource_request =
+        ResourceMapToResourceRequest(lease_spec.GetRequiredResources().GetResourceMap(),
+                                     /*requires_object_store_memory=*/false);
+    cluster_resource_scheduler_.GetClusterResourceManager()
+        .SubtractNodeAvailableResources(scheduling::NodeID(actor->GetNodeID().Binary()),
+                                        resource_request);
+    actor->SetAcquiredResources(std::move(resource_request));
+    actor->SetGrantOrReject(true);
+  } else {
+    actor->SetGrantOrReject(false);
+  }
   LeaseWorkerFromNode(actor, node.value());
 }
 
 NodeID GcsActorScheduler::SelectForwardingNode(std::shared_ptr<GcsActor> actor) {
+  if (RayConfig::instance().gcs_actor_scheduling_centralized()) {
+    // Centralized scheduling: let the GCS' cluster resource scheduler pick the best node.
+    // This handles both pure-actor (hybrid) and PG-actor (affinity-with-bundle)
+    // scheduling internally based on the lease's scheduling strategy.
+    const auto &lease_spec = actor->GetLeaseSpecification();
+    bool is_infeasible = false;
+    auto best = cluster_resource_scheduler_.GetBestSchedulableNode(
+        lease_spec,
+        /*preferred_node_id=*/std::string(),
+        /*exclude_local_node=*/true,
+        /*requires_object_store_memory=*/false,
+        &is_infeasible);
+    return best.IsNil() ? NodeID::Nil() : NodeID::FromBinary(best.Binary());
+  }
+
   // Select a node to lease worker for the actor.
   std::shared_ptr<const rpc::GcsNodeInfo> node;
 
@@ -381,6 +414,13 @@ void GcsActorScheduler::HandleRequestWorkerLeaseCanceled(
       << "Lease request was canceled: "
       << rpc::RequestWorkerLeaseReply::SchedulingFailureType_Name(failure_type);
 
+  if (!actor->GetAcquiredResources().IsEmpty()) {
+    // This placement is abandoned (e.g. SCHEDULING_FAILED re-queues the actor and a
+    // later Schedule() overwrites the acquired resources), so return the resources
+    // deducted in Schedule() to the ledger, mirroring HandleWorkerLeaseRejectedReply.
+    ReturnActorAcquiredResources(actor);
+  }
+
   schedule_failure_handler_(actor, failure_type, scheduling_failure_message);
 }
 
@@ -621,6 +661,15 @@ void GcsActorScheduler::OnActorDestruction(std::shared_ptr<GcsActor> actor) {
 }
 
 void GcsActorScheduler::ReturnActorAcquiredResources(std::shared_ptr<GcsActor> actor) {
+  if (RayConfig::instance().gcs_actor_scheduling_centralized()) {
+    // Authoritative GCS ledger: add the actor's acquired resources back to the node it
+    // was scheduled on. This mirrors the deduct performed in Schedule().
+    const auto &acquired = actor->GetAcquiredResources();
+    if (!acquired.IsEmpty() && !actor->GetNodeID().IsNil()) {
+      cluster_resource_scheduler_.GetClusterResourceManager().AddNodeAvailableResources(
+          scheduling::NodeID(actor->GetNodeID().Binary()), acquired.GetResourceSet());
+    }
+  }
   actor->SetAcquiredResources(ResourceRequest());
 }
 

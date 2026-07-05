@@ -135,6 +135,7 @@ class GcsActorSchedulerTest : public ::testing::Test {
         io_context_->GetIoService(),
         *gcs_actor_table_,
         *gcs_node_manager_,
+        *cluster_resource_scheduler_,
         /*schedule_failure_handler=*/
         [this](std::shared_ptr<gcs::GcsActor> actor,
                const rpc::RequestWorkerLeaseReply::SchedulingFailureType failure_type,
@@ -281,6 +282,36 @@ TEST_F(GcsActorSchedulerTest, TestScheduleActorSuccess) {
   ASSERT_EQ(actor, success_actors_.front());
   ASSERT_EQ(actor->GetNodeID(), node_id);
   ASSERT_EQ(actor->GetWorkerID(), worker_id);
+}
+
+TEST_F(GcsActorSchedulerTest, TestCentralizedSchedulingDeductAndRelease) {
+  // WS2-lite: with gcs_actor_scheduling_centralized on, the GCS picks the node itself
+  // via its own ClusterResourceScheduler and maintains an authoritative ledger:
+  // deduct on schedule, add back on release.
+  RayConfig::instance().initialize(R"({"gcs_actor_scheduling_centralized": true})");
+
+  auto node = AddNewNode({{"CPU", 4.0}});
+  scheduling::NodeID scheduling_node_id(node->node_id());
+  auto &crm = cluster_resource_scheduler_->GetClusterResourceManager();
+  const auto cpu = ResourceID::CPU();
+  ASSERT_EQ(crm.GetNodeResources(scheduling_node_id).available.Get(cpu), FixedPoint(4));
+
+  auto actor = NewGcsActor({{"CPU", 1.0}});
+  gcs_actor_scheduler_->Schedule(actor);
+
+  // The GCS picked the only node itself, granted directly (no spillback), and deducted
+  // the actor's resources from its authoritative ledger.
+  ASSERT_EQ(actor->GetNodeID(), NodeID::FromBinary(node->node_id()));
+  ASSERT_TRUE(actor->GetGrantOrReject());
+  ASSERT_EQ(crm.GetNodeResources(scheduling_node_id).available.Get(cpu), FixedPoint(3));
+
+  // On actor destruction the GCS adds the actor's acquired resources back to the ledger
+  // (OnActorDestruction is public and calls ReturnActorAcquiredResources when the actor
+  // holds acquired resources).
+  gcs_actor_scheduler_->OnActorDestruction(actor);
+  ASSERT_EQ(crm.GetNodeResources(scheduling_node_id).available.Get(cpu), FixedPoint(4));
+
+  RayConfig::instance().initialize(R"({"gcs_actor_scheduling_centralized": false})");
 }
 
 TEST_F(GcsActorSchedulerTest, TestScheduleRetryWhenLeasing) {

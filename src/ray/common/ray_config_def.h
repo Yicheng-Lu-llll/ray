@@ -432,6 +432,17 @@ RAY_CONFIG(uint32_t, gcs_create_actor_retry_interval_ms, 200)
 /// schedule, add back on release), granting leases directly without spillback. When false
 /// (the default), actor scheduling behavior is unchanged.
 RAY_CONFIG(bool, gcs_actor_scheduling_centralized, false)
+/// If true (only meaningful with gcs_actor_scheduling_centralized), the raylet is treated
+/// as a dumb executor: GCS is the sole scheduler and its resource ledger is
+/// authoritative, so (1) the GCS placement group scheduler skips BOTH the distributed
+/// two-phase-commit PREPARE and COMMIT RPCs and simply updates its own in-memory ledger
+/// (a PG is placed the moment GCS deducts + builds its group resources); and (2) a
+/// centralized actor lease that reaches a raylet is granted directly on that node without
+/// re-running the raylet's local scheduler or admission control — its bundle-wrapped
+/// resources are unwrapped to the plain underlying resources and allocated locally for
+/// the worker. When false (the default), placement groups use the original two-phase
+/// commit and raylets schedule/admit leases.
+RAY_CONFIG(bool, gcs_centralized_bypass_raylet, false)
 /// Exponential backoff params for gcs to retry creating a placement group
 RAY_CONFIG(uint64_t, gcs_create_placement_group_retry_min_interval_ms, 100)
 RAY_CONFIG(uint64_t, gcs_create_placement_group_retry_max_interval_ms, 1000)

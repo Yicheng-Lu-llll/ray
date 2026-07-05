@@ -151,24 +151,33 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
 
     // TODO(sang): The callback might not be called at all if nodes are dead. We should
     // handle this case properly.
-    PrepareResources(bundles_per_node,
-                     gcs_node_manager_.GetAliveNode(node_id),
-                     [this,
-                      bundles_per_node,
-                      node_id,
-                      lease_status_tracker,
-                      failure_callback,
-                      success_callback](const Status &status) {
-                       for (const auto &bundle : bundles_per_node) {
-                         lease_status_tracker->MarkPrepareRequestReturned(
-                             node_id, bundle, status);
-                       }
+    auto prepare_callback = [this,
+                             bundles_per_node,
+                             node_id,
+                             lease_status_tracker,
+                             failure_callback,
+                             success_callback](const Status &status) {
+      for (const auto &bundle : bundles_per_node) {
+        lease_status_tracker->MarkPrepareRequestReturned(node_id, bundle, status);
+      }
 
-                       if (lease_status_tracker->AllPrepareRequestsReturned()) {
-                         OnAllBundlePrepareRequestReturned(
-                             lease_status_tracker, failure_callback, success_callback);
-                       }
-                     });
+      if (lease_status_tracker->AllPrepareRequestsReturned()) {
+        OnAllBundlePrepareRequestReturned(
+            lease_status_tracker, failure_callback, success_callback);
+      }
+    };
+
+    if (RayConfig::instance().gcs_centralized_bypass_raylet()) {
+      // Centralized mode: the authoritative GCS ledger already reserved these bundles
+      // (AcquireBundleResources above), so the distributed PREPARE round is redundant
+      // and cannot collide. Skip the prepare RPC and drive the commit path directly.
+      // The COMMIT RPC is skipped too (see CommitAllBundles) because raylets no longer
+      // hold bundle group resources — centralized actor leases unwrap to plain resources.
+      prepare_callback(Status::OK());
+    } else {
+      PrepareResources(
+          bundles_per_node, gcs_node_manager_.GetAliveNode(node_id), prepare_callback);
+    }
   }
 }
 
@@ -411,7 +420,13 @@ void GcsPlacementGroupScheduler::CommitAllBundles(
       }
     };
 
-    if (node.has_value()) {
+    if (RayConfig::instance().gcs_centralized_bypass_raylet()) {
+      // Centralized mode: raylets hold no bundle group resources, so skip the COMMIT RPC
+      // and finalize from GCS's own authoritative ledger. CommitBundleResources
+      // (GCS-side, in the callback) builds the group resources in GCS's view — which is
+      // what the centralized GCS actor scheduler schedules against.
+      commit_resources_callback(Status::OK());
+    } else if (node.has_value()) {
       CommitResources(bundles_per_node, node, commit_resources_callback);
     } else {
       RAY_LOG(INFO) << "Failed to commit resources because the node is dead, node id = "

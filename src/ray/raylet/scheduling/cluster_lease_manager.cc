@@ -21,6 +21,7 @@
 #include <string>
 #include <utility>
 
+#include "ray/common/ray_config.h"
 #include "ray/util/logging.h"
 #include "ray/util/string_utils.h"
 
@@ -207,6 +208,19 @@ void ClusterLeaseManager::ScheduleAndGrantLeases() {
       // leases from being scheduled.
       const std::shared_ptr<internal::Work> &work = *work_it;
       RayLease lease = work->lease_;
+      if (RayConfig::instance().gcs_centralized_bypass_raylet() &&
+          work->grant_or_reject_) {
+        // Centralized mode: GCS is the sole scheduler and already chose this node, so
+        // grant directly on the local node without re-running the raylet scheduler /
+        // admission. Worker resource allocation (bundle resources unwrapped to plain)
+        // happens in local_lease_manager. Route through the local node explicitly.
+        RAY_LOG(DEBUG) << "Centralized bypass: granting lease "
+                       << lease.GetLeaseSpecification().LeaseId() << " directly on "
+                       << self_node_id_;
+        ScheduleOnNode(self_node_id_, work);
+        work_it = work_queue.erase(work_it);
+        continue;
+      }
       RAY_LOG(DEBUG) << "Scheduling pending lease "
                      << lease.GetLeaseSpecification().LeaseId();
       auto scheduling_node_id = cluster_resource_scheduler_.GetBestSchedulableNode(

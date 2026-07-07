@@ -366,6 +366,11 @@ void GcsServer::Stop() {
       ray_event_recorder_->StopExportingEvents();
     }
 
+    // Stop the resource-load pull thread (if any) before its client pool / call manager are
+    // destroyed, so no in-flight GetResourceLoad reply touches freed state.
+    if (resource_load_pull_io_thread_) {
+      resource_load_pull_io_thread_->Stop();
+    }
     io_context_provider_.StopAllDedicatedIOContexts();
     ray_syncer_.reset();
     observability_pubsub_handler_.reset();
@@ -469,35 +474,96 @@ void GcsServer::InitGcsResourceManager(const GcsInitData &gcs_init_data) {
       *gcs_resource_manager_,
       RayConfig::instance().gcs_max_active_rpcs_per_handler()));
 
+  // Optionally offload the periodic GetResourceLoad pull's per-node RPC issuance (O(nodes) work,
+  // otherwise run on the GCS main io_context) to a dedicated thread; results are applied back on
+  // the main io_context. This pull only feeds autoscaler/dashboard bookkeeping (no scheduling
+  // impact); at large node counts its per-sweep issuance steals the single main thread from actor
+  // registration/scheduling. Default off => behavior unchanged.
+  if (RayConfig::instance().gcs_offload_resource_load_pull()) {
+    resource_load_pull_io_thread_ = std::make_unique<InstrumentedIOContextWithThread>(
+        "gcs_resource_load_pull",
+        /*enable_lag_probe=*/false,
+        /*used_for_health_check=*/false);
+    resource_load_pull_client_call_manager_ = std::make_unique<rpc::ClientCallManager>(
+        resource_load_pull_io_thread_->GetIoService(),
+        /*record_stats=*/true,
+        config_.node_ip_address,
+        ClusterID::Nil(),
+        RayConfig::instance().gcs_server_rpc_client_thread_num());
+    resource_load_pull_raylet_client_pool_ =
+        std::make_unique<rpc::RayletClientPool>([this](const rpc::Address &addr) {
+          return std::make_shared<ray::rpc::RayletClient>(
+              addr,
+              *resource_load_pull_client_call_manager_,
+              /*raylet_unavailable_timeout_callback=*/[]() {});
+        });
+  }
+
   periodical_runner_->RunFnPeriodically(
       [this] {
+        if (!RayConfig::instance().gcs_offload_resource_load_pull()) {
+          for (const auto &alive_node : gcs_node_manager_->GetAllAliveNodes()) {
+            auto remote_address = rpc::RayletClientPool::GenerateRayletAddress(
+                alive_node.first,
+                alive_node.second->node_manager_address(),
+                alive_node.second->node_manager_port());
+            auto raylet_client = raylet_client_pool_.GetOrConnectByAddress(remote_address);
+
+            // GetResourceLoad will also get usage. Historically it didn't.
+            raylet_client->GetResourceLoad([this](auto &status, auto &&load_and_usage) {
+              if (status.ok()) {
+                // TODO(vitsai): Remove duplicate reporting to GcsResourceManager
+                // after verifying that non-autoscaler paths are taken care of.
+                // Currently, GcsResourceManager aggregates reporting from different
+                // sources at different intervals, leading to an obviously inconsistent
+                // view.
+                //
+                // Once autoscaler is completely moved to the new mode of consistent
+                // per-node reporting, remove this if it is not needed anymore.
+                gcs_resource_manager_->UpdateResourceLoads(load_and_usage.resources());
+                gcs_autoscaler_state_manager_->UpdateResourceLoadAndUsage(
+                    std::move(*load_and_usage.mutable_resources()));
+              } else {
+                RAY_LOG_EVERY_N(WARNING, 10)
+                    << "Failed to get the resource load: " << status.ToString();
+              }
+            });
+          }
+          return;
+        }
+        // Offloaded path: snapshot alive-node addresses on the main io_context (same node-manager
+        // access as the default path), then issue the per-node RPCs on the dedicated pull thread.
+        std::vector<rpc::Address> addresses;
         for (const auto &alive_node : gcs_node_manager_->GetAllAliveNodes()) {
-          auto remote_address = rpc::RayletClientPool::GenerateRayletAddress(
+          addresses.push_back(rpc::RayletClientPool::GenerateRayletAddress(
               alive_node.first,
               alive_node.second->node_manager_address(),
-              alive_node.second->node_manager_port());
-          auto raylet_client = raylet_client_pool_.GetOrConnectByAddress(remote_address);
-
-          // GetResourceLoad will also get usage. Historically it didn't.
-          raylet_client->GetResourceLoad([this](auto &status, auto &&load_and_usage) {
-            if (status.ok()) {
-              // TODO(vitsai): Remove duplicate reporting to GcsResourceManager
-              // after verifying that non-autoscaler paths are taken care of.
-              // Currently, GcsResourceManager aggregates reporting from different
-              // sources at different intervals, leading to an obviously inconsistent
-              // view.
-              //
-              // Once autoscaler is completely moved to the new mode of consistent
-              // per-node reporting, remove this if it is not needed anymore.
-              gcs_resource_manager_->UpdateResourceLoads(load_and_usage.resources());
-              gcs_autoscaler_state_manager_->UpdateResourceLoadAndUsage(
-                  std::move(*load_and_usage.mutable_resources()));
-            } else {
-              RAY_LOG_EVERY_N(WARNING, 10)
-                  << "Failed to get the resource load: " << status.ToString();
-            }
-          });
+              alive_node.second->node_manager_port()));
         }
+        resource_load_pull_io_thread_->GetIoService().post(
+            [this, addresses = std::move(addresses)]() mutable {
+              for (const auto &addr : addresses) {
+                auto raylet_client =
+                    resource_load_pull_raylet_client_pool_->GetOrConnectByAddress(addr);
+                raylet_client->GetResourceLoad([this](auto &status, auto &&load_and_usage) {
+                  if (!status.ok()) {
+                    RAY_LOG_EVERY_N(WARNING, 10)
+                        << "Failed to get the resource load: " << status.ToString();
+                    return;
+                  }
+                  // Reply runs on the dedicated pull thread; apply the results on the main
+                  // io_context (GcsResourceManager / autoscaler state are main-thread only).
+                  io_context_provider_.GetDefaultIOContext().dispatch(
+                      [this, resources = load_and_usage.resources()]() mutable {
+                        gcs_resource_manager_->UpdateResourceLoads(resources);
+                        gcs_autoscaler_state_manager_->UpdateResourceLoadAndUsage(
+                            std::move(resources));
+                      },
+                      "GcsServer.ApplyResourceLoad");
+                });
+              }
+            },
+            "GcsServer.IssueResourceLoadPull");
       },
       RayConfig::instance().gcs_pull_resource_loads_period_milliseconds(),
       "RayletLoadPulled");

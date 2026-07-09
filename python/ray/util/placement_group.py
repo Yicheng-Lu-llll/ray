@@ -221,7 +221,16 @@ def placement_group(
         stripped_topology_strategy,
     )
 
-    return PlacementGroup(placement_group_id)
+    # The creator already knows the bundle shapes, so seed the bundle cache here.
+    # Otherwise the first task/actor submitted into this group pays a synchronous
+    # placement_group_table() RPC to the GCS (via bundle_specs -> _get_bundle_cache
+    # during resource-shape validation) just to re-learn what we passed in. Under a
+    # loaded GCS that RPC is tens-to-hundreds of ms per group, serialized on the
+    # driver's submit path. Float-normalize to match the GCS-returned form.
+    return PlacementGroup(
+        placement_group_id,
+        bundle_cache=[{k: float(v) for k, v in bundle.items()} for bundle in bundles],
+    )
 
 
 @PublicAPI

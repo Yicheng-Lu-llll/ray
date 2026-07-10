@@ -15,8 +15,10 @@
 #include "ray/gcs/actor/gcs_actor_manager.h"
 
 #include <algorithm>
+#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/regex.hpp>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -31,6 +33,46 @@
 #include "ray/util/logging.h"
 
 namespace {
+// ===== DECOMPDBG: temporary sub-step timing decomposition for the register/create
+// hot path. Single-threaded (GCS main thread) so atomics are only for safety. Dumps
+// cumulative per-sub-step averages every `every` registrations. Remove after profiling.
+struct DecompBucket {
+  std::atomic<int64_t> ns{0};
+  std::atomic<int64_t> n{0};
+  void Add(int64_t d) {
+    ns.fetch_add(d, std::memory_order_relaxed);
+    n.fetch_add(1, std::memory_order_relaxed);
+  }
+};
+struct DecompTimers {
+  DecompBucket reg_log, reg_dedup, reg_build, reg_book, reg_poll, reg_put, reg_total;
+  DecompBucket crt_build, crt_pub, crt_sched, crt_total;
+  void MaybeDump(int64_t every) {
+    int64_t c = reg_total.n.load(std::memory_order_relaxed);
+    if (c == 0 || c % every != 0) {
+      return;
+    }
+    auto us = [](const DecompBucket &b) {
+      int64_t n = b.n.load(std::memory_order_relaxed);
+      return n ? static_cast<double>(b.ns.load(std::memory_order_relaxed)) / n / 1000.0
+               : 0.0;
+    };
+    RAY_LOG(INFO) << "DECOMPDBG regN=" << c << " reg_total_us=" << us(reg_total)
+                  << " | reg_log=" << us(reg_log) << " reg_dedup=" << us(reg_dedup)
+                  << " reg_build=" << us(reg_build) << " reg_book=" << us(reg_book)
+                  << " reg_poll=" << us(reg_poll) << " reg_put=" << us(reg_put)
+                  << " || crtN=" << crt_total.n.load(std::memory_order_relaxed)
+                  << " crt_total_us=" << us(crt_total) << " | crt_build=" << us(crt_build)
+                  << " crt_pub=" << us(crt_pub) << " crt_sched=" << us(crt_sched);
+  }
+};
+DecompTimers g_decomp;
+using DecompClock = std::chrono::steady_clock;
+inline int64_t DecompNs(DecompClock::time_point since) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(DecompClock::now() - since)
+      .count();
+}
+
 /// The error message constructed from below methods is user-facing, so please avoid
 /// including too much implementation detail or internal information.
 void AddActorInfo(const ray::rpc::ActorTableData *actor_data,
@@ -313,11 +355,14 @@ void GcsActorManager::HandleReportActorOutOfScope(
 void GcsActorManager::HandleRegisterActor(rpc::RegisterActorRequest request,
                                           rpc::RegisterActorReply *reply,
                                           rpc::SendReplyCallback send_reply_callback) {
+  auto _th = DecompClock::now();
   RAY_CHECK(request.task_spec().type() == TaskType::ACTOR_CREATION_TASK);
   auto actor_id =
       ActorID::FromBinary(request.task_spec().actor_creation_task_spec().actor_id());
 
+  auto _tl = DecompClock::now();
   RAY_LOG(INFO).WithField(actor_id.JobId()).WithField(actor_id) << "Registering actor";
+  g_decomp.reg_log.Add(DecompNs(_tl));
   Status status = RegisterActor(
       request, [reply, send_reply_callback, actor_id](const Status &register_status) {
         if (register_status.ok()) {
@@ -335,6 +380,8 @@ void GcsActorManager::HandleRegisterActor(rpc::RegisterActorRequest request,
     GCS_RPC_SEND_REPLY(send_reply_callback, reply, status);
   }
   ++counts_[CountType::REGISTER_ACTOR_REQUEST];
+  g_decomp.reg_total.Add(DecompNs(_th));
+  g_decomp.MaybeDump(1000);
 }
 
 void GcsActorManager::HandleRestartActorForLineageReconstruction(
@@ -661,6 +708,7 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
                                       std::function<void(Status)> register_callback) {
   RAY_CHECK(thread_checker_.IsOnSameThread());
   RAY_CHECK(register_callback);
+  auto _tr = DecompClock::now();
   const auto &actor_creation_task_spec = request.task_spec().actor_creation_task_spec();
   auto actor_id = ActorID::FromBinary(actor_creation_task_spec.actor_id());
 
@@ -689,11 +737,15 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
   std::string ray_namespace = actor_creation_task_spec.ray_namespace();
   RAY_CHECK(!ray_namespace.empty())
       << "`ray_namespace` should be set when creating actor in core worker.";
+  g_decomp.reg_dedup.Add(DecompNs(_tr));
+  _tr = DecompClock::now();
   auto actor = std::make_shared<GcsActor>(request.task_spec(),
                                           ray_namespace,
                                           actor_state_counter_,
                                           ray_event_recorder_,
                                           session_name_);
+  g_decomp.reg_build.Add(DecompNs(_tr));
+  _tr = DecompClock::now();
   if (!actor->GetName().empty()) {
     auto &actors_in_namespace = named_actors_[actor->GetRayNamespace()];
     auto it = actors_in_namespace.find(actor->GetName());
@@ -729,6 +781,8 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
   auto node_id = NodeID::FromBinary(owner_address.node_id());
   auto worker_id = WorkerID::FromBinary(owner_address.worker_id());
   RAY_CHECK(unresolved_actors_[node_id][worker_id].emplace(actor->GetActorID()).second);
+  g_decomp.reg_book.Add(DecompNs(_tr));
+  _tr = DecompClock::now();
 
   if (!actor->IsDetached()) {
     // This actor is owned. Send a long polling request to the actor's
@@ -739,6 +793,8 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
     runtime_env_manager_.AddURIReference(actor->GetActorID().Hex(),
                                          request.task_spec().runtime_env_info());
   }
+  g_decomp.reg_poll.Add(DecompNs(_tr));
+  _tr = DecompClock::now();
 
   // The backend storage is supposed to be reliable, so the status must be ok.
   gcs_table_storage_->ActorTaskSpecTable().Put(
@@ -787,6 +843,7 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
               io_context_});
        },
        io_context_});
+  g_decomp.reg_put.Add(DecompNs(_tr));
 
   return Status::OK();
 }
@@ -797,6 +854,7 @@ Status GcsActorManager::CreateActor(const ray::rpc::CreateActorRequest &request,
   // the GCS server is restarted, it is required to continue to create actor
   // successfully.
   RAY_CHECK(callback);
+  auto _tc0 = DecompClock::now();
   const auto &actor_creation_task_spec = request.task_spec().actor_creation_task_spec();
   auto actor_id = ActorID::FromBinary(actor_creation_task_spec.actor_id());
 
@@ -847,6 +905,7 @@ Status GcsActorManager::CreateActor(const ray::rpc::CreateActorRequest &request,
   const auto &actor_namespace = iter->second->GetRayNamespace();
   RAY_CHECK(!actor_namespace.empty())
       << "`ray_namespace` should be set when creating actor in core worker.";
+  auto _tc = DecompClock::now();
   auto actor = std::make_shared<GcsActor>(request.task_spec(),
                                           actor_namespace,
                                           actor_state_counter_,
@@ -856,6 +915,8 @@ Status GcsActorManager::CreateActor(const ray::rpc::CreateActorRequest &request,
   const auto &actor_table_data = actor->GetActorTableData();
   actor->GetMutableTaskSpec()->set_dependency_resolution_timestamp_ms(
       clock_.NowUnixMillis());
+  g_decomp.crt_build.Add(DecompNs(_tc));
+  _tc = DecompClock::now();
 
   // Pub this state for dashboard showing.
   gcs_publisher_->PublishActor(actor_id, actor_table_data);
@@ -865,9 +926,13 @@ Status GcsActorManager::CreateActor(const ray::rpc::CreateActorRequest &request,
   // Update the registered actor as its creation task specification may have changed due
   // to resolved dependencies.
   registered_actors_[actor_id] = actor;
+  g_decomp.crt_pub.Add(DecompNs(_tc));
+  _tc = DecompClock::now();
 
   // Schedule the actor.
   gcs_actor_scheduler_->Schedule(actor);
+  g_decomp.crt_sched.Add(DecompNs(_tc));
+  g_decomp.crt_total.Add(DecompNs(_tc0));
   return Status::OK();
 }
 

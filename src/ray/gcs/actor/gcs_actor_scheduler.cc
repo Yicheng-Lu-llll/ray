@@ -14,6 +14,8 @@
 
 #include "ray/gcs/actor/gcs_actor_scheduler.h"
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
@@ -22,6 +24,45 @@
 #include "ray/asio/asio_util.h"
 #include "ray/common/ray_config.h"
 #include "ray/common/scheduling/cluster_resource_data.h"
+#include "ray/util/logging.h"
+
+namespace {
+// ===== DECOMPDBG: temporary sub-step timing for actor Schedule/LeaseWorkerFromNode.
+// Single-threaded (GCS main thread). Dumps cumulative averages every `every` leases.
+struct SchedBucket {
+  std::atomic<int64_t> ns{0};
+  std::atomic<int64_t> n{0};
+  void Add(int64_t d) {
+    ns.fetch_add(d, std::memory_order_relaxed);
+    n.fetch_add(1, std::memory_order_relaxed);
+  }
+};
+struct SchedTimers {
+  SchedBucket sched_select, sched_pre, sched_log, sched_copy, sched_rpc, sched_total;
+  void MaybeDump(int64_t every) {
+    int64_t c = sched_total.n.load(std::memory_order_relaxed);
+    if (c == 0 || c % every != 0) {
+      return;
+    }
+    auto us = [](const SchedBucket &b) {
+      int64_t n = b.n.load(std::memory_order_relaxed);
+      return n ? static_cast<double>(b.ns.load(std::memory_order_relaxed)) / n / 1000.0
+               : 0.0;
+    };
+    RAY_LOG(INFO) << "DECOMPDBG-SCHED schedN=" << c
+                  << " sched_total_us=" << us(sched_total)
+                  << " | sched_select=" << us(sched_select)
+                  << " sched_pre=" << us(sched_pre) << " sched_log=" << us(sched_log)
+                  << " sched_copy=" << us(sched_copy) << " sched_rpc=" << us(sched_rpc);
+  }
+};
+SchedTimers g_sched;
+using SchedClock = std::chrono::steady_clock;
+inline int64_t SchedNs(SchedClock::time_point since) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(SchedClock::now() - since)
+      .count();
+}
+}  // namespace
 
 namespace ray {
 namespace gcs {
@@ -54,9 +95,12 @@ void GcsActorScheduler::Schedule(std::shared_ptr<GcsActor> actor) {
   // TODO(irabbani): Understand why this CHECK exists and either remove or
   // add an error message.
   RAY_CHECK(actor->GetNodeID().IsNil() && actor->GetWorkerID().IsNil());
+  auto _ts0 = SchedClock::now();
 
   // Select a node to where the actor is forwarded.
   auto node_id = SelectForwardingNode(actor);
+  g_sched.sched_select.Add(SchedNs(_ts0));
+  auto _tpre = SchedClock::now();
 
   auto node = gcs_node_manager_.GetAliveNode(node_id);
   if (!node.has_value()) {
@@ -96,7 +140,10 @@ void GcsActorScheduler::Schedule(std::shared_ptr<GcsActor> actor) {
   } else {
     actor->SetGrantOrReject(false);
   }
+  g_sched.sched_pre.Add(SchedNs(_tpre));
   LeaseWorkerFromNode(actor, node.value());
+  g_sched.sched_total.Add(SchedNs(_ts0));
+  g_sched.MaybeDump(1000);
 }
 
 NodeID GcsActorScheduler::SelectForwardingNode(std::shared_ptr<GcsActor> actor) {
@@ -270,11 +317,13 @@ void GcsActorScheduler::LeaseWorkerFromNode(
   RAY_CHECK(actor && node);
 
   auto node_id = NodeID::FromBinary(node->node_id());
+  auto _tlog = SchedClock::now();
   RAY_LOG(INFO)
           .WithField(actor->GetActorID())
           .WithField(actor->GetActorID().JobId())
           .WithField(node_id)
       << "Leasing worker for actor.";
+  g_sched.sched_log.Add(SchedNs(_tlog));
 
   // We need to ensure that the RequestWorkerLease won't be sent before the reply of
   // ReleaseUnusedActorWorkers is returned.
@@ -283,6 +332,7 @@ void GcsActorScheduler::LeaseWorkerFromNode(
     return;
   }
 
+  auto _tcopy = SchedClock::now();
   rpc::Address remote_address;
   remote_address.set_node_id(node->node_id());
   remote_address.set_ip_address(node->node_manager_address());
@@ -300,12 +350,15 @@ void GcsActorScheduler::LeaseWorkerFromNode(
   request.set_grant_or_reject(actor->GetGrantOrReject());
   request.set_backlog_size(0);
   request.set_is_selected_based_on_locality(false);
+  g_sched.sched_copy.Add(SchedNs(_tcopy));
+  auto _trpc = SchedClock::now();
   raylet_client->RequestWorkerLease(
       std::move(request),
       [this, actor, node](const Status &status,
                           const rpc::RequestWorkerLeaseReply &reply) {
         HandleWorkerLeaseReply(actor, node, status, reply);
       });
+  g_sched.sched_rpc.Add(SchedNs(_trpc));
 }
 
 void GcsActorScheduler::RetryLeasingWorkerFromNode(

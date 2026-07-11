@@ -319,6 +319,16 @@ RAY_CONFIG(int64_t, kill_worker_timeout_milliseconds, 5000)
 /// during graceful shutdown.
 RAY_CONFIG(int64_t, actor_graceful_shutdown_timeout_ms, 30000)
 
+/// When enabled, the GCS issues the actor creation task push to the leased
+/// worker from a dedicated side thread instead of the main thread. The
+/// request-side grpc work (serialization, call creation and — because every
+/// actor gets a fresh worker, i.e. a cold channel — the connection
+/// establishment machinery) otherwise runs inline on the GCS main thread
+/// (~0.5ms per actor) and bounds actor creation throughput. The reply callback
+/// is still posted back to the main io_context, so state mutations stay
+/// single-threaded.
+RAY_CONFIG(bool, gcs_actor_creation_push_offload_enabled, false)
+
 /// The duration that we wait after the worker is launched before the
 /// starting_worker_timeout_callback() is called.
 RAY_CONFIG(int64_t, worker_register_timeout_seconds, 60)

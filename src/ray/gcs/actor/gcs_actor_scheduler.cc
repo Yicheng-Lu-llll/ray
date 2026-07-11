@@ -506,9 +506,7 @@ void GcsActorScheduler::CreateActorOnWorker(std::shared_ptr<GcsActor> actor,
                             std::memory_order_relaxed);
 
   auto client = worker_client_pool_.GetOrConnect(worker->GetAddress());
-  auto _ts = std::chrono::steady_clock::now();
-  client->PushNormalTask(
-      std::move(request),
+  auto push_callback =
       [this, actor, worker](Status status, const rpc::PushTaskReply &reply) {
         // If the actor is still in the creating map and the status is ok, remove the
         // actor from the creating map and invoke the schedule_success_handler_.
@@ -555,7 +553,34 @@ void GcsActorScheduler::CreateActorOnWorker(std::shared_ptr<GcsActor> actor,
                 actor->LocalRayletAddress().value(), worker->GetAddress(), actor_id);
           }
         }
-      });
+      };
+  auto _ts = std::chrono::steady_clock::now();
+  if (RayConfig::instance().gcs_actor_creation_push_offload_enabled()) {
+    // Issue the push from a dedicated side thread. The request-side grpc work
+    // (serialization, call creation and — since every actor gets a fresh worker
+    // process, i.e. a cold channel — the connection-establishment machinery)
+    // otherwise runs inline on this thread. The reply callback is posted back
+    // to the main io_context by the ClientCallManager, so all state mutations
+    // stay on the main thread.
+    if (push_io_thread_ == nullptr) {
+      push_io_thread_ = std::make_unique<InstrumentedIOContextWithThread>(
+          "gcs_actor_push",
+          /*enable_lag_probe=*/false,
+          /*used_for_health_check=*/false);
+    }
+    // std::function requires a copyable callable, so hold the request in a
+    // shared_ptr across the post and move it back out on the send thread.
+    std::shared_ptr<rpc::PushTaskRequest> request_holder = std::move(request);
+    push_io_thread_->GetIoService().post(
+        [client, request_holder, push_callback]() {
+          client->PushNormalTask(
+              std::make_unique<rpc::PushTaskRequest>(std::move(*request_holder)),
+              push_callback);
+        },
+        "OffloadActorCreationPush");
+  } else {
+    client->PushNormalTask(std::move(request), push_callback);
+  }
   decomp_send_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - _ts)
                                .count(),

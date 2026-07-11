@@ -24,6 +24,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "ray/asio/asio_util.h"
 #include "ray/asio/instrumented_io_context.h"
 #include "ray/common/id.h"
 #include "ray/common/status.h"
@@ -363,6 +364,12 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
   rpc::RayletClientPool &raylet_client_pool_;
   /// Core worker client pool shared by the GCS.
   rpc::CoreWorkerClientPool &worker_client_pool_;
+  /// Dedicated side thread that issues the actor creation task pushes when
+  /// `gcs_actor_creation_push_offload_enabled` is set, so the request-side grpc
+  /// work (serialization, call creation and the cold per-worker channel's
+  /// connection establishment) is not paid on the main thread. Created lazily
+  /// from the main thread only.
+  std::unique_ptr<InstrumentedIOContextWithThread> push_io_thread_;
 
   /// The resource changed listeners.
   std::vector<std::function<void()>> resource_changed_listeners_;

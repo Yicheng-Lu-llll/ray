@@ -52,10 +52,6 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
   virtual void GetObjectStatus(GetObjectStatusRequest &&request,
                                const ClientCallback<GetObjectStatusReply> &callback) = 0;
 
-  virtual void WaitForActorRefDeleted(
-      WaitForActorRefDeletedRequest &&request,
-      const ClientCallback<WaitForActorRefDeletedReply> &callback) = 0;
-
   // Object location / ownership RPCs
   virtual void UpdateObjectLocationBatch(
       UpdateObjectLocationBatchRequest &&request,

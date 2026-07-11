@@ -317,9 +317,9 @@ class GcsClientTest : public ::testing::TestWithParam<bool> {
     message.mutable_actor_creation_task_spec()->set_actor_id(actor_id.Binary());
     message.mutable_actor_creation_task_spec()->set_is_detached(is_detached);
     message.mutable_actor_creation_task_spec()->set_ray_namespace("test");
-    // If the actor is non-detached, the `WaitForActorRefDeleted` function of the core
-    // worker client is called during the actor registration process. In order to simulate
-    // the scenario of registration failure, we set the address to an illegal value.
+    // Give non-detached actors a syntactically valid (but unreachable) owner
+    // address. Nothing contacts the owner during registration: the ref-deleted
+    // signal is pushed by the owner (ReportActorRefDeleted), not polled.
     if (!is_detached) {
       rpc::Address address;
       address.set_worker_id(WorkerID::FromRandom().Binary());
@@ -787,12 +787,6 @@ TEST_P(GcsClientTest, TestActorTableResubscribe) {
   // expected number of actor subscription messages before registering actor.
   auto expected_num_subscribe_one_notifications = num_subscribe_one_notifications + 1;
 
-  // NOTE: In the process of actor registration, if the callback function of
-  // `WaitForActorRefDeleted` is executed first, and then the callback function of
-  // `ActorTable().Put` is executed, the actor registration fails, we will receive one
-  // notification message; otherwise, the actor registration succeeds, we will receive
-  // two notification messages. So we can't assert whether the actor is registered
-  // successfully.
   RegisterActor(actor_table_data, false);
 
   auto condition_subscribe_one = [&num_subscribe_one_notifications,
@@ -965,15 +959,24 @@ TEST_P(GcsClientTest, TestEvictExpiredDestroyedActors) {
   if (RayConfig::instance().gcs_storage() == gcs::GcsServer::kInMemoryStorage) {
     return;
   }
-  // Register actors and the actors will be destroyed.
+  // Register actors, then destroy each by reporting its refs deleted (as the
+  // owner would once its reference count hits zero).
   JobID job_id = JobID::FromInt(1);
   AddJob(job_id);
+  auto report_actor_ref_deleted = [this](const ActorID &actor_id) {
+    std::promise<bool> promise;
+    gcs_client_->Actors().AsyncReportActorRefDeleted(
+        actor_id, [&promise](Status status) { promise.set_value(status.ok()); });
+    EXPECT_TRUE(WaitReady(promise.get_future(), timeout_ms_));
+  };
   absl::flat_hash_set<ActorID> actor_ids;
   int actor_count = RayConfig::instance().maximum_gcs_destroyed_actor_cached_count();
   for (int index = 0; index < actor_count; ++index) {
     auto actor_table_data = GenActorTableData(job_id);
     RegisterActor(actor_table_data, false);
-    actor_ids.insert(ActorID::FromBinary(actor_table_data->actor_id()));
+    auto actor_id = ActorID::FromBinary(actor_table_data->actor_id());
+    report_actor_ref_deleted(actor_id);
+    actor_ids.insert(actor_id);
   }
 
   // Restart GCS.
@@ -983,12 +986,11 @@ TEST_P(GcsClientTest, TestEvictExpiredDestroyedActors) {
   for (int index = 0; index < actor_count; ++index) {
     auto actor_table_data = GenActorTableData(job_id);
     RegisterActor(actor_table_data, false);
-    actor_ids.insert(ActorID::FromBinary(actor_table_data->actor_id()));
+    auto actor_id = ActorID::FromBinary(actor_table_data->actor_id());
+    report_actor_ref_deleted(actor_id);
+    actor_ids.insert(actor_id);
   }
 
-  // NOTE: GCS will not reply when actor registration fails, so when GCS restarts, gcs
-  // client will register the actor again and the status of the actor may be
-  // `DEPENDENCIES_UNREADY` or `DEAD`. We should get all dead actors.
   auto condition = [this]() {
     return GetAllActors(true).size() ==
            RayConfig::instance().maximum_gcs_destroyed_actor_cached_count();

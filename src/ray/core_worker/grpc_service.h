@@ -64,10 +64,6 @@ class CoreWorkerServiceHandler : public DelayedServiceHandler {
                                      GetObjectStatusReply *reply,
                                      SendReplyCallback send_reply_callback) = 0;
 
-  virtual void HandleWaitForActorRefDeleted(WaitForActorRefDeletedRequest request,
-                                            WaitForActorRefDeletedReply *reply,
-                                            SendReplyCallback send_reply_callback) = 0;
-
   virtual void HandlePubsubLongPolling(PubsubLongPollingRequest request,
                                        PubsubLongPollingReply *reply,
                                        SendReplyCallback send_reply_callback) = 0;

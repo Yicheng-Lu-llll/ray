@@ -84,29 +84,11 @@ class MockWorkerClient : public rpc::FakeCoreWorkerClient {
   explicit MockWorkerClient(instrumented_io_context &io_service)
       : io_service_(io_service) {}
 
-  void WaitForActorRefDeleted(
-      rpc::WaitForActorRefDeletedRequest &&request,
-      const rpc::ClientCallback<rpc::WaitForActorRefDeletedReply> &callback) override {
-    callbacks_.push_back(callback);
-  }
-
   void KillActor(const rpc::KillActorRequest &request,
                  const rpc::ClientCallback<rpc::KillActorReply> &callback) override {
     killed_actors_.push_back(ActorID::FromBinary(request.intended_actor_id()));
   }
 
-  bool Reply(Status status = Status::OK()) {
-    if (callbacks_.size() == 0) {
-      return false;
-    }
-    auto callback = callbacks_.front();
-    auto reply = rpc::WaitForActorRefDeletedReply();
-    callback(status, std::move(reply));
-    callbacks_.pop_front();
-    return true;
-  }
-
-  std::list<rpc::ClientCallback<rpc::WaitForActorRefDeletedReply>> callbacks_;
   std::vector<ActorID> killed_actors_;
   instrumented_io_context &io_service_;
 };
@@ -225,6 +207,14 @@ class GcsActorManagerTest : public ::testing::Test {
     return gcs_actor_manager_->registered_actors_.contains(actor_id)
                ? gcs_actor_manager_->registered_actors_[actor_id]
                : nullptr;
+  }
+
+  bool IsActorRegistered(const ActorID &actor_id) const {
+    return gcs_actor_manager_->registered_actors_.contains(actor_id);
+  }
+
+  Status RegisterActorRequest(const rpc::RegisterActorRequest &request) {
+    return gcs_actor_manager_->RegisterActor(request, [](const Status &) {});
   }
 
   void OnNodeDead(const NodeID &node_id) {
@@ -351,6 +341,16 @@ class GcsActorManagerTest : public ::testing::Test {
     }
   }
 
+  // The reply is written from the async ActorTable().Put completion after this
+  // returns, so keep it alive via shared_ptr (as the server's ServerCall does).
+  void ReportActorRefDeleted(const ActorID &actor_id) {
+    rpc::ReportActorRefDeletedRequest request;
+    request.set_actor_id(actor_id.Binary());
+    auto reply = std::make_shared<rpc::ReportActorRefDeletedReply>();
+    gcs_actor_manager_->HandleReportActorRefDeleted(
+        request, reply.get(), [reply](auto status, auto success, auto failure) {});
+  }
+
   FakeClock clock_;
   instrumented_io_context io_service_;
   std::shared_ptr<gcs::StoreClient> store_client_;
@@ -407,7 +407,7 @@ TEST_F(GcsActorManagerTest, TestBasic) {
   ASSERT_EQ(finished_actors.size(), 1);
   RAY_CHECK_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::ALIVE, ""), 1);
 
-  ASSERT_TRUE(worker_client_->Reply());
+  ReportActorRefDeleted(actor->GetActorID());
   ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
   RAY_CHECK_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::ALIVE, ""), 0);
   RAY_CHECK_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::DEAD, ""), 1);
@@ -495,8 +495,7 @@ TEST_F(GcsActorManagerTest, TestDeadCount) {
     actor->UpdateAddress(RandomAddress());
     gcs_actor_manager_->OnActorCreationSuccess(actor, rpc::PushTaskReply());
     io_service_.run_one();
-    // Actor is killed.
-    ASSERT_TRUE(worker_client_->Reply());
+    ReportActorRefDeleted(actor->GetActorID());
     ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
   }
 
@@ -567,8 +566,7 @@ TEST_F(GcsActorManagerTest, TestNonDeadEntryEvictionDecrementsCounter) {
     actor->UpdateAddress(RandomAddress());
     gcs_actor_manager_->OnActorCreationSuccess(actor, rpc::PushTaskReply());
     io_service_.run_one();
-    // Actor is killed.
-    ASSERT_TRUE(worker_client_->Reply());
+    ReportActorRefDeleted(actor->GetActorID());
     ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
   }
   drain_io_context();
@@ -774,8 +772,6 @@ TEST_F(GcsActorManagerTest, TestWorkerFailure) {
       "worker process has died."));
   // No more actors to schedule.
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 0);
-
-  ASSERT_TRUE(worker_client_->Reply());
 }
 
 TEST_F(GcsActorManagerTest, TestNodeFailure) {
@@ -822,8 +818,6 @@ TEST_F(GcsActorManagerTest, TestNodeFailure) {
       "node has died."));
   // No more actors to schedule.
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 0);
-
-  ASSERT_TRUE(worker_client_->Reply());
 }
 
 TEST_F(GcsActorManagerTest, TestActorReconstruction) {
@@ -890,8 +884,6 @@ TEST_F(GcsActorManagerTest, TestActorReconstruction) {
       "node has died."));
   // No more actors to schedule.
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 0);
-
-  ASSERT_TRUE(worker_client_->Reply());
 }
 
 TEST_F(GcsActorManagerTest, TestActorRestartWhenOwnerDead) {
@@ -1109,8 +1101,6 @@ TEST_F(GcsActorManagerTest, TestNamedActorDeletionWorkerFailure) {
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName(actor_name, "test"),
             actor->GetActorID());
 
-  // Detached actor has no reply of WaitForActorRefDeleted request.
-  ASSERT_FALSE(worker_client_->Reply());
   // Kill this detached actor
   rpc::KillActorViaGcsReply reply;
   rpc::KillActorViaGcsRequest request;
@@ -1271,8 +1261,7 @@ TEST_F(GcsActorManagerTest, TestDestroyActorBeforeActorCreationCompletes) {
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.clear();
 
-  // Simulate the reply of WaitForActorRefDeleted request to trigger actor destruction.
-  ASSERT_TRUE(worker_client_->Reply());
+  ReportActorRefDeleted(actor->GetActorID());
 
   // Check that the actor is in state `DEAD`.
   actor->UpdateAddress(RandomAddress());
@@ -2421,9 +2410,7 @@ TEST_F(GcsActorManagerTest, TestGetNamedActorOnDeletedActorRefReturnsNotFound) {
   // Actor should now be DEAD
   ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
 
-  // Simulate the reply of WaitForActorRefDeleted request to trigger actor ref deletion
-  ASSERT_TRUE(worker_client_->Reply())
-      << "Failed to notify the actor manager that the actor has been deleted.";
+  ReportActorRefDeleted(actor->GetActorID());
   // Actor ref should be deleted and is no longer reconstructable
   drain_io_context();
 
@@ -2462,9 +2449,7 @@ TEST_F(GcsActorManagerTest, TestRegisterNamedActorOnDeletedActorRefCreatesNewAct
   // Actor should now be DEAD
   ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
 
-  // Simulate the reply of WaitForActorRefDeleted request to trigger actor ref deletion
-  ASSERT_TRUE(worker_client_->Reply())
-      << "Failed to notify the actor manager that the actor has been deleted.";
+  ReportActorRefDeleted(actor->GetActorID());
   drain_io_context();
 
   rpc::RegisterActorRequest register_request =
@@ -2498,6 +2483,161 @@ TEST_F(GcsActorManagerTest, TestRegisterNamedActorOnDeletedActorRefCreatesNewAct
 
   // Verify the new actor has a different ID
   ASSERT_NE(actor->GetActorID(), new_actor->GetActorID());
+}
+
+TEST_F(GcsActorManagerTest, TestReportActorRefDeletedDestroysActorAndReleasesName) {
+  auto send_reply_callback = [](Status, std::function<void()>, std::function<void()>) {};
+  const JobID job_id = JobID::FromInt(1);
+  const std::string actor_name = "test_report_actor_ref_deleted_actor";
+  const std::string ray_namespace = "test_namespace";
+
+  std::shared_ptr<gcs::GcsActor> actor;
+  RegisterAndCreateNamedActor(
+      job_id, actor_name, ray_namespace, send_reply_callback, actor);
+
+  // The owner reports that all references (including lineage refs) are deleted.
+  rpc::ReportActorRefDeletedRequest ref_deleted_request;
+  ref_deleted_request.set_actor_id(actor->GetActorID().Binary());
+  rpc::ReportActorRefDeletedReply ref_deleted_reply;
+  gcs_actor_manager_->HandleReportActorRefDeleted(
+      ref_deleted_request,
+      &ref_deleted_reply,
+      [](auto status, auto success_callback, auto failure_callback) {});
+  drain_io_context();
+
+  // The actor is permanently destroyed: DEAD, not reconstructable, name released.
+  ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
+  rpc::GetNamedActorInfoRequest get_request;
+  get_request.set_name(actor_name);
+  get_request.set_ray_namespace(ray_namespace);
+  rpc::GetNamedActorInfoReply get_reply;
+  gcs_actor_manager_->HandleGetNamedActorInfo(
+      get_request, &get_reply, send_reply_callback);
+  ASSERT_EQ(get_reply.status().code(), static_cast<int>(StatusCode::NotFound))
+      << "The name should be released after the actor ref is deleted.";
+}
+
+TEST_F(GcsActorManagerTest, TestRegisterAfterOwnerDeathIsRejected) {
+  // A registration can reach the GCS *after* its owner's death was processed
+  // (the owner dies right after sending it, and the RPC is delayed/retried).
+  // Owner-death cleanup only scans bookkeeping populated at registration, so
+  // accepting it would leave an actor nothing ever destroys.
+  const JobID job_id = JobID::FromInt(1);
+  auto request = GenRegisterActorRequest(job_id, /*max_restarts=*/0, /*detached=*/false);
+  const auto &owner_address = request.task_spec().caller_address();
+  const auto owner_node_id = NodeID::FromBinary(owner_address.node_id());
+  const auto owner_worker_id = WorkerID::FromBinary(owner_address.worker_id());
+  const auto actor_id =
+      ActorID::FromBinary(request.task_spec().actor_creation_task_spec().actor_id());
+
+  gcs_actor_manager_->OnWorkerDead(owner_node_id,
+                                   owner_worker_id,
+                                   "127.0.0.1",
+                                   rpc::WorkerExitType::SYSTEM_ERROR,
+                                   "owner worker process has died.");
+  drain_io_context();
+
+  auto status = RegisterActorRequest(request);
+  ASSERT_TRUE(status.IsInvalid()) << status;
+  ASSERT_FALSE(IsActorRegistered(actor_id))
+      << "An actor whose owner already died must not be registered.";
+}
+
+TEST_F(GcsActorManagerTest, TestRegisterAfterOwnerNodeDeathIsRejected) {
+  // Same race, but the whole owning node died: worker-level deaths are not
+  // reported individually in that case, so the node tombstone must cover it.
+  const JobID job_id = JobID::FromInt(1);
+  auto request = GenRegisterActorRequest(job_id, /*max_restarts=*/0, /*detached=*/false);
+  const auto owner_node_id =
+      NodeID::FromBinary(request.task_spec().caller_address().node_id());
+  const auto actor_id =
+      ActorID::FromBinary(request.task_spec().actor_creation_task_spec().actor_id());
+
+  OnNodeDead(owner_node_id);
+  drain_io_context();
+
+  auto status = RegisterActorRequest(request);
+  ASSERT_TRUE(status.IsInvalid()) << status;
+  ASSERT_FALSE(IsActorRegistered(actor_id))
+      << "An actor whose owning node already died must not be registered.";
+}
+
+TEST_F(GcsActorManagerTest, TestReportActorRefDeletedOnDetachedActorIsRejected) {
+  // A detached actor outlives its owner's references, so a correct owner never
+  // reports this. Reject it rather than let a buggy client destroy the actor.
+  auto send_reply_callback = [](Status, std::function<void()>, std::function<void()>) {};
+  const JobID job_id = JobID::FromInt(1);
+  auto registered_actor = RegisterActor(job_id,
+                                        /*max_restarts=*/0,
+                                        /*detached=*/true,
+                                        /*name=*/"detached_actor",
+                                        /*ray_namespace=*/"test_namespace");
+  ASSERT_NE(registered_actor, nullptr);
+
+  rpc::ReportActorRefDeletedRequest request;
+  request.set_actor_id(registered_actor->GetActorID().Binary());
+  rpc::ReportActorRefDeletedReply reply;
+  gcs_actor_manager_->HandleReportActorRefDeleted(
+      request, &reply, [](Status status, auto success, auto failure) {});
+  drain_io_context();
+
+  // The business status travels in the reply; the callback status is transport-level.
+  ASSERT_EQ(reply.status().code(), static_cast<int>(StatusCode::Invalid))
+      << reply.status().message();
+  ASSERT_NE(registered_actor->GetState(), rpc::ActorTableData::DEAD)
+      << "A detached actor must not be destroyed by a ref-deleted report.";
+  rpc::GetNamedActorInfoRequest get_request;
+  get_request.set_name("detached_actor");
+  get_request.set_ray_namespace("test_namespace");
+  rpc::GetNamedActorInfoReply get_reply;
+  gcs_actor_manager_->HandleGetNamedActorInfo(
+      get_request, &get_reply, send_reply_callback);
+  ASSERT_EQ(get_reply.status().code(), static_cast<int>(StatusCode::OK));
+}
+
+TEST_F(GcsActorManagerTest, TestReportActorRefDeletedOnUnknownActorReplies) {
+  rpc::ReportActorRefDeletedRequest request;
+  const JobID job_id = JobID::FromInt(9999);
+  request.set_actor_id(ActorID::Of(job_id, TaskID::ForDriverTask(job_id), 0).Binary());
+  rpc::ReportActorRefDeletedReply reply;
+  bool replied = false;
+  gcs_actor_manager_->HandleReportActorRefDeleted(
+      request,
+      &reply,
+      [&replied](auto status, auto success_callback, auto failure_callback) {
+        replied = true;
+      });
+  ASSERT_TRUE(replied) << "Reporting an unknown/already-dead actor should reply OK.";
+}
+
+TEST_F(GcsActorManagerTest, TestOwnerDeathDestroysActorAndReleasesName) {
+  auto send_reply_callback = [](Status, std::function<void()>, std::function<void()>) {};
+  const JobID job_id = JobID::FromInt(1);
+  const std::string actor_name = "test_owner_death_actor";
+  const std::string ray_namespace = "test_namespace";
+
+  std::shared_ptr<gcs::GcsActor> actor;
+  RegisterAndCreateNamedActor(
+      job_id, actor_name, ray_namespace, send_reply_callback, actor);
+
+  // The owner dies without ever reporting ref-deleted: owner-death cleanup
+  // must still destroy the actor and release its name.
+  gcs_actor_manager_->OnWorkerDead(actor->GetOwnerNodeID(),
+                                   actor->GetOwnerID(),
+                                   "127.0.0.1",
+                                   rpc::WorkerExitType::SYSTEM_ERROR,
+                                   "owner worker process has died.");
+  drain_io_context();
+
+  ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
+  rpc::GetNamedActorInfoRequest get_request;
+  get_request.set_name(actor_name);
+  get_request.set_ray_namespace(ray_namespace);
+  rpc::GetNamedActorInfoReply get_reply;
+  gcs_actor_manager_->HandleGetNamedActorInfo(
+      get_request, &get_reply, send_reply_callback);
+  ASSERT_EQ(get_reply.status().code(), static_cast<int>(StatusCode::NotFound))
+      << "The name should be released after the owner dies.";
 }
 
 TEST_F(GcsActorManagerTest, TestGetNamedActorOnInScopeActorReturnsSameActor) {

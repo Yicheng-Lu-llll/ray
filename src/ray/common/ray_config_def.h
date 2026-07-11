@@ -435,6 +435,11 @@ RAY_CONFIG(double, gcs_create_placement_group_retry_multiplier, 1.5)
 RAY_CONFIG(uint32_t, maximum_gcs_destroyed_actor_cached_count, 100000)
 /// Maximum number of dead nodes in GCS server memory cache.
 RAY_CONFIG(uint32_t, maximum_gcs_dead_node_cached_count, 1000)
+
+/// Maximum number of recently dead owner workers remembered by the GCS actor
+/// manager to reject actor registrations whose owner already died before the
+/// registration was processed.
+RAY_CONFIG(uint32_t, maximum_gcs_dead_owner_worker_cached_count, 32768)
 /// The storage backend to use for the GCS. It can be 'memory', 'redis', or
 /// 'rocksdb'.
 RAY_CONFIG(std::string, gcs_storage, "memory")

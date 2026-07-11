@@ -16,6 +16,7 @@
 
 #include <gtest/gtest_prod.h>
 
+#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -156,6 +157,10 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
                                    rpc::ReportActorOutOfScopeReply *reply,
                                    rpc::SendReplyCallback send_reply_callback) override;
 
+  void HandleReportActorRefDeleted(rpc::ReportActorRefDeletedRequest request,
+                                   rpc::ReportActorRefDeletedReply *reply,
+                                   rpc::SendReplyCallback send_reply_callback) override;
+
   /// Set actors on the node as preempted and publish the actor information.
   /// If the node is already dead, this method is a no-op.
   void SetPreemptedAndPublish(const NodeID &node_id);
@@ -289,17 +294,32 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
       std::shared_ptr<const rpc::GcsNodeInfo> node);
   /// A data structure representing an actor's owner.
   struct Owner {
-    explicit Owner(rpc::Address address) : address_(std::move(address)) {}
-    /// The address of the owner.
-    rpc::Address address_;
     /// The IDs of actors owned by this worker.
     absl::flat_hash_set<ActorID> children_actor_ids_;
   };
 
-  /// Poll an actor's owner so that we will receive a notification when the
-  /// actor has no references, or the owner has died. This should not be
-  /// called for detached actors.
-  void PollOwnerForActorRefDeleted(const std::shared_ptr<GcsActor> &actor);
+  /// Track the actor in its owner's bookkeeping (`owners_`) so that
+  /// owner-death cleanup (OnWorkerDead/OnNodeDead) destroys it when the owner
+  /// dies. This should not be called for detached actors.
+  void AddActorToOwner(const std::shared_ptr<GcsActor> &actor);
+
+  /// Record an owner worker / node death in the bounded tombstone caches
+  /// consulted by `IsOwnerKnownDead`.
+  void RecordOwnerWorkerDead(const WorkerID &worker_id);
+  void RecordNodeDead(const NodeID &node_id);
+
+  /// Whether the owner worker (or its whole node) is already known to be dead.
+  ///
+  /// Used to reject a RegisterActor that arrives *after* its owner's death was
+  /// processed: owner-death cleanup scans `owners_` / `unresolved_actors_` /
+  /// `created_actors_`, which are only populated at registration, so an actor
+  /// registered after that scan would never be destroyed (a permanent
+  /// DEPENDENCIES_UNREADY ghost; a named one occupies its name forever). A hit
+  /// is always a real death because worker and node IDs are never reused; the
+  /// caches are bounded FIFOs, so a miss after eviction merely falls back to
+  /// the pre-existing behavior.
+  bool IsOwnerKnownDead(const NodeID &owner_node_id,
+                        const WorkerID &owner_worker_id) const;
 
   /// Destroy an actor that has gone out of scope. This cleans up all local
   /// state associated with the actor and marks the actor as dead. For owned
@@ -497,6 +517,12 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
   /// worker. An owned actor should be destroyed once it has gone out of scope,
   /// according to its owner, or the owner dies.
   absl::flat_hash_map<NodeID, absl::flat_hash_map<WorkerID, Owner>> owners_;
+  /// Bounded FIFO tombstones of recently dead owner workers / nodes, consulted
+  /// by `IsOwnerKnownDead` to reject registrations racing with owner death.
+  absl::flat_hash_set<WorkerID> recently_dead_owner_workers_;
+  std::deque<WorkerID> recently_dead_owner_workers_fifo_;
+  absl::flat_hash_set<NodeID> recently_dead_nodes_;
+  std::deque<NodeID> recently_dead_nodes_fifo_;
 
   /// The scheduler to schedule all registered actors.
   std::unique_ptr<GcsActorSchedulerInterface> gcs_actor_scheduler_;

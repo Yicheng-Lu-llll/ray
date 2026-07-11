@@ -86,41 +86,11 @@ class MockWorkerClient : public rpc::FakeCoreWorkerClient {
   explicit MockWorkerClient(instrumented_io_context &io_service)
       : io_service_(io_service) {}
 
-  void WaitForActorRefDeleted(
-      rpc::WaitForActorRefDeletedRequest &&request,
-      const rpc::ClientCallback<rpc::WaitForActorRefDeletedReply> &callback) override {
-    callbacks_.push_back(callback);
-  }
-
   void KillActor(const rpc::KillActorRequest &request,
                  const rpc::ClientCallback<rpc::KillActorReply> &callback) override {
     killed_actors_.push_back(ActorID::FromBinary(request.intended_actor_id()));
   }
 
-  bool Reply(Status status = Status::OK()) {
-    if (callbacks_.size() == 0) {
-      return false;
-    }
-
-    // The created_actors_ of gcs actor manager will be modified in io_service thread.
-    // In order to avoid multithreading reading and writing created_actors_, we also
-    // send the `WaitForActorRefDeleted` callback operation to io_service thread.
-    std::promise<bool> promise;
-    io_service_.post(
-        [this, status, &promise]() {
-          auto callback = callbacks_.front();
-          auto reply = rpc::WaitForActorRefDeletedReply();
-          callback(status, std::move(reply));
-          promise.set_value(false);
-        },
-        "test");
-    promise.get_future().get();
-
-    callbacks_.pop_front();
-    return true;
-  }
-
-  std::list<rpc::ClientCallback<rpc::WaitForActorRefDeletedReply>> callbacks_;
   std::vector<ActorID> killed_actors_;
   instrumented_io_context &io_service_;
 };
@@ -199,6 +169,25 @@ class GcsActorManagerTest : public ::testing::Test {
     io_service_.stop();
     thread_io_service_->join();
     std::filesystem::remove_all(log_dir_.c_str());
+  }
+
+  void ReportActorRefDeleted(const ActorID &actor_id) {
+    // The created_actors_ of gcs actor manager is modified in the io_service
+    // thread, so run the handler there, like the real RPC would.
+    std::promise<bool> promise;
+    io_service_.post(
+        [this, actor_id, &promise]() {
+          rpc::ReportActorRefDeletedRequest request;
+          request.set_actor_id(actor_id.Binary());
+          // The reply is written from the ActorTable().Put completion after
+          // this task returns; keep it alive until the reply callback has run.
+          auto reply = std::make_shared<rpc::ReportActorRefDeletedReply>();
+          gcs_actor_manager_->HandleReportActorRefDeleted(
+              request, reply.get(), [reply](auto status, auto success, auto failure) {});
+          promise.set_value(true);
+        },
+        "test");
+    promise.get_future().get();
   }
 
   void WaitActorCreated(const ActorID &actor_id) {
@@ -327,7 +316,7 @@ TEST_F(GcsActorManagerTest, TestBasic) {
   ASSERT_EQ(finished_actors.size(), 1);
   RAY_CHECK_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::ALIVE, ""), 1);
 
-  ASSERT_TRUE(worker_client_->Reply());
+  ReportActorRefDeleted(actor->GetActorID());
   ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
   RAY_CHECK_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::ALIVE, ""), 0);
   RAY_CHECK_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::DEAD, ""), 1);

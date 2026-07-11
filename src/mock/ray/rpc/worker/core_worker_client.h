@@ -52,11 +52,6 @@ class MockCoreWorkerClientInterface : public CoreWorkerClientInterface {
                const ClientCallback<GetObjectStatusReply> &callback),
               (override));
   MOCK_METHOD(void,
-              WaitForActorRefDeleted,
-              (WaitForActorRefDeletedRequest && request,
-               const ClientCallback<WaitForActorRefDeletedReply> &callback),
-              (override));
-  MOCK_METHOD(void,
               PubsubLongPolling,
               (PubsubLongPollingRequest && request,
                const ClientCallback<PubsubLongPollingReply> &callback),

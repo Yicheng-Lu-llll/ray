@@ -208,26 +208,6 @@ void ActorManager::OnActorKilled(const ActorID &actor_id) {
   MarkActorKilledOrOutOfScope(GetActorHandle(actor_id));
 }
 
-void ActorManager::WaitForActorRefDeleted(
-    const ActorID &actor_id,
-    std::function<void(const ActorID &)> actor_ref_deleted_callback) {
-  // GCS actor manager will wait until the actor has been created before polling the
-  // owner. This should avoid any asynchronous problems.
-  auto callback =
-      [actor_id, actor_ref_deleted_callback = std::move(actor_ref_deleted_callback)](
-          const ObjectID &object_id) { actor_ref_deleted_callback(actor_id); };
-
-  // Returns true if the object was present and the callback was added. It might have
-  // already been evicted by the time we get this request, in which case we should
-  // respond immediately so the gcs server can destroy the actor.
-  const auto actor_creation_return_id = ObjectID::ForActorHandle(actor_id);
-  if (!reference_counter_.AddObjectRefDeletedCallback(actor_creation_return_id,
-                                                      callback)) {
-    RAY_LOG(DEBUG).WithField(actor_id) << "ActorID reference already gone";
-    callback(actor_creation_return_id);
-  }
-}
-
 void ActorManager::HandleActorStateNotification(const ActorID &actor_id,
                                                 const rpc::ActorTableData &actor_data) {
   const auto &actor_state = rpc::ActorTableData::ActorState_Name(actor_data.state());

@@ -42,6 +42,9 @@ class FakeActorCreator : public ActorCreatorInterface {
                                   uint64_t num_restarts_due_to_lineage_reconstruction,
                                   rpc::StatusCallback callback) override {}
 
+  void AsyncReportActorRefDeleted(const ActorID &actor_id,
+                                  rpc::StatusCallback callback) override {}
+
   void AsyncCreateActor(
       const TaskSpecification &task_spec,
       const rpc::ClientCallback<rpc::CreateActorReply> &callback) override {}

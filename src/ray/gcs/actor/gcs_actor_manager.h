@@ -156,6 +156,10 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
                                    rpc::ReportActorOutOfScopeReply *reply,
                                    rpc::SendReplyCallback send_reply_callback) override;
 
+  void HandleReportActorRefDeleted(rpc::ReportActorRefDeletedRequest request,
+                                   rpc::ReportActorRefDeletedReply *reply,
+                                   rpc::SendReplyCallback send_reply_callback) override;
+
   /// Set actors on the node as preempted and publish the actor information.
   /// If the node is already dead, this method is a no-op.
   void SetPreemptedAndPublish(const NodeID &node_id);

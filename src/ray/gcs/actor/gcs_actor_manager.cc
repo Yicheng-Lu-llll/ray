@@ -359,6 +359,30 @@ void GcsActorManager::HandleReportActorOutOfScope(
   }
 }
 
+void GcsActorManager::HandleReportActorRefDeleted(
+    rpc::ReportActorRefDeletedRequest request,
+    rpc::ReportActorRefDeletedReply *reply,
+    rpc::SendReplyCallback send_reply_callback) {
+  auto actor_id = ActorID::FromBinary(request.actor_id());
+  auto it = registered_actors_.find(actor_id);
+  if (it == registered_actors_.end()) {
+    RAY_LOG(INFO).WithField(actor_id) << "The ref-deleted actor is already dead";
+    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+    return;
+  }
+  RAY_LOG(INFO).WithField(actor_id)
+      << "Actor has no references (including lineage refs), destroying actor";
+  int64_t timeout_ms = RayConfig::instance().actor_graceful_shutdown_timeout_ms();
+  DestroyActor(
+      actor_id,
+      GenActorRefDeletedCause(GetActorTableData(actor_id)),
+      /*force_kill=*/false,
+      [reply, send_reply_callback]() {
+        GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+      },
+      timeout_ms);
+}
+
 void GcsActorManager::HandleRegisterActor(rpc::RegisterActorRequest request,
                                           rpc::RegisterActorReply *reply,
                                           rpc::SendReplyCallback send_reply_callback) {
@@ -1022,6 +1046,14 @@ void GcsActorManager::PollOwnerForActorRefDeleted(
     it = workers.emplace(owner_id, Owner(actor->GetOwnerAddress())).first;
   }
   it->second.children_actor_ids_.insert(actor_id);
+
+  if (RayConfig::instance().actor_ref_deleted_push_enabled()) {
+    // The owner pushes a ReportActorRefDeleted RPC when all references to the
+    // actor are deleted, so there is no need to hold a per-actor long-poll on
+    // the owner. The owner bookkeeping above is still required for destroying
+    // the owner's actors when the owner dies (OnWorkerDead/OnNodeDead).
+    return;
+  }
 
   rpc::WaitForActorRefDeletedRequest wait_request;
   wait_request.set_intended_worker_id(owner_id.Binary());

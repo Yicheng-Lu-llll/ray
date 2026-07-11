@@ -416,6 +416,14 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   void NotifyGCSWhenActorOutOfScope(const ActorID &actor_id,
                                     uint64_t num_restarts_due_to_lineage_reconstructions);
 
+  /// Notify the GCS when all references to the actor (including lineage refs)
+  /// are deleted, so the GCS can permanently destroy the actor. Only used when
+  /// `actor_ref_deleted_push_enabled` is set, in which case the GCS does not
+  /// hold a per-actor WaitForActorRefDeleted long-poll on the owner. Must be
+  /// installed only after the actor registration reply is received, so the
+  /// report can never race ahead of the registration on the GCS side.
+  void NotifyGCSWhenActorRefDeleted(const ActorID &actor_id);
+
   /// Pool for producing new core worker clients.
   rpc::CoreWorkerClientPool &core_worker_client_pool_;
 

@@ -618,7 +618,6 @@ void GcsServer::InitGcsActorManager(
         gcs_placement_group_manager_->CleanPlacementGroupIfNeededWhenActorDead(actor_id);
       },
       raylet_client_pool_,
-      worker_client_pool_,
       *ray_event_recorder_,
       config_.session_name,
       actor_by_state_gauge,

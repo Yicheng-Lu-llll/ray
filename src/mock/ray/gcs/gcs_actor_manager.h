@@ -30,8 +30,7 @@ class MockGcsActorManager : public GcsActorManager {
  public:
   MockGcsActorManager(RuntimeEnvManager &runtime_env_manager,
                       GCSFunctionManager &function_manager,
-                      rpc::RayletClientPool &raylet_client_pool,
-                      rpc::CoreWorkerClientPool &worker_client_pool)
+                      rpc::RayletClientPool &raylet_client_pool)
       : GcsActorManager(
             /*scheduler=*/
             nullptr,
@@ -42,7 +41,6 @@ class MockGcsActorManager : public GcsActorManager {
             function_manager,
             [](const ActorID &) {},
             raylet_client_pool,
-            worker_client_pool,
             /*ray_event_recorder=*/fake_ray_event_recorder_,
             /*session_name=*/"",
             /*actor_by_state_gauge=*/fake_actor_by_state_gauge_,

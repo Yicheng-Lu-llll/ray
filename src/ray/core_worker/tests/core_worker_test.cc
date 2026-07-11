@@ -954,6 +954,10 @@ TEST_F(CoreWorkerTest, NamedActorRegisterFailureReleasesHandleReference) {
   ASSERT_TRUE(status.IsTimedOut()) << status;
   EXPECT_FALSE(reference_counter_->HasReference(ObjectID::ForActorHandle(actor_id)));
   EXPECT_EQ(task_manager_->NumPendingTasks(), 0);
+  // The push model has no GCS-side poll: the failure path must arm and send
+  // the ref-deleted report itself, or the GCS never learns.
+  ASSERT_EQ(mock_gcs_client_->mock_actor_accessor->reported_ref_deleted_actor_ids_,
+            std::vector<ActorID>{actor_id});
 
   mock_gcs_client_->mock_actor_accessor->sync_register_actor_status_ = Status::OK();
   ActorID ok_actor_id;
@@ -966,6 +970,9 @@ TEST_F(CoreWorkerTest, NamedActorRegisterFailureReleasesHandleReference) {
   ASSERT_TRUE(status.ok()) << status;
   EXPECT_TRUE(reference_counter_->HasReference(ObjectID::ForActorHandle(ok_actor_id)));
   EXPECT_EQ(task_manager_->NumPendingTasks(), 1);
+  // No report for the successful registration: its reference is still held.
+  EXPECT_EQ(mock_gcs_client_->mock_actor_accessor->reported_ref_deleted_actor_ids_.size(),
+            1u);
 }
 
 TEST_F(CoreWorkerTest, HandlePubsubCommandBatchInvalidChannelType) {
@@ -1256,169 +1263,6 @@ TEST_F(CoreWorkerTest, HandlePubsubWorkerObjectLocationsChannelRetries) {
     CheckMessage(msg, i);
   }
 }
-
-class HandleWaitForActorRefDeletedRetriesTest
-    : public CoreWorkerTest,
-      public ::testing::WithParamInterface<bool> {};
-
-TEST_P(HandleWaitForActorRefDeletedRetriesTest, ActorRefDeletedForRegisteredActor) {
-  // delete_actor_handle: determines whether the actor handle is removed from the
-  // reference counter. This is used to trigger the send_reply_callback which is stored in
-  // the reference counter via delete_actor_handle == true: the actor handle is removed
-  // from the reference counter and we expect the send_reply_callback to be triggered.
-  // delete_actor_handle == false: the actor handle is not removed from the reference
-  // counter and we expect the send_reply_callback to not be triggered.
-  bool delete_actor_handle = GetParam();
-
-  auto actor_id = ActorID::Of(JobID::FromInt(0), TaskID::Nil(), 0);
-  auto actor_creation_return_id = ObjectID::ForActorHandle(actor_id);
-
-  rpc::Address owner_address;
-  owner_address.set_worker_id(core_worker_->GetWorkerID().Binary());
-  reference_counter_->AddOwnedObject(actor_creation_return_id,
-                                     {},
-                                     owner_address,
-                                     "test",
-                                     0,
-                                     LineageReconstructionEligibility::INELIGIBLE_PUT,
-                                     true);
-
-  rpc::WaitForActorRefDeletedRequest request;
-  request.set_actor_id(actor_id.Binary());
-  request.set_intended_worker_id(core_worker_->GetWorkerID().Binary());
-
-  size_t callback_count = 0;
-  rpc::WaitForActorRefDeletedReply reply1;
-  rpc::WaitForActorRefDeletedReply reply2;
-
-  core_worker_->HandleWaitForActorRefDeleted(
-      request,
-      &reply1,
-      [&callback_count](
-          Status s, std::function<void()> success, std::function<void()> failure) {
-        ASSERT_TRUE(s.ok());
-        callback_count++;
-      });
-
-  if (delete_actor_handle) {
-    std::vector<ObjectID> deleted;
-    // Triggers the send_reply_callback which is stored in the reference counter
-    reference_counter_->RemoveLocalReference(actor_creation_return_id, &deleted);
-    ASSERT_EQ(deleted.size(), 1u);
-    ASSERT_EQ(callback_count, 1);
-  } else {
-    ASSERT_EQ(callback_count, 0);
-  }
-
-  // The send_reply_callback is immediately triggered since the object has gone out of
-  // scope if delete_actor_handle is true. Otherwise, it is not triggered.
-  core_worker_->HandleWaitForActorRefDeleted(
-      request,
-      &reply2,
-      [&callback_count](
-          Status s, std::function<void()> success, std::function<void()> failure) {
-        ASSERT_TRUE(s.ok());
-        callback_count++;
-      });
-
-  if (delete_actor_handle) {
-    ASSERT_EQ(callback_count, 2);
-  } else {
-    ASSERT_EQ(callback_count, 0);
-  }
-}
-
-INSTANTIATE_TEST_SUITE_P(ActorRefDeletedForRegisteredActor,
-                         HandleWaitForActorRefDeletedRetriesTest,
-                         ::testing::Values(true, false));
-
-class HandleWaitForActorRefDeletedWhileRegisteringRetriesTest
-    : public CoreWorkerTest,
-      public ::testing::WithParamInterface<bool> {};
-
-TEST_P(HandleWaitForActorRefDeletedWhileRegisteringRetriesTest,
-       ActorRefDeletedForRegisteringActor) {
-  // delete_actor_handle: determines whether the actor handle is removed from the
-  // reference counter. This is used to trigger the send_reply_callback which is stored in
-  // the reference counter via delete_actor_handle == true: the actor handle is removed
-  // from the reference counter and we expect the send_reply_callback to be triggered.
-  // delete_actor_handle == false: the actor handle is not removed from the reference
-  // counter and we expect the send_reply_callback to not be triggered.
-  bool delete_actor_handle = GetParam();
-
-  auto actor_id = ActorID::Of(JobID::FromInt(0), TaskID::Nil(), 1);
-  auto actor_creation_return_id = ObjectID::ForActorHandle(actor_id);
-
-  rpc::Address owner_address;
-  owner_address.set_worker_id(core_worker_->GetWorkerID().Binary());
-
-  reference_counter_->AddOwnedObject(actor_creation_return_id,
-                                     {},
-                                     owner_address,
-                                     "test",
-                                     0,
-                                     LineageReconstructionEligibility::INELIGIBLE_PUT,
-                                     true);
-
-  rpc::TaskSpec task_spec_msg;
-  task_spec_msg.set_type(rpc::TaskType::ACTOR_CREATION_TASK);
-  auto *actor_creation_spec = task_spec_msg.mutable_actor_creation_task_spec();
-  actor_creation_spec->set_actor_id(actor_id.Binary());
-  actor_creation_spec->set_max_actor_restarts(0);
-  actor_creation_spec->set_max_task_retries(0);
-  TaskSpecification task_spec(task_spec_msg);
-
-  actor_creator_->AsyncRegisterActor(task_spec, nullptr);
-
-  ASSERT_TRUE(actor_creator_->IsActorInRegistering(actor_id));
-
-  rpc::WaitForActorRefDeletedRequest request;
-  request.set_actor_id(actor_id.Binary());
-  request.set_intended_worker_id(core_worker_->GetWorkerID().Binary());
-
-  size_t callback_count = 0;
-  rpc::WaitForActorRefDeletedReply reply1;
-  rpc::WaitForActorRefDeletedReply reply2;
-
-  // Since the actor is in the registering state, we store the callbacks and trigger them
-  // when the the actor is done registering.
-  core_worker_->HandleWaitForActorRefDeleted(
-      request,
-      &reply1,
-      [&callback_count](
-          Status s, std::function<void()> success, std::function<void()> failure) {
-        ASSERT_TRUE(s.ok());
-        callback_count++;
-      });
-
-  core_worker_->HandleWaitForActorRefDeleted(
-      request,
-      &reply2,
-      [&callback_count](
-          Status s, std::function<void()> success, std::function<void()> failure) {
-        ASSERT_TRUE(s.ok());
-        callback_count++;
-      });
-
-  ASSERT_EQ(callback_count, 0);
-  mock_gcs_client_->mock_actor_accessor->async_register_actor_callback_(Status::OK());
-  // Triggers the callbacks passed to AsyncWaitForActorRegisterFinish
-  ASSERT_FALSE(actor_creator_->IsActorInRegistering(actor_id));
-
-  if (delete_actor_handle) {
-    std::vector<ObjectID> deleted;
-    // Triggers the send_reply_callback which is stored in the reference counter
-    reference_counter_->RemoveLocalReference(actor_creation_return_id, &deleted);
-    ASSERT_EQ(deleted.size(), 1u);
-    ASSERT_EQ(callback_count, 2);
-  } else {
-    ASSERT_EQ(callback_count, 0);
-  }
-}
-
-INSTANTIATE_TEST_SUITE_P(ActorRefDeletedForRegisteringActor,
-                         HandleWaitForActorRefDeletedWhileRegisteringRetriesTest,
-                         ::testing::Values(true, false));
 
 // Callback fires after the last local reference is dropped, and
 // FlushObjectFreedCallbacks drains the pending work.

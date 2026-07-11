@@ -2188,8 +2188,8 @@ Status CoreWorker::CreateActor(const RayFunction &function,
       root_detached_actor_id,
       actor_creation_options.actor_generator_backpressure_num_objects);
   // Add the actor handle before we submit the actor creation task, since the
-  // actor handle must be in scope by the time the GCS sends the
-  // WaitForActorRefDeletedRequest.
+  // actor handle must be in scope by the time the ref-deleted watch is
+  // installed after registration.
   RAY_CHECK(actor_manager_->EmplaceNewActorHandle(
       std::move(actor_handle), CurrentCallSite(), rpc_address_, /*owned=*/!is_detached))
       << "Attempt to emplace new actor handle for the actor being created with actor id: "
@@ -2276,6 +2276,7 @@ Status CoreWorker::CreateActor(const RayFunction &function,
           task_spec.TaskId(), rpc::ErrorType::ACTOR_CREATION_FAILED, &status);
       // Detached actor doesn't need ref counting.
       if (!is_detached) {
+        actor_task_submitter_->NotifyGCSWhenActorRefDeleted(actor_id);
         RemoveActorHandleReference(actor_id);
       }
       return status;
@@ -3853,44 +3854,6 @@ void CoreWorker::PopulateObjectStatus(const ObjectID &object_id,
       reply->add_node_ids(node_id.Binary());
     }
     reply->set_object_size(locality_data.value().object_size);
-  }
-}
-
-void CoreWorker::HandleWaitForActorRefDeleted(
-    rpc::WaitForActorRefDeletedRequest request,
-    rpc::WaitForActorRefDeletedReply *reply,
-    rpc::SendReplyCallback send_reply_callback) {
-  const auto actor_id = ActorID::FromBinary(request.actor_id());
-
-  if (HandleWrongRecipient(WorkerID::FromBinary(request.intended_worker_id()),
-                           send_reply_callback)) {
-    return;
-  }
-
-  // Send a response to trigger cleaning up the actor state once the handle is
-  // no longer in scope.
-  auto respond = [send_reply_callback](const ActorID &respond_actor_id) {
-    RAY_LOG(DEBUG).WithField(respond_actor_id)
-        << "Replying to HandleWaitForActorRefDeleted";
-    send_reply_callback(Status::OK(), nullptr, nullptr);
-  };
-
-  /// The callback for each request is stored in the reference counter due to retries
-  /// and message reordering where the callback of the retry of the request could be
-  /// overwritten by the callback of the initial request.
-  if (actor_creator_->IsActorInRegistering(actor_id)) {
-    actor_creator_->AsyncWaitForActorRegisterFinish(
-        actor_id, [this, actor_id, respond = std::move(respond)](const auto &status) {
-          if (!status.ok()) {
-            respond(actor_id);
-          } else {
-            RAY_LOG(DEBUG).WithField(actor_id) << "Received HandleWaitForActorRefDeleted";
-            actor_manager_->WaitForActorRefDeleted(actor_id, std::move(respond));
-          }
-        });
-  } else {
-    RAY_LOG(DEBUG).WithField(actor_id) << "Received HandleWaitForActorRefDeleted";
-    actor_manager_->WaitForActorRefDeleted(actor_id, std::move(respond));
   }
 }
 

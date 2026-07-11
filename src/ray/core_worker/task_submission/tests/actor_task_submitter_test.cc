@@ -1011,6 +1011,36 @@ TEST_P(ActorTaskSubmitterTest, TestPerConcurrencyGroupSequencing) {
   ASSERT_EQ(worker_client_->received_seq_nos.size(), 4);
 }
 
+TEST_P(ActorTaskSubmitterTest, TestNotifyGCSWhenActorRefDeletedReportsOnRefDeletion) {
+  ActorID actor_id = ActorID::Of(JobID::FromInt(0), TaskID::Nil(), 0);
+  const ObjectID actor_handle_id = ObjectID::ForActorHandle(actor_id);
+  rpc::Address addr;
+  reference_counter_->AddOwnedObject(actor_handle_id,
+                                     {},
+                                     addr,
+                                     "",
+                                     0,
+                                     LineageReconstructionEligibility::INELIGIBLE_PUT,
+                                     /*add_local_ref=*/true);
+
+  submitter_.NotifyGCSWhenActorRefDeleted(actor_id);
+  ASSERT_TRUE(actor_creator_.ref_deleted_reports_.empty())
+      << "The report must not be sent while a reference is still held.";
+
+  reference_counter_->RemoveLocalReference(actor_handle_id, nullptr);
+  ASSERT_EQ(actor_creator_.ref_deleted_reports_, std::vector<ActorID>{actor_id});
+}
+
+TEST_P(ActorTaskSubmitterTest, TestNotifyGCSWhenActorRefDeletedReportsImmediately) {
+  // The actor handle reference is already gone when the watch is installed
+  // (e.g. the handle was deleted while the registration was in flight): the
+  // report must fire immediately instead of waiting for a deletion event that
+  // already happened.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(0), TaskID::Nil(), 0);
+  submitter_.NotifyGCSWhenActorRefDeleted(actor_id);
+  ASSERT_EQ(actor_creator_.ref_deleted_reports_, std::vector<ActorID>{actor_id});
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

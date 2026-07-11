@@ -2272,6 +2272,19 @@ Status CoreWorker::CreateActor(const RayFunction &function,
     // for local driver. But the current code all go through the gcs right now.
     auto status = actor_creator_->RegisterActor(task_spec);
     if (!status.ok()) {
+      if (::RayConfig::instance().actor_ref_deleted_push_enabled() &&
+          !task_spec.IsDetachedActor()) {
+        // The sync registration has a client-side deadline
+        // (gcs_server_request_timeout_seconds), so a failure here does not imply
+        // the GCS didn't persist the registration (the reply may have been lost).
+        // Arm the ref-deleted watch anyway to preserve the poll protocol's
+        // self-healing: if the registration did go through, dropping the handle
+        // still destroys the actor and releases its name; if it didn't, the
+        // report is a no-op on the GCS. The async path below doesn't need this:
+        // it retries without a deadline, so its failure callback only fires on a
+        // definitive rejection, which implies nothing was registered.
+        actor_task_submitter_->NotifyGCSWhenActorRefDeleted(task_spec.ActorCreationId());
+      }
       return status;
     }
     io_service_.post(

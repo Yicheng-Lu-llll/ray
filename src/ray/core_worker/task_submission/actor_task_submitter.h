@@ -123,6 +123,19 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   /// Submit an actor creation task to an actor via GCS.
   void SubmitActorCreationTask(TaskSpecification task_spec);
 
+  /// Arrange for the GCS to be notified once all references to the actor
+  /// (including lineage refs) are deleted, so it can permanently destroy the
+  /// actor. Only used when `actor_ref_deleted_push_enabled` is set (callers
+  /// gate on the flag), in which case the GCS does not hold a per-actor
+  /// WaitForActorRefDeleted long-poll on the owner.
+  ///
+  /// Must be called only after the actor registration attempt has resolved
+  /// (reply received, or the sync registration returned an error), so the
+  /// report can never reach the GCS before the registration does. Calling it
+  /// for an actor the GCS never registered is harmless: the report is a
+  /// no-op on the GCS side.
+  void NotifyGCSWhenActorRefDeleted(const ActorID &actor_id);
+
   /// Create connection to actor and send all pending tasks.
   ///
   /// \param[in] actor_id Actor ID.

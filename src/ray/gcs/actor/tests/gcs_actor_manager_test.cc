@@ -2500,6 +2500,85 @@ TEST_F(GcsActorManagerTest, TestRegisterNamedActorOnDeletedActorRefCreatesNewAct
   ASSERT_NE(actor->GetActorID(), new_actor->GetActorID());
 }
 
+TEST_F(GcsActorManagerTest, TestReportActorRefDeletedDestroysActorAndReleasesName) {
+  auto send_reply_callback = [](Status, std::function<void()>, std::function<void()>) {};
+  const JobID job_id = JobID::FromInt(1);
+  const std::string actor_name = "test_report_actor_ref_deleted_actor";
+  const std::string ray_namespace = "test_namespace";
+
+  std::shared_ptr<gcs::GcsActor> actor;
+  RegisterAndCreateNamedActor(
+      job_id, actor_name, ray_namespace, send_reply_callback, actor);
+
+  // The owner reports that all references (including lineage refs) are deleted.
+  rpc::ReportActorRefDeletedRequest ref_deleted_request;
+  ref_deleted_request.set_actor_id(actor->GetActorID().Binary());
+  rpc::ReportActorRefDeletedReply ref_deleted_reply;
+  gcs_actor_manager_->HandleReportActorRefDeleted(
+      ref_deleted_request,
+      &ref_deleted_reply,
+      [](auto status, auto success_callback, auto failure_callback) {});
+  drain_io_context();
+
+  // The actor is permanently destroyed: DEAD, not reconstructable, name released.
+  ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
+  rpc::GetNamedActorInfoRequest get_request;
+  get_request.set_name(actor_name);
+  get_request.set_ray_namespace(ray_namespace);
+  rpc::GetNamedActorInfoReply get_reply;
+  gcs_actor_manager_->HandleGetNamedActorInfo(
+      get_request, &get_reply, send_reply_callback);
+  ASSERT_EQ(get_reply.status().code(), static_cast<int>(StatusCode::NotFound))
+      << "The name should be released after the actor ref is deleted.";
+}
+
+TEST_F(GcsActorManagerTest, TestReportActorRefDeletedOnUnknownActorReplies) {
+  rpc::ReportActorRefDeletedRequest request;
+  const JobID job_id = JobID::FromInt(9999);
+  request.set_actor_id(ActorID::Of(job_id, TaskID::ForDriverTask(job_id), 0).Binary());
+  rpc::ReportActorRefDeletedReply reply;
+  bool replied = false;
+  gcs_actor_manager_->HandleReportActorRefDeleted(
+      request,
+      &reply,
+      [&replied](auto status, auto success_callback, auto failure_callback) {
+        replied = true;
+      });
+  ASSERT_TRUE(replied) << "Reporting an unknown/already-dead actor should reply OK.";
+}
+
+TEST_F(GcsActorManagerTest, TestNoPollIssuedWhenRefDeletedPushEnabled) {
+  RayConfig::instance().initialize(
+      R"(
+{
+  "actor_ref_deleted_push_enabled": true
+}
+  )");
+  auto send_reply_callback = [](Status, std::function<void()>, std::function<void()>) {};
+  const JobID job_id = JobID::FromInt(1);
+  const std::string actor_name = "test_no_poll_when_push_enabled_actor";
+  const std::string ray_namespace = "test_namespace";
+
+  std::shared_ptr<gcs::GcsActor> actor;
+  RegisterAndCreateNamedActor(
+      job_id, actor_name, ray_namespace, send_reply_callback, actor);
+
+  // No WaitForActorRefDeleted long-poll is issued to the owner.
+  ASSERT_TRUE(worker_client_->callbacks_.empty())
+      << "No per-actor long-poll should be issued when the push path is enabled.";
+
+  // The push path destroys the actor permanently.
+  rpc::ReportActorRefDeletedRequest ref_deleted_request;
+  ref_deleted_request.set_actor_id(actor->GetActorID().Binary());
+  rpc::ReportActorRefDeletedReply ref_deleted_reply;
+  gcs_actor_manager_->HandleReportActorRefDeleted(
+      ref_deleted_request,
+      &ref_deleted_reply,
+      [](auto status, auto success_callback, auto failure_callback) {});
+  drain_io_context();
+  ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
+}
+
 TEST_F(GcsActorManagerTest, TestGetNamedActorOnInScopeActorReturnsSameActor) {
   auto send_reply_callback = [](Status, std::function<void()>, std::function<void()>) {};
   const JobID job_id = JobID::FromInt(1);

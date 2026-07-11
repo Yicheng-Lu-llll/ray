@@ -319,6 +319,13 @@ RAY_CONFIG(int64_t, kill_worker_timeout_milliseconds, 5000)
 /// during graceful shutdown.
 RAY_CONFIG(int64_t, actor_graceful_shutdown_timeout_ms, 30000)
 
+/// When enabled, the actor's owner pushes a ReportActorRefDeleted RPC to the GCS
+/// once all references to the actor (including lineage refs) are deleted, instead
+/// of the GCS holding a per-actor WaitForActorRefDeleted long-poll on the owner.
+/// This removes one pending RPC (and its memory) per actor on both the GCS and
+/// the owner, and removes the poll setup from the actor registration hot path.
+RAY_CONFIG(bool, actor_ref_deleted_push_enabled, false)
+
 /// The duration that we wait after the worker is launched before the
 /// starting_worker_timeout_callback() is called.
 RAY_CONFIG(int64_t, worker_register_timeout_seconds, 60)

@@ -487,6 +487,10 @@ void GcsActorScheduler::CreateActorOnWorker(std::shared_ptr<GcsActor> actor,
           .WithField(actor->GetActorID().JobId())
       << "Submitting actor creation task to worker.";
 
+  // DECOMPDBG: time the PushTaskRequest build (TaskSpec deep copy) and the send
+  // call separately. Remove after profiling.
+  static std::atomic<int64_t> decomp_build_ns{0}, decomp_send_ns{0}, decomp_n{0};
+  auto _tb = std::chrono::steady_clock::now();
   auto request = std::make_unique<rpc::PushTaskRequest>();
   request->set_intended_worker_id(worker->GetWorkerID().Binary());
   request->mutable_task_spec()->CopyFrom(
@@ -496,8 +500,13 @@ void GcsActorScheduler::CreateActorOnWorker(std::shared_ptr<GcsActor> actor,
     resources.Add(std::move(resource));
   }
   request->mutable_resource_mapping()->CopyFrom(resources);
+  decomp_build_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - _tb)
+                                .count(),
+                            std::memory_order_relaxed);
 
   auto client = worker_client_pool_.GetOrConnect(worker->GetAddress());
+  auto _ts = std::chrono::steady_clock::now();
   client->PushNormalTask(
       std::move(request),
       [this, actor, worker](Status status, const rpc::PushTaskReply &reply) {
@@ -547,6 +556,17 @@ void GcsActorScheduler::CreateActorOnWorker(std::shared_ptr<GcsActor> actor,
           }
         }
       });
+  decomp_send_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - _ts)
+                               .count(),
+                           std::memory_order_relaxed);
+  int64_t decomp_c = decomp_n.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (decomp_c % 200 == 0) {
+    RAY_LOG(INFO) << "DECOMPDBG-PUSH n=" << decomp_c << " build_us="
+                  << decomp_build_ns.load(std::memory_order_relaxed) / 1000.0 / decomp_c
+                  << " send_us="
+                  << decomp_send_ns.load(std::memory_order_relaxed) / 1000.0 / decomp_c;
+  }
 }
 
 void GcsActorScheduler::RetryCreatingActorOnWorker(

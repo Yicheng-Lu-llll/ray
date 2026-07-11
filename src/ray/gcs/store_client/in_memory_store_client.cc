@@ -32,7 +32,8 @@ void InMemoryStoreClient::AsyncPut(const std::string &table_name,
   } else {
     inserted = table.Emplace(key, std::move(data));
   }
-  std::move(callback).Post("GcsInMemoryStore.Put", inserted);
+  // DECOMPDBG: per-table label. Remove after profiling.
+  std::move(callback).Post("GcsInMemoryStore.Put." + table_name, inserted);
 }
 
 void InMemoryStoreClient::AsyncGet(
@@ -44,7 +45,8 @@ void InMemoryStoreClient::AsyncGet(
   if (table != nullptr) {
     data = table->Get(key);
   }
-  std::move(callback).Post("GcsInMemoryStore.Get", Status::OK(), std::move(data));
+  std::move(callback).Post(
+      "GcsInMemoryStore.Get." + table_name, Status::OK(), std::move(data));
 }
 
 void InMemoryStoreClient::AsyncGetAll(

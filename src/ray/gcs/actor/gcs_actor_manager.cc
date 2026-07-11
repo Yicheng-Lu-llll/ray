@@ -47,6 +47,8 @@ struct DecompBucket {
 struct DecompTimers {
   DecompBucket reg_log, reg_dedup, reg_build, reg_book, reg_poll, reg_put, reg_total;
   DecompBucket crt_build, crt_pub, crt_sched, crt_total;
+  DecompBucket regcb_export, regcb_pub, regcb_reply;
+  DecompBucket alivecb_pub, alivecb_export, alivecb_reply;
   void MaybeDump(int64_t every) {
     int64_t c = reg_total.n.load(std::memory_order_relaxed);
     if (c == 0 || c % every != 0) {
@@ -64,6 +66,11 @@ struct DecompTimers {
                   << " || crtN=" << crt_total.n.load(std::memory_order_relaxed)
                   << " crt_total_us=" << us(crt_total) << " | crt_build=" << us(crt_build)
                   << " crt_pub=" << us(crt_pub) << " crt_sched=" << us(crt_sched);
+    RAY_LOG(INFO) << "DECOMPDBG-CB regN=" << c << " regcb_export=" << us(regcb_export)
+                  << " regcb_pub=" << us(regcb_pub) << " regcb_reply=" << us(regcb_reply)
+                  << " || alivecb_pub=" << us(alivecb_pub)
+                  << " alivecb_export=" << us(alivecb_export)
+                  << " alivecb_reply=" << us(alivecb_reply);
   }
 };
 DecompTimers g_decomp;
@@ -381,7 +388,7 @@ void GcsActorManager::HandleRegisterActor(rpc::RegisterActorRequest request,
   }
   ++counts_[CountType::REGISTER_ACTOR_REQUEST];
   g_decomp.reg_total.Add(DecompNs(_th));
-  g_decomp.MaybeDump(1000);
+  g_decomp.MaybeDump(200);
 }
 
 void GcsActorManager::HandleRestartActorForLineageReconstruction(
@@ -809,7 +816,9 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
                 // The backend storage is supposed to be reliable, so the status must be
                 // ok.
                 RAY_CHECK_OK(put_status);
+                auto _tcb = DecompClock::now();
                 actor->WriteActorExportEvent(true);
+                g_decomp.regcb_export.Add(DecompNs(_tcb));
                 auto registered_actor_it = registered_actors_.find(actor->GetActorID());
                 auto callback_iter =
                     actor_to_register_callbacks_.find(actor->GetActorID());
@@ -829,8 +838,11 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
                   return;
                 }
 
+                _tcb = DecompClock::now();
                 gcs_publisher_->PublishActor(actor->GetActorID(),
                                              actor->GetActorTableData());
+                g_decomp.regcb_pub.Add(DecompNs(_tcb));
+                _tcb = DecompClock::now();
                 // Invoke all callbacks for all registration requests of this actor
                 // (duplicated requests are included) and remove all of them from
                 // actor_to_register_callbacks_.
@@ -839,6 +851,7 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
                   callback(Status::OK());
                 }
                 actor_to_register_callbacks_.erase(callback_iter);
+                g_decomp.regcb_reply.Add(DecompNs(_tcb));
               },
               io_context_});
        },
@@ -1772,12 +1785,18 @@ void GcsActorManager::OnActorCreationSuccess(const std::shared_ptr<GcsActor> &ac
         actor_data_only_with_states = std::move(actor_data_only_with_states),
         actor,
         reply](Status status) mutable {
+         auto _tcb = DecompClock::now();
          gcs_publisher_->PublishActor(actor_id, std::move(actor_data_only_with_states));
+         g_decomp.alivecb_pub.Add(DecompNs(_tcb));
+         _tcb = DecompClock::now();
          actor->WriteActorExportEvent(false);
+         g_decomp.alivecb_export.Add(DecompNs(_tcb));
+         _tcb = DecompClock::now();
          // Invoke all callbacks for all registration requests of this actor (duplicated
          // requests are included) and remove all of them from
          // actor_to_create_callbacks_.
          RunAndClearActorCreationCallbacks(actor, reply, Status::OK());
+         g_decomp.alivecb_reply.Add(DecompNs(_tcb));
        },
        io_context_});
 }

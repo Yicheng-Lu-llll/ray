@@ -383,6 +383,72 @@ void GcsActorManager::HandleReportActorRefDeleted(
       timeout_ms);
 }
 
+void GcsActorManager::HandleGetActorCreationTaskSpec(
+    rpc::GetActorCreationTaskSpecRequest request,
+    rpc::GetActorCreationTaskSpecReply *reply,
+    rpc::SendReplyCallback send_reply_callback) {
+  auto actor_id = ActorID::FromBinary(request.actor_id());
+  auto it = registered_actors_.find(actor_id);
+  if (it == registered_actors_.end() ||
+      it->second->GetState() == rpc::ActorTableData::DEAD) {
+    // The actor was destroyed between the lease grant and the worker's pull;
+    // the worker exits on NotFound and the raylet reclaims it.
+    GCS_RPC_SEND_REPLY(
+        send_reply_callback, reply, Status::NotFound("Actor is no longer registered."));
+    return;
+  }
+  reply->mutable_task_spec()->CopyFrom(
+      it->second->GetCreationTaskSpecification().GetMessage());
+  GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+}
+
+void GcsActorManager::HandleReportActorCreationDone(
+    rpc::ReportActorCreationDoneRequest request,
+    rpc::ReportActorCreationDoneReply *reply,
+    rpc::SendReplyCallback send_reply_callback) {
+  auto actor_id = ActorID::FromBinary(request.actor_id());
+  const auto &worker_address = request.worker_address();
+  auto worker_id = WorkerID::FromBinary(worker_address.worker_id());
+  auto it = registered_actors_.find(actor_id);
+  if (it == registered_actors_.end() ||
+      it->second->GetState() == rpc::ActorTableData::DEAD) {
+    // The actor was destroyed while the worker was creating it. Mirror the
+    // push callback's branch for an actor that left the creating bookkeeping:
+    // reclaim the leased worker.
+    RAY_LOG(INFO).WithField(actor_id)
+        << "Actor creation outcome reported for an actor that no longer "
+           "exists, killing the leased worker.";
+    gcs_actor_scheduler_->KillStaleLeasedWorker(worker_address, actor_id);
+    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+    return;
+  }
+  auto actor = it->second;
+  if (actor->GetWorkerID() != worker_id) {
+    // The actor has been re-placed (e.g. its node or worker was declared dead
+    // and it was rescheduled); the reporting worker is stale.
+    RAY_LOG(INFO).WithField(actor_id)
+        << "Actor creation outcome reported by a stale worker, killing it.";
+    gcs_actor_scheduler_->KillStaleLeasedWorker(worker_address, actor_id);
+    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+    return;
+  }
+  if (actor->GetState() == rpc::ActorTableData::ALIVE) {
+    // Duplicate report (the worker retries until acked); already processed.
+    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+    return;
+  }
+  rpc::PushTaskReply push_reply;
+  push_reply.set_is_application_error(request.is_application_error());
+  push_reply.set_task_execution_error(request.task_execution_error());
+  push_reply.mutable_borrowed_refs()->CopyFrom(request.borrowed_refs());
+  push_reply.set_actor_repr_name(request.actor_repr_name());
+  gcs_actor_scheduler_->OnActorCreationTaskDone(actor, push_reply);
+  // OnActorCreationTaskDone runs the success handling synchronously up to the
+  // async table flush, so an ack means the ALIVE (or creation-failed) state is
+  // recorded in the GCS's in-memory authority.
+  GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+}
+
 void GcsActorManager::HandleRegisterActor(rpc::RegisterActorRequest request,
                                           rpc::RegisterActorReply *reply,
                                           rpc::SendReplyCallback send_reply_callback) {

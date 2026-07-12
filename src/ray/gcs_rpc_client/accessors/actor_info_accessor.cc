@@ -270,6 +270,30 @@ void ActorInfoAccessor::AsyncReportActorRefDeleted(const ActorID &actor_id,
       timeout_ms);
 }
 
+void ActorInfoAccessor::AsyncGetActorCreationTaskSpec(
+    const ActorID &actor_id,
+    std::function<void(const Status &, rpc::GetActorCreationTaskSpecReply &&)> callback,
+    int64_t timeout_ms) {
+  rpc::GetActorCreationTaskSpecRequest request;
+  request.set_actor_id(actor_id.Binary());
+  context_->GetGcsRpcClient().GetActorCreationTaskSpec(
+      std::move(request), std::move(callback), timeout_ms);
+}
+
+void ActorInfoAccessor::AsyncReportActorCreationDone(
+    rpc::ReportActorCreationDoneRequest request,
+    const rpc::StatusCallback &callback,
+    int64_t timeout_ms) {
+  context_->GetGcsRpcClient().ReportActorCreationDone(
+      std::move(request),
+      [callback](const Status &status, rpc::ReportActorCreationDoneReply &&reply) {
+        if (callback) {
+          callback(status);
+        }
+      },
+      timeout_ms);
+}
+
 void ActorInfoAccessor::AsyncSubscribe(
     const ActorID &actor_id,
     const rpc::SubscribeCallback<ActorID, rpc::ActorTableData> &subscribe,

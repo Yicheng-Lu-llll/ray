@@ -1365,6 +1365,14 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
                                       rpc::ActorCallArgWaitCompleteReply *reply,
                                       rpc::SendReplyCallback send_reply_callback);
 
+  /// Implements gRPC server handler. Raylet's lease-grant signal under
+  /// gcs_actor_creation_worker_pull_enabled: pull the actor creation task spec
+  /// from the GCS, execute it through the same path as a pushed creation task,
+  /// and report the outcome to the GCS via ReportActorCreationDone.
+  void HandlePullActorCreationTask(rpc::PullActorCreationTaskRequest request,
+                                   rpc::PullActorCreationTaskReply *reply,
+                                   rpc::SendReplyCallback send_reply_callback);
+
   /// Implements gRPC server handler.
   void HandleRayletNotifyGCSRestart(rpc::RayletNotifyGCSRestartRequest request,
                                     rpc::RayletNotifyGCSRestartReply *reply,
@@ -1945,6 +1953,12 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
 
   /// Address of our RPC server.
   rpc::Address rpc_address_;
+
+  /// The actor whose creation task this worker has already been signaled to
+  /// pull (gcs_actor_creation_worker_pull_enabled). Guards against duplicate
+  /// raylet signals (the signal RPC is retried on transient failures). Only
+  /// accessed from io_service_ handlers.
+  ActorID pulled_actor_creation_task_id_;
 
   // Client to the GCS shared by core worker interfaces.
   std::shared_ptr<gcs::GcsClient> gcs_client_;

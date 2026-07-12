@@ -176,6 +176,22 @@ message PushTaskReply {
   repeated StreamingGeneratorReturnIdInfo streaming_generator_return_ids = 10;
 }
 
+message PullActorCreationTaskRequest {
+  // The intended recipient worker (the worker just leased for this actor).
+  bytes intended_worker_id = 1;
+  // The actor whose creation task the worker should pull from the GCS.
+  bytes actor_id = 2;
+  // The resource ids assigned to the leased worker (same content as the
+  // resource_mapping of the lease reply / of the push protocol's
+  // PushTaskRequest).
+  repeated ResourceMapEntry resource_mapping = 3;
+}
+
+message PullActorCreationTaskReply {
+  // Ack means "signal received"; the execution outcome is reported by the
+  // worker directly to the GCS via ReportActorCreationDone.
+}
+
 message ActorCallArgWaitCompleteRequest {
   // The ID of the worker this message is intended for.
   bytes intended_worker_id = 1;
@@ -477,6 +493,14 @@ service CoreWorkerService {
   // Failure: Always from local raylet, should not fail.
   rpc ActorCallArgWaitComplete(ActorCallArgWaitCompleteRequest)
       returns (ActorCallArgWaitCompleteReply);
+
+  // Raylet signals the just-leased worker to pull its actor creation task
+  // from the GCS (gcs_actor_creation_worker_pull_enabled). Always from the
+  // local raylet. Failure: if the signal is lost the worker never starts the
+  // creation task; the leased-worker/node death paths recover, same as a lost
+  // push in the push protocol.
+  rpc PullActorCreationTask(PullActorCreationTaskRequest)
+      returns (PullActorCreationTaskReply);
 
   // A worker asks the object's owner worker about the object's current status.
   // This RPC assumes the ref won't be removed in the middle of execution and it's the

@@ -3746,6 +3746,100 @@ void CoreWorker::HandlePushTask(rpc::PushTaskRequest request,
   }
 }
 
+void CoreWorker::HandlePullActorCreationTask(rpc::PullActorCreationTaskRequest request,
+                                             rpc::PullActorCreationTaskReply *reply,
+                                             rpc::SendReplyCallback send_reply_callback) {
+  if (HandleWrongRecipient(WorkerID::FromBinary(request.intended_worker_id()),
+                           send_reply_callback)) {
+    return;
+  }
+  auto actor_id = ActorID::FromBinary(request.actor_id());
+  // The raylet's signal is retried on transient failures, so it can be
+  // delivered more than once; only the first delivery may start the pull
+  // (a duplicate would re-enter HandlePushTask, whose duplicate-creation
+  // guard replies with an empty reply that must not be reported to the GCS
+  // as the creation outcome). Handlers run on io_service_, so no lock.
+  if (pulled_actor_creation_task_id_ == actor_id) {
+    send_reply_callback(Status::OK(), nullptr, nullptr);
+    return;
+  }
+  pulled_actor_creation_task_id_ = actor_id;
+  RAY_LOG(DEBUG).WithField(actor_id)
+      << "Pulling actor creation task from the GCS (raylet lease-grant signal).";
+  // Ack the raylet immediately: the ack only means "signal received"; the
+  // outcome is reported to the GCS via ReportActorCreationDone.
+  send_reply_callback(Status::OK(), nullptr, nullptr);
+
+  auto resource_mapping =
+      std::make_shared<google::protobuf::RepeatedPtrField<rpc::ResourceMapEntry>>(
+          std::move(*request.mutable_resource_mapping()));
+  // The GCS client posts this callback to io_service_, the same event loop that
+  // runs the CoreWorkerService handlers, so calling HandlePushTask here enters
+  // the exact execution path a pushed creation task takes.
+  gcs_client_->Actors().AsyncGetActorCreationTaskSpec(
+      actor_id,
+      [this, actor_id, resource_mapping](
+          const Status &status, rpc::GetActorCreationTaskSpecReply &&spec_reply) {
+        if (!status.ok()) {
+          // The actor was destroyed between the lease grant and the pull (or
+          // the GCS is unreachable past the client's retry window). Exit so
+          // the raylet reclaims this leased worker; if the actor still exists
+          // the GCS reschedules it through the worker-death path, same as a
+          // failed push.
+          RAY_LOG(WARNING).WithField(actor_id)
+              << "Failed to pull the actor creation task from the GCS, exiting: "
+              << status;
+          ForceExit(rpc::WorkerExitType::SYSTEM_ERROR,
+                    "Failed to pull the actor creation task from the GCS: " +
+                        status.ToString());
+          return;
+        }
+        rpc::PushTaskRequest push_request;
+        push_request.set_intended_worker_id(worker_context_->GetWorkerID().Binary());
+        *push_request.mutable_task_spec() = std::move(*spec_reply.mutable_task_spec());
+        *push_request.mutable_resource_mapping() = std::move(*resource_mapping);
+        // The reply outlives HandlePushTask via the shared_ptr captured in the
+        // reply callback, which ships it to the GCS in place of the push
+        // protocol's PushTaskReply.
+        auto push_reply = std::make_shared<rpc::PushTaskReply>();
+        auto report_outcome = [this, actor_id, push_reply](
+                                  Status task_status,
+                                  std::function<void()> success,
+                                  std::function<void()> failure) {
+          rpc::ReportActorCreationDoneRequest report;
+          report.set_actor_id(actor_id.Binary());
+          report.mutable_worker_address()->CopyFrom(rpc_address_);
+          if (task_status.ok()) {
+            report.set_is_application_error(push_reply->is_application_error());
+            report.set_task_execution_error(push_reply->task_execution_error());
+          } else {
+            // Mirror the push protocol: a non-OK creation outcome surfaces to
+            // the GCS as a creation task error.
+            report.set_is_application_error(true);
+            report.set_task_execution_error(task_status.ToString());
+          }
+          report.mutable_borrowed_refs()->CopyFrom(push_reply->borrowed_refs());
+          report.set_actor_repr_name(push_reply->actor_repr_name());
+          gcs_client_->Actors().AsyncReportActorCreationDone(
+              std::move(report), [this, actor_id](const Status &ack_status) {
+                if (!ack_status.ok()) {
+                  // Un-acked means the GCS never recorded the outcome; exit so
+                  // the worker-death path reconstructs the actor rather than
+                  // leaving it CREATING forever.
+                  RAY_LOG(ERROR).WithField(actor_id)
+                      << "Failed to report actor creation outcome to the GCS, "
+                         "exiting: "
+                      << ack_status;
+                  ForceExit(rpc::WorkerExitType::SYSTEM_ERROR,
+                            "Failed to report actor creation outcome to the GCS: " +
+                                ack_status.ToString());
+                }
+              });
+        };
+        HandlePushTask(std::move(push_request), push_reply.get(), report_outcome);
+      });
+}
+
 void CoreWorker::HandleActorCallArgWaitComplete(
     rpc::ActorCallArgWaitCompleteRequest request,
     rpc::ActorCallArgWaitCompleteReply *reply,

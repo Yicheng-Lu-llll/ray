@@ -78,6 +78,18 @@ class MockActorScheduler : public gcs::GcsActorSchedulerInterface {
                     const ActorID &actor_id,
                     const LeaseID &lease_id));
 
+  void OnActorCreationTaskDone(std::shared_ptr<gcs::GcsActor> actor,
+                               const rpc::PushTaskReply &reply) override {
+    creation_done_actors.push_back(actor);
+  }
+  void KillStaleLeasedWorker(const rpc::Address &worker_address,
+                             const ActorID &actor_id) override {
+    killed_stale_workers.emplace_back(WorkerID::FromBinary(worker_address.worker_id()),
+                                      actor_id);
+  }
+  std::vector<std::shared_ptr<gcs::GcsActor>> creation_done_actors;
+  std::vector<std::pair<WorkerID, ActorID>> killed_stale_workers;
+
   std::vector<std::shared_ptr<gcs::GcsActor>> actors;
 };
 

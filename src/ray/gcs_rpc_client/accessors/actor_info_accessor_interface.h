@@ -131,6 +131,32 @@ class ActorInfoAccessorInterface {
                                           int64_t timeout_ms = -1) = 0;
 
   /**
+  Fetch the full creation task spec of an actor from the GCS
+  (gcs_actor_creation_worker_pull_enabled). The callback receives NotFound if
+  the actor is no longer registered.
+
+  @param actor_id The ID of the actor.
+  @param callback Called with the status and, on success, the task spec.
+  @param timeout_ms Timeout in milliseconds. -1 means the default.
+ */
+  virtual void AsyncGetActorCreationTaskSpec(
+      const ActorID &actor_id,
+      std::function<void(const Status &, rpc::GetActorCreationTaskSpecReply &&)> callback,
+      int64_t timeout_ms = -1) = 0;
+
+  /**
+  Report the outcome of an actor creation task executed after a pull
+  (gcs_actor_creation_worker_pull_enabled). The GCS acks after processing.
+
+  @param request The report (actor id, worker address, outcome fields).
+  @param callback Called with the ack status.
+  @param timeout_ms Timeout in milliseconds. -1 means the default.
+ */
+  virtual void AsyncReportActorCreationDone(rpc::ReportActorCreationDoneRequest request,
+                                            const rpc::StatusCallback &callback,
+                                            int64_t timeout_ms = -1) = 0;
+
+  /**
     Register actor asynchronously.
 
     @param task_spec The specification for the actor creation task.

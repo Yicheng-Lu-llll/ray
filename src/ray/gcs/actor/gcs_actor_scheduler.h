@@ -96,6 +96,27 @@ class GcsActorSchedulerInterface {
   /// \param actor The actor to be destoryed.
   virtual void OnActorDestruction(std::shared_ptr<GcsActor> actor) = 0;
 
+  /// Handle a worker's report that it finished executing an actor creation
+  /// task it pulled from the GCS (gcs_actor_creation_worker_pull_enabled).
+  /// Mirrors the push protocol's PushTask reply handling: removes the worker
+  /// from the creating bookkeeping and invokes the success handler.
+  ///
+  /// \param actor The actor whose creation task finished.
+  /// \param reply The creation task outcome, in PushTaskReply form.
+  virtual void OnActorCreationTaskDone(std::shared_ptr<GcsActor> actor,
+                                       const rpc::PushTaskReply &reply) = 0;
+
+  /// Ask the raylet of the given worker to kill a leased worker whose creation
+  /// task outcome arrived for an actor that no longer exists or has been
+  /// re-placed elsewhere (stale report under the pull protocol). Mirrors the
+  /// push protocol's handling of a reply for an actor that left the creating
+  /// bookkeeping.
+  ///
+  /// \param worker_address Address of the stale leased worker.
+  /// \param actor_id The actor the worker was leased for.
+  virtual void KillStaleLeasedWorker(const rpc::Address &worker_address,
+                                     const ActorID &actor_id) = 0;
+
   virtual std::string DebugString() const = 0;
 
   virtual ~GcsActorSchedulerInterface() = default;
@@ -178,6 +199,12 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
   ///
   /// \param actor The actor to be destoryed.
   void OnActorDestruction(std::shared_ptr<GcsActor> actor) override;
+
+  void OnActorCreationTaskDone(std::shared_ptr<GcsActor> actor,
+                               const rpc::PushTaskReply &reply) override;
+
+  void KillStaleLeasedWorker(const rpc::Address &worker_address,
+                             const ActorID &actor_id) override;
 
   std::string DebugString() const override;
 
@@ -300,8 +327,14 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
   ///
   /// \param actor The actor to be created.
   /// \param worker The worker that the actor will created on.
+  /// \param raylet_signals_worker True on the fresh lease-grant path, where —
+  /// under gcs_actor_creation_worker_pull_enabled — the raylet has already
+  /// signaled the worker to pull the creation task, so the push is skipped.
+  /// Recovery paths (GCS restart reschedule, push retries) pass false and
+  /// always push.
   void CreateActorOnWorker(std::shared_ptr<GcsActor> actor,
-                           std::shared_ptr<GcsLeasedWorker> worker);
+                           std::shared_ptr<GcsLeasedWorker> worker,
+                           bool raylet_signals_worker = false);
 
   /// Retry creating the specified actor on the specified worker asynchoronously.
   /// Make it a virtual method so that the io_context_ could be mocked out.

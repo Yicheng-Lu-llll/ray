@@ -78,6 +78,14 @@ class ActorInfoGcsServiceHandler {
   virtual void HandleReportActorRefDeleted(ReportActorRefDeletedRequest request,
                                            ReportActorRefDeletedReply *reply,
                                            SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleGetActorCreationTaskSpec(GetActorCreationTaskSpecRequest request,
+                                              GetActorCreationTaskSpecReply *reply,
+                                              SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleReportActorCreationDone(ReportActorCreationDoneRequest request,
+                                             ReportActorCreationDoneReply *reply,
+                                             SendReplyCallback send_reply_callback) = 0;
 };
 
 class NodeInfoGcsServiceHandler {

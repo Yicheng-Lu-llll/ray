@@ -184,6 +184,33 @@ message ReportActorRefDeletedReply {
   GcsStatus status = 1;
 }
 
+message GetActorCreationTaskSpecRequest {
+  // ID of the actor whose creation task spec is requested.
+  bytes actor_id = 1;
+}
+
+message GetActorCreationTaskSpecReply {
+  GcsStatus status = 1;
+  // The full creation task spec of the actor (including inlined args).
+  TaskSpec task_spec = 2;
+}
+
+message ReportActorCreationDoneRequest {
+  // ID of the actor whose creation task finished on the worker.
+  bytes actor_id = 1;
+  // Address of the worker that executed the creation task.
+  Address worker_address = 2;
+  // The fields of the creation task's PushTaskReply that the GCS consumes.
+  bool is_application_error = 3;
+  string task_execution_error = 4;
+  repeated ObjectReferenceCount borrowed_refs = 5;
+  string actor_repr_name = 6;
+}
+
+message ReportActorCreationDoneReply {
+  GcsStatus status = 1;
+}
+
 // Service for actor info access.
 service ActorInfoGcsService {
   // Register actor to gcs service.
@@ -210,6 +237,18 @@ service ActorInfoGcsService {
   // per-actor WaitForActorRefDeleted long-poll on the owner.
   rpc ReportActorRefDeleted(ReportActorRefDeletedRequest)
       returns (ReportActorRefDeletedReply);
+  // Fetch the full creation task spec of an actor. Called by the leased worker
+  // when `gcs_actor_creation_worker_pull_enabled` is set: instead of the GCS
+  // pushing the creation task over a per-actor GCS->worker connection, the
+  // raylet signals the worker at lease grant and the worker pulls the spec
+  // over its existing GCS channel.
+  rpc GetActorCreationTaskSpec(GetActorCreationTaskSpecRequest)
+      returns (GetActorCreationTaskSpecReply);
+  // Report the outcome of an actor creation task executed after a pull
+  // (see GetActorCreationTaskSpec). Replaces the PushTask reply of the push
+  // protocol; the GCS acks only after the outcome is processed.
+  rpc ReportActorCreationDone(ReportActorCreationDoneRequest)
+      returns (ReportActorCreationDoneReply);
 }
 
 message GetClusterIdRequest {}

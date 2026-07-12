@@ -26,6 +26,7 @@
 
 #include "ray/common/scheduling/cluster_resource_data.h"
 #include "ray/common/scheduling/placement_group_util.h"
+#include "ray/core_worker_rpc_client/core_worker_client_interface.h"
 #include "ray/util/logging.h"
 
 namespace ray {
@@ -1081,9 +1082,45 @@ void LocalLeaseManager::Grant(
     }
   }
 
+  const bool signal_actor_creation_pull =
+      RayConfig::instance().gcs_actor_creation_worker_pull_enabled() &&
+      lease_spec.IsActorCreationTask() && !reply_callbacks.empty() &&
+      worker->rpc_client() != nullptr;
+  rpc::PullActorCreationTaskRequest pull_request;
+  if (signal_actor_creation_pull) {
+    // Snapshot the resource mapping BEFORE the replies are sent: once
+    // send_reply_callback_ runs, the reply protos belong to the RPC layer and
+    // may be freed at any time (reading them afterwards is a use-after-free).
+    pull_request.set_intended_worker_id(worker->WorkerId().Binary());
+    pull_request.set_actor_id(lease_spec.ActorId().Binary());
+    pull_request.mutable_resource_mapping()->CopyFrom(
+        reply_callbacks.front().reply_->resource_mapping());
+  }
+
   // Send the result back to the clients.
   for (const auto &reply_callback : reply_callbacks) {
     reply_callback.send_reply_callback_(Status::OK(), nullptr, nullptr);
+  }
+
+  if (signal_actor_creation_pull) {
+    // Signal the leased worker to pull its actor creation task from the GCS
+    // over the worker's existing GCS channel, instead of the GCS pushing it
+    // over a per-actor GCS->worker connection. Sent after the lease replies so
+    // the GCS processes the grant before anything the worker does in response.
+    // The resource mapping mirrors what the push protocol's PushTaskRequest
+    // would carry (the lease replies all get identical mappings above).
+    const auto worker_id = worker->WorkerId();
+    worker->rpc_client()->PullActorCreationTask(
+        std::move(pull_request),
+        [worker_id](const Status &status, const rpc::PullActorCreationTaskReply &) {
+          if (!status.ok()) {
+            // If the signal is lost the worker never starts the creation task;
+            // the leased-worker death paths recover, same as a lost push.
+            RAY_LOG(WARNING).WithField(worker_id)
+                << "Failed to signal leased worker to pull its actor creation task: "
+                << status;
+          }
+        });
   }
 }
 

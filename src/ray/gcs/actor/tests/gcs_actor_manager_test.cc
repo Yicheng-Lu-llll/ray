@@ -76,6 +76,18 @@ class MockActorScheduler : public gcs::GcsActorSchedulerInterface {
                     const ActorID &actor_id,
                     const LeaseID &lease_id));
 
+  void OnActorCreationTaskDone(std::shared_ptr<gcs::GcsActor> actor,
+                               const rpc::PushTaskReply &reply) override {
+    creation_done_actors.push_back(actor);
+  }
+  void KillStaleLeasedWorker(const rpc::Address &worker_address,
+                             const ActorID &actor_id) override {
+    killed_stale_workers.emplace_back(WorkerID::FromBinary(worker_address.worker_id()),
+                                      actor_id);
+  }
+  std::vector<std::shared_ptr<gcs::GcsActor>> creation_done_actors;
+  std::vector<std::pair<WorkerID, ActorID>> killed_stale_workers;
+
   std::vector<std::shared_ptr<gcs::GcsActor>> actors;
 };
 
@@ -203,6 +215,27 @@ class GcsActorManagerTest : public ::testing::Test {
     address.set_node_id(node_id.Binary());
     address.set_worker_id(worker_id.Binary());
     return address;
+  }
+
+  // Drives an actor through register+create so it is pending creation in the
+  // mock scheduler, then assigns it a worker address (the state it is in once
+  // the lease is granted). Returns the actor.
+  std::shared_ptr<gcs::GcsActor> SetupActorPendingOnWorker(
+      const rpc::Address &worker_address) {
+    auto job_id = JobID::FromInt(1);
+    auto registered_actor = RegisterActor(job_id);
+    rpc::CreateActorRequest create_actor_request;
+    create_actor_request.mutable_task_spec()->CopyFrom(
+        registered_actor->GetCreationTaskSpecification().GetMessage());
+    RAY_CHECK_OK(
+        gcs_actor_manager_->CreateActor(create_actor_request,
+                                        [](const std::shared_ptr<gcs::GcsActor> &,
+                                           const rpc::PushTaskReply &,
+                                           const Status &) {}));
+    auto actor = mock_actor_scheduler_->actors.back();
+    mock_actor_scheduler_->actors.pop_back();
+    actor->UpdateAddress(worker_address);
+    return actor;
   }
 
   std::shared_ptr<gcs::GcsActor> RegisterActor(
@@ -2577,6 +2610,110 @@ TEST_F(GcsActorManagerTest, TestNoPollIssuedWhenRefDeletedPushEnabled) {
       [](auto status, auto success_callback, auto failure_callback) {});
   drain_io_context();
   ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
+}
+
+TEST_F(GcsActorManagerTest, TestReportActorCreationDoneDelegatesToScheduler) {
+  auto worker_address = RandomAddress();
+  auto actor = SetupActorPendingOnWorker(worker_address);
+
+  rpc::ReportActorCreationDoneRequest request;
+  request.set_actor_id(actor->GetActorID().Binary());
+  request.mutable_worker_address()->CopyFrom(worker_address);
+  request.set_actor_repr_name("MyActorRepr");
+  rpc::ReportActorCreationDoneReply reply;
+  bool replied = false;
+  gcs_actor_manager_->HandleReportActorCreationDone(
+      request, &reply, [&replied](auto, auto, auto) { replied = true; });
+
+  ASSERT_TRUE(replied);
+  ASSERT_EQ(mock_actor_scheduler_->creation_done_actors.size(), 1);
+  ASSERT_EQ(mock_actor_scheduler_->creation_done_actors.back()->GetActorID(),
+            actor->GetActorID());
+  ASSERT_TRUE(mock_actor_scheduler_->killed_stale_workers.empty());
+}
+
+TEST_F(GcsActorManagerTest, TestReportActorCreationDoneFromStaleWorkerKillsIt) {
+  auto worker_address = RandomAddress();
+  auto actor = SetupActorPendingOnWorker(worker_address);
+
+  // A report arrives from a different worker than the one the actor is
+  // currently placed on (e.g. the actor was re-placed after a node death).
+  auto stale_address = RandomAddress();
+  rpc::ReportActorCreationDoneRequest request;
+  request.set_actor_id(actor->GetActorID().Binary());
+  request.mutable_worker_address()->CopyFrom(stale_address);
+  rpc::ReportActorCreationDoneReply reply;
+  bool replied = false;
+  gcs_actor_manager_->HandleReportActorCreationDone(
+      request, &reply, [&replied](auto, auto, auto) { replied = true; });
+
+  ASSERT_TRUE(replied);
+  ASSERT_TRUE(mock_actor_scheduler_->creation_done_actors.empty());
+  ASSERT_EQ(mock_actor_scheduler_->killed_stale_workers.size(), 1);
+  ASSERT_EQ(mock_actor_scheduler_->killed_stale_workers.back().first,
+            WorkerID::FromBinary(stale_address.worker_id()));
+}
+
+TEST_F(GcsActorManagerTest, TestReportActorCreationDoneForUnknownActorKillsWorker) {
+  auto job_id = JobID::FromInt(9999);
+  auto worker_address = RandomAddress();
+  rpc::ReportActorCreationDoneRequest request;
+  request.set_actor_id(ActorID::Of(job_id, TaskID::ForDriverTask(job_id), 0).Binary());
+  request.mutable_worker_address()->CopyFrom(worker_address);
+  rpc::ReportActorCreationDoneReply reply;
+  bool replied = false;
+  gcs_actor_manager_->HandleReportActorCreationDone(
+      request, &reply, [&replied](auto, auto, auto) { replied = true; });
+
+  ASSERT_TRUE(replied) << "Unknown actor must still be acked (idempotence).";
+  ASSERT_TRUE(mock_actor_scheduler_->creation_done_actors.empty());
+  ASSERT_EQ(mock_actor_scheduler_->killed_stale_workers.size(), 1);
+}
+
+TEST_F(GcsActorManagerTest, TestReportActorCreationDoneDuplicateAfterAliveIsAck) {
+  auto worker_address = RandomAddress();
+  auto actor = SetupActorPendingOnWorker(worker_address);
+  // First outcome is processed through the real success path.
+  gcs_actor_manager_->OnActorCreationSuccess(actor, rpc::PushTaskReply());
+  drain_io_context();
+  ASSERT_EQ(actor->GetState(), rpc::ActorTableData::ALIVE);
+
+  // The worker retries the report (e.g. the first ack was lost): pure ack, no
+  // re-processing, no kill.
+  rpc::ReportActorCreationDoneRequest request;
+  request.set_actor_id(actor->GetActorID().Binary());
+  request.mutable_worker_address()->CopyFrom(worker_address);
+  rpc::ReportActorCreationDoneReply reply;
+  bool replied = false;
+  gcs_actor_manager_->HandleReportActorCreationDone(
+      request, &reply, [&replied](auto, auto, auto) { replied = true; });
+
+  ASSERT_TRUE(replied);
+  ASSERT_TRUE(mock_actor_scheduler_->creation_done_actors.empty());
+  ASSERT_TRUE(mock_actor_scheduler_->killed_stale_workers.empty());
+}
+
+TEST_F(GcsActorManagerTest, TestGetActorCreationTaskSpecReturnsSpecOrNotFound) {
+  auto worker_address = RandomAddress();
+  auto actor = SetupActorPendingOnWorker(worker_address);
+
+  rpc::GetActorCreationTaskSpecRequest request;
+  request.set_actor_id(actor->GetActorID().Binary());
+  rpc::GetActorCreationTaskSpecReply reply;
+  gcs_actor_manager_->HandleGetActorCreationTaskSpec(
+      request, &reply, [](auto, auto, auto) {});
+  ASSERT_EQ(reply.status().code(), static_cast<int>(StatusCode::OK));
+  ASSERT_EQ(ActorID::FromBinary(reply.task_spec().actor_creation_task_spec().actor_id()),
+            actor->GetActorID());
+
+  auto job_id = JobID::FromInt(9999);
+  rpc::GetActorCreationTaskSpecRequest unknown_request;
+  unknown_request.set_actor_id(
+      ActorID::Of(job_id, TaskID::ForDriverTask(job_id), 0).Binary());
+  rpc::GetActorCreationTaskSpecReply unknown_reply;
+  gcs_actor_manager_->HandleGetActorCreationTaskSpec(
+      unknown_request, &unknown_reply, [](auto, auto, auto) {});
+  ASSERT_EQ(unknown_reply.status().code(), static_cast<int>(StatusCode::NotFound));
 }
 
 TEST_F(GcsActorManagerTest, TestGetNamedActorOnInScopeActorReturnsSameActor) {

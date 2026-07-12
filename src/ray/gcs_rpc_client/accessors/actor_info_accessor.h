@@ -135,6 +135,15 @@ class ActorInfoAccessor : public ActorInfoAccessorInterface {
                                   const rpc::StatusCallback &callback,
                                   int64_t timeout_ms = -1) override;
 
+  void AsyncGetActorCreationTaskSpec(
+      const ActorID &actor_id,
+      std::function<void(const Status &, rpc::GetActorCreationTaskSpecReply &&)> callback,
+      int64_t timeout_ms = -1) override;
+
+  void AsyncReportActorCreationDone(rpc::ReportActorCreationDoneRequest request,
+                                    const rpc::StatusCallback &callback,
+                                    int64_t timeout_ms = -1) override;
+
   /**
     Register actor to GCS asynchronously.
 

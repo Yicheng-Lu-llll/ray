@@ -55,6 +55,10 @@ class FakeCoreWorkerClient : public CoreWorkerClientInterface {
       const ActorCallArgWaitCompleteRequest &request,
       const ClientCallback<ActorCallArgWaitCompleteReply> &callback) override {}
 
+  void PullActorCreationTask(
+      PullActorCreationTaskRequest &&request,
+      const ClientCallback<PullActorCreationTaskReply> &callback) override {}
+
   void GetObjectStatus(GetObjectStatusRequest &&request,
                        const ClientCallback<GetObjectStatusReply> &callback) override {}
 

@@ -90,6 +90,7 @@ ray_cc_library(
         "//src/ray/common:ray_object",
         "//src/ray/common/scheduling:cluster_resource_data",
         "//src/ray/common/scheduling:placement_group_util",
+        "//src/ray/core_worker_rpc_client:core_worker_client_interface",
         "//src/ray/object_manager:object_manager_common",
         "//src/ray/raylet:lease_dependency_manager",
         "//src/ray/raylet:metrics",

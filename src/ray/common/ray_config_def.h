@@ -336,6 +336,18 @@ RAY_CONFIG(bool, gcs_actor_creation_push_offload_enabled, false)
 /// the owner, and removes the poll setup from the actor registration hot path.
 RAY_CONFIG(bool, actor_ref_deleted_push_enabled, false)
 
+/// When enabled, the GCS no longer pushes actor creation tasks to leased
+/// workers over per-actor GCS->worker connections. Instead, the raylet signals
+/// the worker over its existing local connection at lease grant time
+/// (PullActorCreationTask), the worker pulls the creation task spec from the
+/// GCS over its existing GCS channel (GetActorCreationTaskSpec) and reports
+/// the outcome back (ReportActorCreationDone). This removes the per-actor
+/// GCS->worker channel (and its inline connection setup) from the creation hot
+/// path. The GCS and all raylets must agree on this setting. Recovery paths
+/// that re-submit to an already-leased worker (GCS restart reschedule) still
+/// use the push.
+RAY_CONFIG(bool, gcs_actor_creation_worker_pull_enabled, false)
+
 /// The duration that we wait after the worker is launched before the
 /// starting_worker_timeout_callback() is called.
 RAY_CONFIG(int64_t, worker_register_timeout_seconds, 60)

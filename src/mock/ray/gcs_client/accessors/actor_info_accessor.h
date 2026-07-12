@@ -61,6 +61,13 @@ class FakeActorInfoAccessor : public gcs::ActorInfoAccessorInterface {
   void AsyncReportActorRefDeleted(const ActorID &,
                                   const rpc::StatusCallback &,
                                   int64_t = -1) override {}
+  void AsyncGetActorCreationTaskSpec(
+      const ActorID &,
+      std::function<void(const Status &, rpc::GetActorCreationTaskSpecReply &&)>,
+      int64_t = -1) override {}
+  void AsyncReportActorCreationDone(rpc::ReportActorCreationDoneRequest,
+                                    const rpc::StatusCallback &,
+                                    int64_t = -1) override {}
   void AsyncRegisterActor(const TaskSpecification &task_spec,
                           const rpc::StatusCallback &callback,
                           int64_t = -1) override {

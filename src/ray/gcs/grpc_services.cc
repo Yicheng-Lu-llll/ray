@@ -40,6 +40,10 @@ void ActorInfoGrpcService::InitServerCallFactories(
       ActorInfoGcsService, ReportActorOutOfScope, max_active_rpcs_per_handler_)
   RPC_SERVICE_HANDLER(
       ActorInfoGcsService, ReportActorRefDeleted, max_active_rpcs_per_handler_)
+  RPC_SERVICE_HANDLER(
+      ActorInfoGcsService, GetActorCreationTaskSpec, max_active_rpcs_per_handler_)
+  RPC_SERVICE_HANDLER(
+      ActorInfoGcsService, ReportActorCreationDone, max_active_rpcs_per_handler_)
 }
 
 void NodeInfoGrpcService::InitServerCallFactories(

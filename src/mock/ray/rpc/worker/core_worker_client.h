@@ -47,6 +47,11 @@ class MockCoreWorkerClientInterface : public CoreWorkerClientInterface {
                const ClientCallback<ActorCallArgWaitCompleteReply> &callback),
               (override));
   MOCK_METHOD(void,
+              PullActorCreationTask,
+              (PullActorCreationTaskRequest && request,
+               const ClientCallback<PullActorCreationTaskReply> &callback),
+              (override));
+  MOCK_METHOD(void,
               GetObjectStatus,
               (GetObjectStatusRequest && request,
                const ClientCallback<GetObjectStatusReply> &callback),

@@ -291,6 +291,16 @@ class GcsRpcClient {
                              /*method_timeout_ms*/ -1, )
 
   VOID_GCS_RPC_CLIENT_METHOD(ActorInfoGcsService,
+                             GetActorCreationTaskSpec,
+                             actor_info_grpc_client_,
+                             /*method_timeout_ms*/ -1, )
+
+  VOID_GCS_RPC_CLIENT_METHOD(ActorInfoGcsService,
+                             ReportActorCreationDone,
+                             actor_info_grpc_client_,
+                             /*method_timeout_ms*/ -1, )
+
+  VOID_GCS_RPC_CLIENT_METHOD(ActorInfoGcsService,
                              RestartActorForLineageReconstruction,
                              actor_info_grpc_client_,
                              /*method_timeout_ms*/ -1, )

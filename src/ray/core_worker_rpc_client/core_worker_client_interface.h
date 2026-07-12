@@ -49,6 +49,12 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
       const ActorCallArgWaitCompleteRequest &request,
       const ClientCallback<ActorCallArgWaitCompleteReply> &callback) = 0;
 
+  /// Raylet signals the just-leased worker to pull its actor creation task
+  /// from the GCS (gcs_actor_creation_worker_pull_enabled).
+  virtual void PullActorCreationTask(
+      PullActorCreationTaskRequest &&request,
+      const ClientCallback<PullActorCreationTaskReply> &callback) = 0;
+
   virtual void GetObjectStatus(GetObjectStatusRequest &&request,
                                const ClientCallback<GetObjectStatusReply> &callback) = 0;
 

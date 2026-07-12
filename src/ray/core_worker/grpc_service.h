@@ -56,6 +56,10 @@ class CoreWorkerServiceHandler : public DelayedServiceHandler {
                                               ActorCallArgWaitCompleteReply *reply,
                                               SendReplyCallback send_reply_callback) = 0;
 
+  virtual void HandlePullActorCreationTask(PullActorCreationTaskRequest request,
+                                           PullActorCreationTaskReply *reply,
+                                           SendReplyCallback send_reply_callback) = 0;
+
   virtual void HandleRayletNotifyGCSRestart(RayletNotifyGCSRestartRequest request,
                                             RayletNotifyGCSRestartReply *reply,
                                             SendReplyCallback send_reply_callback) = 0;

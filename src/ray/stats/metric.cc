@@ -163,6 +163,31 @@ void Metric::Record(double value, TagsType tags) {
 
 void Metric::Record(double value,
                     std::vector<std::pair<std::string_view, std::string>> tags) {
+  if (StatsConfig::instance().IsStatsDisabled()) {
+    return;
+  }
+  if (::RayConfig::instance().enable_open_telemetry()) {
+    // Build the OpenTelemetry tag map directly. Going through the TagsType
+    // overload would register every tag key in the opencensus global registry
+    // (a lock + hash per tag) only to read the names back out, which is pure
+    // overhead on hot paths (e.g. the per-request gRPC counters).
+    absl::flat_hash_map<std::string, std::string> open_telemetry_tags;
+    for (const auto &tag_key : tag_keys_) {
+      open_telemetry_tags[tag_key.name()] = "";
+    }
+    for (auto &tag : tags) {
+      auto it = open_telemetry_tags.find(tag.first);
+      if (it != open_telemetry_tags.end()) {
+        it->second = std::move(tag.second);
+      }
+    }
+    for (const auto &tag : StatsConfig::instance().GetGlobalTags()) {
+      open_telemetry_tags[tag.first.name()] = tag.second;
+    }
+    OpenTelemetryMetricRecorder::GetInstance().SetMetricValue(
+        name_, std::move(open_telemetry_tags), value);
+    return;
+  }
   TagsType tags_pair_vec;
   tags_pair_vec.reserve(tags.size());
   for (auto &tag : tags) {

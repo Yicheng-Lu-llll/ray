@@ -214,7 +214,7 @@ class ServerCallImpl : public ServerCall {
     // TODO(Yi Cheng) call_name_ sometimes get corrunpted due to memory issues.
     RAY_CHECK(!call_name_.empty()) << "Call name is empty";
     if (record_metrics_) {
-      grpc_server_req_new_counter_.Record(1.0, {{"Method", call_name_}});
+      GrpcServerReqNewCounter().Record(1.0, {{"Method", call_name_}});
     }
   }
 
@@ -259,7 +259,7 @@ class ServerCallImpl : public ServerCall {
 
     start_time_ = absl::GetCurrentTimeNanos();
     if (record_metrics_) {
-      grpc_server_req_handling_counter_.Record(1.0, {{"Method", call_name_}});
+      GrpcServerReqHandlingCounter().Record(1.0, {{"Method", call_name_}});
     }
     if (!io_service_.stopped()) {
       io_service_.post(
@@ -336,8 +336,8 @@ class ServerCallImpl : public ServerCall {
 
   void OnReplySent() override {
     if (record_metrics_) {
-      grpc_server_req_finished_counter_.Record(1.0, {{"Method", call_name_}});
-      grpc_server_req_succeeded_counter_.Record(1.0, {{"Method", call_name_}});
+      GrpcServerReqFinishedCounter().Record(1.0, {{"Method", call_name_}});
+      GrpcServerReqSucceededCounter().Record(1.0, {{"Method", call_name_}});
     }
     if (send_reply_success_callback_ && !io_service_.stopped()) {
       io_service_.post(
@@ -349,8 +349,8 @@ class ServerCallImpl : public ServerCall {
 
   void OnReplyFailed() override {
     if (record_metrics_) {
-      grpc_server_req_finished_counter_.Record(1.0, {{"Method", call_name_}});
-      grpc_server_req_failed_counter_.Record(1.0, {{"Method", call_name_}});
+      GrpcServerReqFinishedCounter().Record(1.0, {{"Method", call_name_}});
+      GrpcServerReqFailedCounter().Record(1.0, {{"Method", call_name_}});
     }
     if (send_reply_failure_callback_ && !io_service_.stopped()) {
       io_service_.post(
@@ -392,8 +392,8 @@ class ServerCallImpl : public ServerCall {
     io_service_.stats()->RecordEnd(std::move(stats_handle_));
     auto end_time = absl::GetCurrentTimeNanos();
     if (record_metrics_) {
-      grpc_server_req_process_time_ms_histogram_.Record(
-          (end_time - start_time_) / 1000000.0, {{"Method", call_name_}});
+      GrpcServerReqProcessTimeMsHistogram().Record((end_time - start_time_) / 1000000.0,
+                                                   {{"Method", call_name_}});
     }
   }
 
@@ -468,18 +468,6 @@ class ServerCallImpl : public ServerCall {
 
   /// If true, the server call will generate gRPC server metrics.
   bool record_metrics_;
-
-  ray::stats::Histogram grpc_server_req_process_time_ms_histogram_{
-      GetGrpcServerReqProcessTimeMsHistogramMetric()};
-  ray::stats::Count grpc_server_req_new_counter_{GetGrpcServerReqNewCounterMetric()};
-  ray::stats::Count grpc_server_req_handling_counter_{
-      GetGrpcServerReqHandlingCounterMetric()};
-  ray::stats::Count grpc_server_req_finished_counter_{
-      GetGrpcServerReqFinishedCounterMetric()};
-  ray::stats::Count grpc_server_req_succeeded_counter_{
-      GetGrpcServerReqSucceededCounterMetric()};
-  ray::stats::Count grpc_server_req_failed_counter_{
-      GetGrpcServerReqFailedCounterMetric()};
 
   template <class T1, class T2, class T3, class T4, ClusterIdAuthType T5, bool T6>
   friend class ServerCallFactoryImpl;

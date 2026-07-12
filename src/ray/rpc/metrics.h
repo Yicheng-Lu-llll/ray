@@ -76,5 +76,41 @@ inline ray::stats::Count GetGrpcClientReqFailedCounterMetric() {
       /*tag_keys=*/{"Method"});
 }
 
+inline ray::stats::Histogram &GrpcServerReqProcessTimeMsHistogram() {
+  static auto *metric =
+      new ray::stats::Histogram(GetGrpcServerReqProcessTimeMsHistogramMetric());
+  return *metric;
+}
+
+inline ray::stats::Count &GrpcServerReqNewCounter() {
+  static auto *metric = new ray::stats::Count(GetGrpcServerReqNewCounterMetric());
+  return *metric;
+}
+
+inline ray::stats::Count &GrpcServerReqHandlingCounter() {
+  static auto *metric = new ray::stats::Count(GetGrpcServerReqHandlingCounterMetric());
+  return *metric;
+}
+
+inline ray::stats::Count &GrpcServerReqFinishedCounter() {
+  static auto *metric = new ray::stats::Count(GetGrpcServerReqFinishedCounterMetric());
+  return *metric;
+}
+
+inline ray::stats::Count &GrpcServerReqSucceededCounter() {
+  static auto *metric = new ray::stats::Count(GetGrpcServerReqSucceededCounterMetric());
+  return *metric;
+}
+
+inline ray::stats::Count &GrpcServerReqFailedCounter() {
+  static auto *metric = new ray::stats::Count(GetGrpcServerReqFailedCounterMetric());
+  return *metric;
+}
+
+inline ray::stats::Count &GrpcClientReqFailedCounter() {
+  static auto *metric = new ray::stats::Count(GetGrpcClientReqFailedCounterMetric());
+  return *metric;
+}
+
 }  // namespace rpc
 }  // namespace ray

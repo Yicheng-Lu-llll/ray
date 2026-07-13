@@ -33,6 +33,13 @@ void RayConfig::initialize(const std::string &config_list) {
   name##_ = ReadEnv<type>("RAY_" #name, #type, default_value);
 
 #include "ray/common/ray_config_def.h"
+// Internal flags are also env-driven; re-read them so a process that
+// re-initializes after changing its environment (e.g. a worker forked from a
+// pre-warmed template) picks up per-worker values such as RAY_JOB_ID. They
+// stay intentionally excluded from the user-facing config_list below.
+#define RAY_INTERNAL_FLAG RAY_CONFIG
+#include "ray/common/ray_internal_flag_def.h"
+#undef RAY_INTERNAL_FLAG
 #undef RAY_CONFIG
 
   if (config_list.empty()) {

@@ -14,14 +14,23 @@
 
 #include "ray/raylet/worker_pool.h"
 
+#ifndef _WIN32
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#endif
+
 #include <algorithm>
 #include <boost/date_time/posix_time/posix_time.hpp>
+#include <chrono>
+#include <cstdio>
 #include <deque>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -194,6 +203,15 @@ void WorkerPool::Start() {
 
     LeaseSpecification lease_spec{std::move(rpc_lease_spec)};
     PrestartWorkersInternal(lease_spec, num_prestart_python_workers);
+  }
+
+  if (RayConfig::instance().raylet_fork_worker_from_template()) {
+    // Pre-warm the fork server (it imports ray once) so the first worker
+    // burst finds it ready instead of falling back to exec.
+    auto it = states_by_lang_.find(Language::PYTHON);
+    if (it != states_by_lang_.end() && !it->second.worker_command.empty()) {
+      EnsureForkServer(it->second.worker_command[0]);
+    }
   }
 }
 
@@ -523,10 +541,21 @@ std::tuple<const ProcessInterface &, WorkerID> WorkerPool::StartWorkerProcess(
                               serialized_runtime_env_context,
                               state);
 
+  // The fork-server path only covers plain Python workers: anything with a
+  // runtime env context, per-process options, or startup-affecting env vars
+  // must go through the exec path. Cgroup-based resource isolation is
+  // compatible: the fork server itself is placed into the workers cgroup at
+  // startup, and forked children inherit its cgroup membership.
+  const bool fork_eligible =
+      RayConfig::instance().raylet_fork_worker_from_template() &&
+      language == Language::PYTHON && worker_type == rpc::WorkerType::WORKER &&
+      dynamic_options.empty() &&
+      (serialized_runtime_env_context.empty() || serialized_runtime_env_context == "{}");
+
   SteadyTimePoint start = clock_.SteadyNow();
   // Start a process and measure the startup time.
   std::unique_ptr<ProcessInterface> proc =
-      StartProcess(worker_command_args, env, worker_id);
+      StartProcess(worker_command_args, env, worker_id, fork_eligible);
   worker_pool_metrics_.num_workers_started_sum.Record(1);
   RAY_LOG(INFO).WithField(worker_id)
       << "Started worker process with pid " << proc->GetId();
@@ -677,7 +706,26 @@ void WorkerPool::MonitorPopWorkerRequestForRegistration(
 std::unique_ptr<ProcessInterface> WorkerPool::StartProcess(
     const std::vector<std::string> &worker_command_args,
     const ProcessEnvironment &env,
-    const WorkerID &worker_id) {
+    const WorkerID &worker_id,
+    bool fork_eligible) {
+  if (fork_eligible) {
+    // Env vars that affect process startup (dynamic linking, interpreter
+    // setup) cannot be applied after fork; fall back to exec for those.
+    bool env_safe = true;
+    for (const auto &entry : env) {
+      const auto &key = entry.first;
+      if (key.rfind("LD_", 0) == 0 || key.rfind("PYTHON", 0) == 0 || key == "PATH") {
+        env_safe = false;
+        break;
+      }
+    }
+    if (env_safe) {
+      auto forked = TrySpawnViaForkServer(worker_command_args, env);
+      if (forked != nullptr) {
+        return forked;
+      }
+    }
+  }
   // Launch the process to create the worker.
   std::error_code ec;
   std::vector<const char *> argv;
@@ -733,6 +781,221 @@ std::unique_ptr<ProcessInterface> WorkerPool::StartProcess(
     }
   }
   return child;
+}
+
+namespace {
+
+// Blocking write of the whole buffer to a socket fd.
+bool WriteAll(int fd, const std::string &data) {
+  size_t written = 0;
+  while (written < data.size()) {
+    ssize_t n = ::send(fd, data.data() + written, data.size() - written, MSG_NOSIGNAL);
+    if (n <= 0) {
+      if (n < 0 && (errno == EINTR)) {
+        continue;
+      }
+      return false;
+    }
+    written += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+// Read until a newline (single-line reply) with a total timeout.
+bool ReadLine(int fd, std::string *line, int timeout_ms) {
+  line->clear();
+  char c;
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (true) {
+    struct pollfd pfd = {fd, POLLIN, 0};
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         deadline - std::chrono::steady_clock::now())
+                         .count();
+    if (remaining <= 0) {
+      return false;
+    }
+    int pr = ::poll(&pfd, 1, static_cast<int>(remaining));
+    if (pr <= 0) {
+      if (pr < 0 && errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    ssize_t n = ::recv(fd, &c, 1, 0);
+    if (n <= 0) {
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    if (c == '\n') {
+      return true;
+    }
+    line->push_back(c);
+  }
+}
+
+std::string JsonEscape(const std::string &in) {
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (char ch : in) {
+    switch (ch) {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    default:
+      if (static_cast<unsigned char>(ch) < 0x20) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "\\u%04x", ch);
+        out += buf;
+      } else {
+        out += ch;
+      }
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+bool WorkerPool::EnsureForkServer(const std::string &python_executable) {
+  if (fork_server_unavailable_) {
+    return false;
+  }
+  if (fork_server_fd_ >= 0) {
+    return true;
+  }
+  if (fork_server_process_ == nullptr) {
+    fork_server_socket_path_ =
+        "/tmp/ray_fork_server_" + std::to_string(GetPID()) + ".sock";
+    std::vector<std::string> args = {python_executable,
+                                     "-m",
+                                     "ray._private.workers.fork_server",
+                                     "--socket-path",
+                                     fork_server_socket_path_};
+    std::vector<const char *> argv;
+    for (const auto &arg : args) {
+      argv.push_back(arg.c_str());
+    }
+    argv.push_back(nullptr);
+    std::error_code ec;
+    // SPT_NOENV must be set before the template imports setproctitle:
+    // otherwise setproctitle in forked children rewrites the environ memory
+    // (clobbering per-worker vars like RAY_JOB_ID after they were applied).
+    ProcessEnvironment fork_server_env;
+    fork_server_env.emplace("SPT_NOENV", "1");
+    // Place the fork server itself into the workers cgroup (when resource
+    // isolation is enabled): forked workers inherit its cgroup membership at
+    // birth, so no per-worker cgroup move is needed on this path.
+    fork_server_process_ = std::make_unique<Process>(argv.data(),
+                                                     ec,
+                                                     /*decouple=*/false,
+                                                     fork_server_env,
+                                                     /*pipe_to_stdin=*/false,
+                                                     add_to_cgroup_hook_);
+    if (!fork_server_process_->IsValid() || ec) {
+      RAY_LOG(WARNING) << "Failed to start the worker fork server (" << ec.message()
+                       << "); falling back to exec for all workers.";
+      fork_server_unavailable_ = true;
+      return false;
+    }
+    fork_server_spawned_at_ = std::chrono::steady_clock::now();
+    RAY_LOG(INFO) << "Started worker fork server, pid " << fork_server_process_->GetId()
+                  << ", socket: " << fork_server_socket_path_;
+  }
+  // Single non-blocking connect attempt. While the template is still
+  // importing ray (~1s), callers fall back to exec instead of stalling the
+  // raylet's main thread; Start() pre-warms the process so this window is
+  // long gone by the time the first eligible worker start arrives.
+  int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return false;
+  }
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, fork_server_socket_path_.c_str(), sizeof(addr.sun_path) - 1);
+  if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0) {
+    fork_server_fd_ = fd;
+    RAY_LOG(INFO) << "Connected to the worker fork server.";
+    return true;
+  }
+  ::close(fd);
+  if (std::chrono::steady_clock::now() - fork_server_spawned_at_ >
+      std::chrono::seconds(60)) {
+    RAY_LOG(WARNING) << "Could not connect to the worker fork server at "
+                     << fork_server_socket_path_
+                     << " within 60s of starting it; falling back to exec for all "
+                        "workers.";
+    fork_server_unavailable_ = true;
+  }
+  return false;
+}
+
+std::unique_ptr<ProcessInterface> WorkerPool::TrySpawnViaForkServer(
+    const std::vector<std::string> &worker_command_args, const ProcessEnvironment &env) {
+  if (worker_command_args.empty()) {
+    return nullptr;
+  }
+  if (!EnsureForkServer(worker_command_args[0])) {
+    return nullptr;
+  }
+  std::string request = "{\"argv\":[";
+  for (size_t i = 0; i < worker_command_args.size(); i++) {
+    if (i > 0) {
+      request += ",";
+    }
+    request += "\"" + JsonEscape(worker_command_args[i]) + "\"";
+  }
+  request += "],\"env\":{";
+  bool first = true;
+  for (const auto &entry : env) {
+    if (!first) {
+      request += ",";
+    }
+    first = false;
+    request += "\"" + JsonEscape(entry.first) + "\":\"" + JsonEscape(entry.second) + "\"";
+  }
+  request += "},\"setpgid\":";
+  request += RayConfig::instance().process_group_cleanup_enabled() ? "true" : "false";
+  request += "}\n";
+
+  std::string reply;
+  if (!WriteAll(fork_server_fd_, request) ||
+      !ReadLine(fork_server_fd_, &reply, /*timeout_ms=*/5000)) {
+    RAY_LOG(WARNING) << "Worker fork server request failed; falling back to exec "
+                        "for all workers.";
+    ::close(fork_server_fd_);
+    fork_server_fd_ = -1;
+    fork_server_unavailable_ = true;
+    return nullptr;
+  }
+  // Reply: {"pid": N} or {"error": "..."}.
+  auto pid_pos = reply.find("\"pid\":");
+  if (pid_pos == std::string::npos) {
+    RAY_LOG(WARNING) << "Worker fork server spawn failed: " << reply
+                     << "; falling back to exec for this worker.";
+    return nullptr;
+  }
+  pid_t pid = static_cast<pid_t>(std::atoll(reply.c_str() + pid_pos + 6));
+  if (pid <= 0) {
+    return nullptr;
+  }
+  RAY_LOG(DEBUG) << "Worker forked from template, pid " << pid;
+  return std::make_unique<Process>(pid);
 }
 
 Status WorkerPool::GetNextFreePort(int *port) {

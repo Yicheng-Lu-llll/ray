@@ -61,11 +61,12 @@ RAY_CONFIG(int64_t, handler_warning_timeout_ms, 1000)
 /// The duration between loads pulled by GCS
 RAY_CONFIG(uint64_t, gcs_pull_resource_loads_period_milliseconds, 1000)
 
-/// If true, the periodic GetResourceLoad pull (autoscaler/dashboard node bookkeeping) issues
-/// its per-node RPCs on a dedicated io_context/thread instead of the GCS main io_context, and
-/// applies the results back on the main io_context. The per-sweep RPC issuance is O(nodes) and
-/// otherwise steals the single main thread from actor registration/scheduling at large scale.
-/// When false (the default), behavior is unchanged.
+/// If true, the periodic GetResourceLoad pull (autoscaler/dashboard node bookkeeping)
+/// issues its per-node RPCs on a dedicated io_context/thread instead of the GCS main
+/// io_context, and applies the results back on the main io_context. The per-sweep RPC
+/// issuance is O(nodes) and otherwise steals the single main thread from actor
+/// registration/scheduling at large scale. When false (the default), behavior is
+/// unchanged.
 RAY_CONFIG(bool, gcs_offload_resource_load_pull, false)
 
 /// The duration between reporting resources sent by the raylets.
@@ -354,6 +355,15 @@ RAY_CONFIG(bool, actor_ref_deleted_push_enabled, false)
 /// that re-submit to an already-leased worker (GCS restart reschedule) still
 /// use the push.
 RAY_CONFIG(bool, gcs_actor_creation_worker_pull_enabled, false)
+
+/// When enabled (Linux only), the raylet starts Python workers by forking
+/// them from a pre-warmed template process (which has already paid the
+/// Python interpreter startup and `import ray`) instead of exec-ing a fresh
+/// interpreter per worker. Only plain Python workers qualify (no
+/// runtime_env context, no dynamic options, no startup-affecting env vars,
+/// resource isolation off); everything else falls back to the exec path,
+/// as does any fork-server failure.
+RAY_CONFIG(bool, raylet_fork_worker_from_template, false)
 
 /// The duration that we wait after the worker is launched before the
 /// starting_worker_timeout_callback() is called.

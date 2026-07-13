@@ -607,10 +607,28 @@ class WorkerPool : public WorkerPoolInterface {
   /// the environment variables of the parent process.
   /// \param[in] worker_id The WorkerID assigned to this worker process.
   /// \return An object representing the started worker process.
+  /// \param fork_eligible Whether this worker may be spawned via the fork
+  /// server (raylet_fork_worker_from_template); ineligible workers and any
+  /// fork-server failure use the regular exec path.
   virtual std::unique_ptr<ProcessInterface> StartProcess(
       const std::vector<std::string> &worker_command_args,
       const ProcessEnvironment &env,
-      const WorkerID &worker_id);
+      const WorkerID &worker_id,
+      bool fork_eligible = false);
+
+  /// Spawn a worker through the fork server. Returns nullptr on any failure
+  /// (callers fall back to the exec path). Starts and connects to the fork
+  /// server on first use.
+  std::unique_ptr<ProcessInterface> TrySpawnViaForkServer(
+      const std::vector<std::string> &worker_command_args, const ProcessEnvironment &env);
+
+  /// Ensure the fork-server process is running and its control socket is
+  /// connected, without blocking: spawns the process on first call and makes
+  /// a single connect attempt per call (a unix connect either succeeds
+  /// immediately or fails immediately). Returns true only once connected.
+  /// \param python_executable Interpreter to run the fork server with (the
+  /// same one the worker command uses).
+  bool EnsureForkServer(const std::string &python_executable);
 
   /// Push a warning message to user if worker pool is getting too big.
   virtual void WarnAboutSize();
@@ -928,6 +946,17 @@ class WorkerPool : public WorkerPoolInterface {
   int64_t process_failed_runtime_env_setup_failed_ = 0;
 
   AddProcessToCgroupHook add_to_cgroup_hook_;
+
+  /// Fork-server state (raylet_fork_worker_from_template).
+  std::unique_ptr<ProcessInterface> fork_server_process_;
+  int fork_server_fd_ = -1;
+  /// Set after an unrecoverable fork-server failure: all subsequent spawns
+  /// use the exec path.
+  bool fork_server_unavailable_ = false;
+  std::string fork_server_socket_path_;
+  /// When the fork-server process was spawned; connect attempts give up (and
+  /// permanently fall back to exec) 60s after this.
+  std::chrono::steady_clock::time_point fork_server_spawned_at_;
 
   /// Ray metrics
   WorkerPoolMetrics worker_pool_metrics_;

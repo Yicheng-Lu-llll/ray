@@ -203,6 +203,13 @@ class SubscriptionIndex {
   int64_t NumSubscriberEntries() const;
 
   /**
+   * @brief Removes keys that have no subscriber in this index from `keys`.
+   *
+   * Keeps everything when there are subscribers to all entities.
+   */
+  void FilterKeysWithSubscribers(std::vector<std::string> *keys) const;
+
+  /**
    * @brief Checks if there's no metadata remaining in the private attributes.
    *
    * @return true if no metadata remains, false otherwise.
@@ -422,6 +429,10 @@ class Publisher : public PublisherInterface {
    * compensated by the snapshot published at registration time.
    */
   bool ChannelHasSubscribers(const rpc::ChannelType channel_type) const override;
+
+  /// See PublisherInterface::FilterKeysWithSubscribers. Takes mutex_.
+  void FilterKeysWithSubscribers(const rpc::ChannelType channel_type,
+                                 std::vector<std::string> *keys) const override;
 
   void PublishFailure(const rpc::ChannelType channel_type,
                       const std::string &key_id) override;

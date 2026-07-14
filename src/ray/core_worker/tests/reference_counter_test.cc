@@ -60,6 +60,9 @@ class ReferenceCountTest : public ::testing::Test {
         subscriber_.get(),
         [](const NodeID &node_id) { return false; },
         [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
+        [this](std::function<void()> work) {
+          posted_publish_work_.push_back(std::move(work));
+        },
         *owned_object_count_metric_,
         *owned_object_size_metric_);
   }
@@ -73,6 +76,17 @@ class ReferenceCountTest : public ::testing::Test {
 
   void AssertNoLeaks() { ASSERT_EQ(rc->NumObjectIDsInScope(), 0); }
 
+  /// Executes work handed to the ReferenceCounter's object-location publish
+  /// executor. Tests call this to drain pending location publishes.
+  void FlushPublishWork() {
+    std::vector<std::function<void()>> work;
+    work.swap(posted_publish_work_);
+    for (auto &f : work) {
+      f();
+    }
+  }
+
+  std::vector<std::function<void()>> posted_publish_work_;
   std::shared_ptr<pubsub::MockPublisher> publisher_;
   std::shared_ptr<pubsub::FakeSubscriber> subscriber_;
 };
@@ -95,6 +109,9 @@ class ReferenceCountLineageEnabledTest : public ::testing::Test {
         subscriber_.get(),
         [](const NodeID &node_id) { return false; },
         [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
+        [this](std::function<void()> work) {
+          posted_publish_work_.push_back(std::move(work));
+        },
         *owned_object_count_metric_,
         *owned_object_size_metric_,
         /*lineage_pinning_enabled=*/true);
@@ -106,6 +123,17 @@ class ReferenceCountLineageEnabledTest : public ::testing::Test {
     rc.reset();
   }
 
+  /// Executes work handed to the ReferenceCounter's object-location publish
+  /// executor. Tests call this to drain pending location publishes.
+  void FlushPublishWork() {
+    std::vector<std::function<void()>> work;
+    work.swap(posted_publish_work_);
+    for (auto &f : work) {
+      f();
+    }
+  }
+
+  std::vector<std::function<void()>> posted_publish_work_;
   std::shared_ptr<pubsub::MockPublisher> publisher_;
   std::shared_ptr<pubsub::FakeSubscriber> subscriber_;
 };
@@ -332,6 +360,9 @@ class MockWorkerClient : public MockCoreWorkerClientInterface {
             subscriber_.get(),
             [](const NodeID &node_id) { return true; },
             [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
+            // Borrower-protocol tests exercise ref-removed publishing, which is
+            // synchronous; location publishes are irrelevant here, so drop them.
+            [](std::function<void()>) {},
             *owned_object_count_metric_,
             *owned_object_size_metric_,
             /*lineage_pinning_enabled=*/false) {}
@@ -864,6 +895,105 @@ TEST_F(ReferenceCountTest, TestSkipsLocationPublishWithoutSubscribers) {
   EXPECT_CALL(*publisher_, ChannelHasSubscribers).WillRepeatedly(::testing::Return(true));
   EXPECT_CALL(*publisher_, Publish).Times(::testing::AtLeast(1));
   rc->AddObjectLocation(obj, node);
+  FlushPublishWork();
+
+  rc->RemoveLocalReference(obj, nullptr);
+}
+
+TEST_F(ReferenceCountTest, TestCoalescesLocationPublishes) {
+  auto obj = ObjectID::FromRandom();
+  auto node = NodeID::FromRandom();
+  auto node2 = NodeID::FromRandom();
+  rpc::Address address;
+  address.set_ip_address("1.2.3.4");
+
+  // Several location-state changes before the drain runs coalesce into a
+  // single published message carrying the latest state.
+  EXPECT_CALL(*publisher_, Publish).Times(1);
+  rc->AddOwnedObject(obj,
+                     {},
+                     address,
+                     "file.py:42",
+                     100,
+                     LineageReconstructionEligibility::INELIGIBLE_PUT,
+                     /*add_local_ref=*/true);
+  rc->AddObjectLocation(obj, node);
+  rc->AddObjectLocation(obj, node2);
+  rc->RemoveObjectLocation(obj, node);
+  FlushPublishWork();
+  ::testing::Mock::VerifyAndClearExpectations(publisher_.get());
+
+  // Updates after a drain schedule a new drain and publish again.
+  EXPECT_CALL(*publisher_, Publish).Times(1);
+  rc->AddObjectLocation(obj, node);
+  FlushPublishWork();
+  ::testing::Mock::VerifyAndClearExpectations(publisher_.get());
+
+  rc->RemoveLocalReference(obj, nullptr);
+}
+
+TEST_F(ReferenceCountTest, TestDirtyObjectFreedBeforeFlushIsSkipped) {
+  auto obj = ObjectID::FromRandom();
+  auto node = NodeID::FromRandom();
+  rpc::Address address;
+  address.set_ip_address("1.2.3.4");
+
+  rc->AddOwnedObject(obj,
+                     {},
+                     address,
+                     "file.py:42",
+                     100,
+                     LineageReconstructionEligibility::INELIGIBLE_PUT,
+                     /*add_local_ref=*/true);
+  rc->AddObjectLocation(obj, node);
+  // The object goes out of scope before the drain runs: nothing is published
+  // for it (subscribers learn about deleted objects through the failure /
+  // ref-removed paths).
+  rc->RemoveLocalReference(obj, nullptr);
+  EXPECT_CALL(*publisher_, Publish).Times(0);
+  FlushPublishWork();
+}
+
+TEST_F(ReferenceCountTest, TestFlushFiltersKeysWithoutSubscribers) {
+  auto obj = ObjectID::FromRandom();
+  auto node = NodeID::FromRandom();
+  rpc::Address address;
+  address.set_ip_address("1.2.3.4");
+
+  rc->AddOwnedObject(obj,
+                     {},
+                     address,
+                     "file.py:42",
+                     100,
+                     LineageReconstructionEligibility::INELIGIBLE_PUT,
+                     /*add_local_ref=*/true);
+  rc->AddObjectLocation(obj, node);
+  // The publisher reports that no subscriber is registered for this key:
+  // the drain must not build or publish a message for it.
+  EXPECT_CALL(*publisher_, FilterKeysWithSubscribers)
+      .WillOnce([](rpc::ChannelType, std::vector<std::string> *keys) { keys->clear(); });
+  EXPECT_CALL(*publisher_, Publish).Times(0);
+  FlushPublishWork();
+
+  rc->RemoveLocalReference(obj, nullptr);
+}
+
+TEST_F(ReferenceCountTest, TestLocationSnapshotPublishesImmediately) {
+  auto obj = ObjectID::FromRandom();
+  rpc::Address address;
+  address.set_ip_address("1.2.3.4");
+
+  rc->AddOwnedObject(obj,
+                     {},
+                     address,
+                     "file.py:42",
+                     100,
+                     LineageReconstructionEligibility::INELIGIBLE_PUT,
+                     /*add_local_ref=*/true);
+  // The registration-time snapshot must not wait for a drain cycle.
+  EXPECT_CALL(*publisher_, Publish).Times(1);
+  rc->PublishObjectLocationSnapshot(obj);
+  ::testing::Mock::VerifyAndClearExpectations(publisher_.get());
 
   rc->RemoveLocalReference(obj, nullptr);
 }
@@ -929,6 +1059,7 @@ TEST(MemoryStoreIntegrationTest, TestSimple) {
       /*is_node_dead=*/[](const NodeID &) { return false; },
       /*free_object_on_nodes_async=*/
       [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
+      [](std::function<void()>) {},
       *owned_object_count_metric,
       *owned_object_size_metric);
   InstrumentedIOContextWithThread io_context("TestSimple");

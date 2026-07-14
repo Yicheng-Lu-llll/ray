@@ -32,6 +32,10 @@ class MockPublisher : public PublisherInterface {
               (const rpc::ChannelType channel_type),
               (const, override));
   MOCK_METHOD(void,
+              FilterKeysWithSubscribers,
+              (const rpc::ChannelType channel_type, std::vector<std::string> *keys),
+              (const, override));
+  MOCK_METHOD(void,
               ConnectToSubscriber,
               (const rpc::PubsubLongPollingRequest &request,
                std::string *publisher_id,

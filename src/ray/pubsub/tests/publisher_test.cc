@@ -358,6 +358,31 @@ TEST_F(PublisherTest, TestChannelHasSubscribers) {
   EXPECT_FALSE(publisher_->ChannelHasSubscribers(channel));
 }
 
+TEST_F(PublisherTest, TestFilterKeysWithSubscribers) {
+  const auto channel = rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL;
+  const auto subscribed = ObjectID::FromRandom();
+  const auto unsubscribed = ObjectID::FromRandom();
+
+  EXPECT_FALSE(
+      publisher_->RegisterSubscription(channel, subscriber_id_, subscribed.Binary())
+          .has_error());
+
+  // Keys without subscribers are removed; subscribed keys are kept.
+  std::vector<std::string> keys = {subscribed.Binary(), unsubscribed.Binary()};
+  publisher_->FilterKeysWithSubscribers(channel, &keys);
+  EXPECT_EQ(keys, std::vector<std::string>({subscribed.Binary()}));
+
+  // A subscriber to all entities keeps every key.
+  EXPECT_FALSE(publisher_
+                   ->RegisterSubscription(channel,
+                                          UniqueID::FromRandom(),
+                                          /*key_id=*/std::nullopt)
+                   .has_error());
+  keys = {subscribed.Binary(), unsubscribed.Binary()};
+  publisher_->FilterKeysWithSubscribers(channel, &keys);
+  EXPECT_EQ(keys.size(), 2u);
+}
+
 TEST_F(PublisherTest, TestSubscriber) {
   absl::flat_hash_set<ObjectID> object_ids_published;
   reply = rpc::PubsubLongPollingReply();

@@ -14,6 +14,7 @@
 
 #include "ray/core_worker/reference_counter.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -414,7 +415,7 @@ void ReferenceCounter::UpdateObjectSize(const ObjectID &object_id, int64_t objec
     it->second.object_size_ = object_size;
     // Increment counter with new size
     UpdateOwnedObjectCounters(object_id, it->second, /*decrement=*/false);
-    PushToLocationSubscribers(it);
+    ScheduleLocationPublish(it);
   }
 }
 
@@ -1491,7 +1492,7 @@ void ReferenceCounter::AddObjectLocationInternal(ReferenceTable::iterator it,
     // Only push to subscribers if we added a new location. We eagerly add the pinned
     // location without waiting for the object store notification to trigger a location
     // report, so there's a chance that we already knew about the node_id location.
-    PushToLocationSubscribers(it);
+    ScheduleLocationPublish(it);
   }
 }
 
@@ -1515,7 +1516,7 @@ bool ReferenceCounter::RemoveObjectLocation(const ObjectID &object_id,
 void ReferenceCounter::RemoveObjectLocationInternal(ReferenceTable::iterator it,
                                                     const NodeID &node_id) {
   it->second.locations.erase(node_id);
-  PushToLocationSubscribers(it);
+  ScheduleLocationPublish(it);
 }
 
 void ReferenceCounter::UpdateObjectPendingCreationInternal(const ObjectID &object_id,
@@ -1529,7 +1530,7 @@ void ReferenceCounter::UpdateObjectPendingCreationInternal(const ObjectID &objec
     UpdateOwnedObjectCounters(object_id, it->second, /*decrement=*/false);
   }
   if (push) {
-    PushToLocationSubscribers(it);
+    ScheduleLocationPublish(it);
   }
 }
 
@@ -1577,7 +1578,7 @@ bool ReferenceCounter::HandleObjectSpilled(const ObjectID &object_id,
     if (!spilled_node_id.IsNil()) {
       it->second.spilled_node_id = spilled_node_id;
     }
-    PushToLocationSubscribers(it);
+    ScheduleLocationPublish(it);
   } else {
     RAY_LOG(DEBUG).WithField(spilled_node_id).WithField(object_id)
         << "Object spilled to dead node ";
@@ -1704,17 +1705,68 @@ bool ReferenceCounter::IsObjectPendingCreation(const ObjectID &object_id) const 
   return it->second.pending_creation_;
 }
 
-void ReferenceCounter::PushToLocationSubscribers(ReferenceTable::iterator it) {
+void ReferenceCounter::ScheduleLocationPublish(ReferenceTable::iterator it) {
   if (!object_info_publisher_->ChannelHasSubscribers(
           rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL)) {
     // Nobody subscribes to this worker's object locations, which is the common
     // case when the objects it owns are small enough to be passed inline (no
-    // raylet ever needs to locate them). Skip building and publishing the
-    // update: the message would be dropped at the subscription index anyway,
-    // and a subscriber that registers later receives a full location snapshot
-    // at registration time, so nothing is lost.
+    // raylet ever needs to locate them). Skip recording the update: the message
+    // would be dropped at the subscription index anyway, and a subscriber that
+    // registers later receives a full location snapshot at registration time,
+    // so nothing is lost.
     return;
   }
+  dirty_location_objects_.insert(it->first);
+  if (location_publish_scheduled_) {
+    return;
+  }
+  location_publish_scheduled_ = true;
+  post_object_location_publish_([this]() { FlushDirtyObjectLocations(); });
+}
+
+void ReferenceCounter::FlushDirtyObjectLocations() {
+  std::vector<std::string> keys;
+  {
+    absl::MutexLock lock(&mutex_);
+    // Marks arriving from here on schedule a new drain task.
+    location_publish_scheduled_ = false;
+    keys.reserve(dirty_location_objects_.size());
+    for (const auto &object_id : dirty_location_objects_) {
+      keys.push_back(object_id.Binary());
+    }
+    dirty_location_objects_.clear();
+  }
+  // Drop keys nobody subscribes to before building any message. A key whose
+  // subscriber registers concurrently is still covered: the registration-time
+  // snapshot includes this update's state.
+  object_info_publisher_->FilterKeysWithSubscribers(
+      rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL, &keys);
+  // Build in bounded batches so the lock is never held for O(all dirty objects).
+  constexpr size_t kBuildBatchSize = 256;
+  for (size_t start = 0; start < keys.size(); start += kBuildBatchSize) {
+    const size_t end = std::min(keys.size(), start + kBuildBatchSize);
+    std::vector<rpc::PubMessage> batch;
+    batch.reserve(end - start);
+    {
+      absl::MutexLock lock(&mutex_);
+      for (size_t i = start; i < end; i++) {
+        auto it = object_id_refs_.find(ObjectID::FromBinary(keys[i]));
+        if (it == object_id_refs_.end()) {
+          // Freed since it was marked. Subscribers learn about deleted objects
+          // through the failure / ref-removed paths.
+          continue;
+        }
+        batch.push_back(BuildObjectLocationMessage(it));
+      }
+    }
+    for (auto &pub_message : batch) {
+      object_info_publisher_->Publish(std::move(pub_message));
+    }
+  }
+}
+
+rpc::PubMessage ReferenceCounter::BuildObjectLocationMessage(
+    ReferenceTable::iterator it) {
   const auto &object_id = it->first;
   const auto &locations = it->second.locations;
   auto object_size = it->second.object_size_;
@@ -1732,8 +1784,7 @@ void ReferenceCounter::PushToLocationSubscribers(ReferenceTable::iterator it) {
   pub_message.set_channel_type(rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL);
   auto object_locations_msg = pub_message.mutable_worker_object_locations_message();
   FillObjectInformationInternal(it, object_locations_msg);
-
-  object_info_publisher_->Publish(std::move(pub_message));
+  return pub_message;
 }
 
 void ReferenceCounter::FillObjectInformation(
@@ -1788,8 +1839,10 @@ void ReferenceCounter::PublishObjectLocationSnapshot(const ObjectID &object_id) 
 
   // Always publish the location when subscribed for the first time.
   // This will ensure that the subscriber will get the first snapshot of the
-  // object location.
-  PushToLocationSubscribers(it);
+  // object location. Published directly instead of through
+  // ScheduleLocationPublish so the new subscriber does not wait for a drain
+  // cycle.
+  object_info_publisher_->Publish(BuildObjectLocationMessage(it));
 }
 
 std::string ReferenceCounter::DebugString() const {

@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <functional>
 #include <list>
 #include <memory>
 #include <string>
@@ -44,6 +45,13 @@ namespace core {
 class ReferenceCounter : public ReferenceCounterInterface,
                          public LocalityDataProviderInterface {
  public:
+  /// \param post_object_location_publish Executor that runs object-location
+  /// publish work off the caller's thread (in production, the dedicated
+  /// object-info publish thread). Location updates are recorded as dirty under
+  /// mutex_ and built/published by a single drain task run through this
+  /// executor, so the expensive work never happens in this class's critical
+  /// sections and consecutive updates to the same object coalesce into one
+  /// message.
   ReferenceCounter(
       rpc::Address rpc_address,
       pubsub::PublisherInterface *object_info_publisher,
@@ -52,6 +60,7 @@ class ReferenceCounter : public ReferenceCounterInterface,
       std::function<void(const ObjectID &object_id,
                          const absl::flat_hash_set<NodeID> &locations)>
           free_object_on_nodes_async,
+      std::function<void(std::function<void()>)> post_object_location_publish,
       ray::observability::MetricInterface &owned_object_by_state_counter,
       ray::observability::MetricInterface &owned_object_sizes_by_state_counter,
       bool lineage_pinning_enabled = false)
@@ -61,6 +70,7 @@ class ReferenceCounter : public ReferenceCounterInterface,
         object_info_subscriber_(object_info_subscriber),
         is_node_dead_(std::move(is_node_dead)),
         free_object_on_nodes_async_(std::move(free_object_on_nodes_async)),
+        post_object_location_publish_(std::move(post_object_location_publish)),
         owned_object_count_by_state_(owned_object_by_state_counter),
         owned_object_sizes_by_state_(owned_object_sizes_by_state_counter) {}
 
@@ -699,10 +709,30 @@ class ReferenceCounter : public ReferenceCounterInterface,
                                  const Reference &ref,
                                  bool decrement) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  /// Publish object locations to all subscribers.
+  /// Schedule the object's location to be published to subscribers.
+  ///
+  /// The object is only marked dirty here; a drain task run through
+  /// post_object_location_publish_ builds and publishes the messages (see
+  /// FlushDirtyObjectLocations). This keeps message building out of this
+  /// class's critical sections and coalesces consecutive updates to the same
+  /// object into a single message, which is safe because the channel carries
+  /// absolute state and subscribers keep the last message they receive.
   ///
   /// \param[in] it The reference iterator for the object.
-  void PushToLocationSubscribers(ReferenceTable::iterator it)
+  void ScheduleLocationPublish(ReferenceTable::iterator it)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  /// Build and publish the location messages for all objects marked dirty by
+  /// ScheduleLocationPublish. Runs on the object-info publish executor. Objects
+  /// whose key has no subscriber are filtered out before any message is built;
+  /// objects freed since they were marked are skipped (subscribers learn about
+  /// those through the failure / ref-removed paths).
+  void FlushDirtyObjectLocations() ABSL_LOCKS_EXCLUDED(mutex_);
+
+  /// Build the location message for the given reference.
+  ///
+  /// \param[in] it The reference iterator for the object.
+  rpc::PubMessage BuildObjectLocationMessage(ReferenceTable::iterator it)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   /// Fill up the object information for the given iterator.
@@ -786,6 +816,18 @@ class ReferenceCounter : public ReferenceCounterInterface,
   const std::function<void(const ObjectID &object_id,
                            const absl::flat_hash_set<NodeID> &locations)>
       free_object_on_nodes_async_;
+
+  /// Runs object-location publish work off the caller's thread (in production,
+  /// the dedicated object-info publish thread). See ScheduleLocationPublish.
+  const std::function<void(std::function<void()>)> post_object_location_publish_;
+
+  /// Objects whose location state changed and has not been published yet.
+  /// Consumed by FlushDirtyObjectLocations.
+  absl::flat_hash_set<ObjectID> dirty_location_objects_ ABSL_GUARDED_BY(mutex_);
+
+  /// Whether a FlushDirtyObjectLocations task is scheduled or running. Ensures
+  /// at most one drain task is in flight.
+  bool location_publish_scheduled_ ABSL_GUARDED_BY(mutex_) = false;
 
   /// A buffer of the objects whose primary or spilled locations have been lost
   /// due to node failure. These objects are still in scope and need to be

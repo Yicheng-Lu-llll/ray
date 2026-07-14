@@ -17,6 +17,7 @@
 #include <gtest/gtest_prod.h>
 
 #include <string>
+#include <vector>
 
 #include "ray/common/id.h"
 #include "ray/common/status.h"
@@ -88,6 +89,20 @@ class PublisherInterface {
   virtual bool ChannelHasSubscribers(const rpc::ChannelType channel_type) const {
     return true;
   }
+
+  /**
+   * @brief Removes keys that have no subscriber on the channel from `keys`.
+   *
+   * Like ChannelHasSubscribers, this is a fast-path hint for publishers:
+   * publishing to a key without subscribers is always safe (the message is
+   * dropped at the subscription index), so implementations may conservatively
+   * keep keys; the default keeps all of them.
+   *
+   * @param channel_type The type of the channel.
+   * @param keys[in,out] Candidate key ids; filtered in place.
+   */
+  virtual void FilterKeysWithSubscribers(const rpc::ChannelType channel_type,
+                                         std::vector<std::string> *keys) const {}
 
   /**
    * @brief Publish to the subscriber that the given key id is not available anymore.

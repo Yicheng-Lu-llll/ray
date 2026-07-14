@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
@@ -54,6 +55,11 @@ class PostingPublisher : public PublisherInterface {
 
   bool ChannelHasSubscribers(const rpc::ChannelType channel_type) const override {
     return inner_->ChannelHasSubscribers(channel_type);
+  }
+
+  void FilterKeysWithSubscribers(const rpc::ChannelType channel_type,
+                                 std::vector<std::string> *keys) const override {
+    inner_->FilterKeysWithSubscribers(channel_type, keys);
   }
 
   void ConnectToSubscriber(

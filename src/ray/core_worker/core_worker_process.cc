@@ -381,6 +381,11 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
       [this](const ObjectID &object_id, const absl::flat_hash_set<NodeID> &locations) {
         GetCoreWorker()->FreeObjectOnNodesAsync(object_id, locations);
       },
+      /*post_object_location_publish=*/
+      [this](std::function<void()> flush_dirty_object_locations) {
+        object_info_publish_service_.post(std::move(flush_dirty_object_locations),
+                                          "ReferenceCounter.FlushDirtyObjectLocations");
+      },
       *owned_objects_counter_,
       *owned_objects_size_counter_,
       RayConfig::instance().lineage_pinning_enabled());

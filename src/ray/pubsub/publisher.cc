@@ -14,6 +14,7 @@
 
 #include "ray/pubsub/publisher.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -121,6 +122,17 @@ int64_t SubscriptionIndex::GetNumBufferedBytes() const {
 int64_t SubscriptionIndex::NumSubscriberEntries() const {
   return static_cast<int64_t>(subscribers_to_all_->Subscribers().size() +
                               subscribers_to_key_id_.size());
+}
+
+void SubscriptionIndex::FilterKeysWithSubscribers(std::vector<std::string> *keys) const {
+  if (!subscribers_to_all_->Subscribers().empty()) {
+    return;
+  }
+  keys->erase(
+      std::remove_if(keys->begin(),
+                     keys->end(),
+                     [this](const std::string &key) { return !entities_.contains(key); }),
+      keys->end());
 }
 
 bool SubscriptionIndex::Publish(const std::shared_ptr<rpc::PubMessage> &pub_message,
@@ -423,6 +435,17 @@ StatusSet<StatusT::InvalidArgument> Publisher::RegisterSubscription(
   channel_subscriber_counts_.at(channel_type)
       ->store(subscription_index_it->second.NumSubscriberEntries());
   return StatusT::OK();
+}
+
+void Publisher::FilterKeysWithSubscribers(const rpc::ChannelType channel_type,
+                                          std::vector<std::string> *keys) const {
+  absl::MutexLock lock(&mutex_);
+  auto it = subscription_index_map_.find(channel_type);
+  if (it == subscription_index_map_.end()) {
+    // Unknown channel: be conservative and keep all keys.
+    return;
+  }
+  it->second.FilterKeysWithSubscribers(keys);
 }
 
 bool Publisher::ChannelHasSubscribers(const rpc::ChannelType channel_type) const {

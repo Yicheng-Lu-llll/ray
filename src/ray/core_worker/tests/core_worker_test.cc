@@ -158,6 +158,7 @@ class CoreWorkerTest : public ::testing::Test {
         fake_object_info_subscriber.get(),
         [](const NodeID &) { return false; },
         [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
+        [](std::function<void()>) {},
         fake_owned_object_count_gauge_,
         fake_owned_object_size_gauge_,
         false);
@@ -822,13 +823,15 @@ TEST(BatchingPassesTwoTwoOneIntoPlasmaGet, CallsPlasmaGetInCorrectBatches) {
   auto is_node_dead = [](const NodeID &) { return false; };
   auto free_object_on_nodes_async = [](const ObjectID &,
                                        const absl::flat_hash_set<NodeID> &) {};
-  ReferenceCounter ref_counter(addr,
-                               /*object_info_publisher=*/nullptr,
-                               /*object_info_subscriber=*/nullptr,
-                               is_node_dead,
-                               free_object_on_nodes_async,
-                               *std::make_shared<ray::observability::FakeGauge>(),
-                               *std::make_shared<ray::observability::FakeGauge>());
+  ReferenceCounter ref_counter(
+      addr,
+      /*object_info_publisher=*/nullptr,
+      /*object_info_subscriber=*/nullptr,
+      is_node_dead,
+      free_object_on_nodes_async,
+      [](std::function<void()>) {},
+      *std::make_shared<ray::observability::FakeGauge>(),
+      *std::make_shared<ray::observability::FakeGauge>());
 
   // Fake plasma client that records Get calls.
   std::vector<std::vector<ObjectID>> observed_batches;
@@ -1128,8 +1131,9 @@ TEST_F(CoreWorkerTest, HandlePubsubWorkerObjectLocationsChannelRetries) {
                                      object_size,
                                      LineageReconstructionEligibility::INELIGIBLE_PUT,
                                      true);
-  // NOTE: this triggers a publish to no subscribers so its not stored in any mailbox but
-  // bumps the sequence id by 1
+  // No subscriber is registered on the channel yet, so this update is skipped
+  // entirely (it does not consume a sequence id); the subscriber below is
+  // brought up to date by the registration-time snapshot instead.
   reference_counter_->AddObjectLocation(object_id, node_id);
 
   rpc::PubsubLongPollingRequest request;
@@ -1197,8 +1201,10 @@ TEST_F(CoreWorkerTest, HandlePubsubWorkerObjectLocationsChannelRetries) {
     EXPECT_EQ(msg.worker_object_locations_message().node_ids_size(), 1);
     EXPECT_EQ(msg.worker_object_locations_message().object_size(), object_size);
     EXPECT_EQ(msg.worker_object_locations_message().node_ids(0), node_id.Binary());
-    // AddObjectLocation triggers a publish so the sequence id is bumped by 1
-    EXPECT_EQ(msg.sequence_id(), i + 2);
+    // The two registration-time snapshots are the only publishes, so their
+    // sequence ids are 1 and 2 (the pre-subscribe location update is skipped
+    // and does not consume a sequence id).
+    EXPECT_EQ(msg.sequence_id(), i + 1);
   };
   for (int i = 0; i < 2; i++) {
     if (i == 0) {

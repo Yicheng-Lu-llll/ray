@@ -176,9 +176,12 @@ cdef extern from "ray/core_worker/core_worker.h" nogil:
             c_string call_site,
             c_vector[CObjectReference] &task_returns,
             const CTaskID current_task_id)
-        CRayStatus KillActor(
+        CRayStatus KillActorAndGetReadyRef(
             const CActorID &actor_id, c_bool force_kill,
-            c_bool no_restart)
+            c_bool no_restart,
+            const c_string &serialized_object_data,
+            const c_string &serialized_object_metadata,
+            CObjectID *ready_ref)
         CRayStatus CancelTask(const CObjectID &object_id, c_bool force_kill,
                               c_bool recursive)
         c_bool IsTaskCanceled(const CTaskID &task_id) const

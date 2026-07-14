@@ -3446,9 +3446,24 @@ def get_actor(name: str, namespace: Optional[str] = None) -> "ray.actor.ActorHan
     return worker.core_worker.get_named_actor_handle(name, namespace or "")
 
 
+_cached_serialized_none = None
+
+
+def _serialized_none(worker):
+    # serialize(None) is an invariant; compute it once, not per ray.kill call.
+    global _cached_serialized_none
+    if _cached_serialized_none is None:
+        _cached_serialized_none = worker.get_serialization_context().serialize(None)
+    return _cached_serialized_none
+
+
 @PublicAPI
 @client_mode_hook
-def kill(actor: "ray.actor.ActorHandle", *, no_restart: bool = True):
+def kill(
+    actor: "ray.actor.ActorHandle",
+    *,
+    no_restart: bool = True,
+) -> Optional["ObjectRef"]:
     """Kill an actor forcefully.
 
     This will interrupt any running tasks on the actor, causing them to fail
@@ -3466,6 +3481,22 @@ def kill(actor: "ray.actor.ActorHandle", *, no_restart: bool = True):
         actor: Handle to the actor to kill.
         no_restart: Whether or not this actor should be restarted if
             it's a restartable actor.
+
+    Returns:
+        An ``ObjectRef`` that becomes ready once the GCS has processed the
+        kill. What readiness means depends on the actor's state:
+
+        - The actor's entry was removed. With ``no_restart=True`` (the
+          default) its name has been released, so you can ``ray.get()`` /
+          ``ray.wait()`` on the ref before recreating an actor under the same
+          name (replacing a named actor).
+        - The actor was already gone; nothing to remove.
+        - With ``no_restart=False`` on a restartable actor, the actor
+          restarts and keeps its name: the ref becoming ready does NOT mean
+          the name is released.
+
+        Readiness never guarantees the actor's worker process has exited.
+        Under Ray Client (``ray://``), returns ``None`` for now.
     """
     worker = global_worker
     worker.check_connected()
@@ -3476,7 +3507,9 @@ def kill(actor: "ray.actor.ActorHandle", *, no_restart: bool = True):
         )
 
     try:
-        worker.core_worker.kill_actor(actor._ray_actor_id, no_restart)
+        return worker.core_worker.kill_actor_and_get_ready_ref(
+            actor._ray_actor_id, no_restart, _serialized_none(worker)
+        )
     except ActorHandleNotFoundError as e:
         actor_job_id = actor._ray_actor_id.job_id
         current_job_id = worker.current_job_id

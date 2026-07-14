@@ -2646,15 +2646,21 @@ Status CoreWorker::CancelChildren(const TaskID &task_id, bool force_kill) {
   return Status::UnknownError(ostr.str());
 }
 
-Status CoreWorker::KillActor(const ActorID &actor_id, bool force_kill, bool no_restart) {
+Status CoreWorker::KillActorImpl(const ActorID &actor_id,
+                                 bool force_kill,
+                                 bool no_restart,
+                                 const rpc::StatusCallback &kill_done) {
   std::promise<Status> p;
   auto f = p.get_future();
+  // Posted because actor_creator_'s registering state is ThreadPrivate to the
+  // io_service thread.
   io_service_.post(
-      [this, p = &p, actor_id, force_kill, no_restart]() {
-        auto cb = [this, p, actor_id, force_kill, no_restart](Status status) mutable {
+      [this, p = &p, actor_id, force_kill, no_restart, kill_done]() {
+        auto cb = [this, p, actor_id, force_kill, no_restart, kill_done](
+                      Status status) mutable {
           if (status.ok()) {
             gcs_client_->Actors().AsyncKillActor(
-                actor_id, force_kill, no_restart, nullptr);
+                actor_id, force_kill, no_restart, kill_done);
           }
           p->set_value(std::move(status));
         };
@@ -2669,13 +2675,67 @@ Status CoreWorker::KillActor(const ActorID &actor_id, bool force_kill, bool no_r
         }
       },
       "CoreWorker.KillActor");
-  const auto &status = f.get();
+  const Status status = f.get();
   // Only call OnActorKilled if the kill was successful (status is OK).
   // If the actor handle doesn't exist, OnActorKilled would crash.
   if (status.ok()) {
     actor_manager_->OnActorKilled(actor_id);
   }
   return status;
+}
+
+Status CoreWorker::KillActor(const ActorID &actor_id, bool force_kill, bool no_restart) {
+  return KillActorImpl(actor_id, force_kill, no_restart, /*kill_done=*/nullptr);
+}
+
+Status CoreWorker::KillActorAndGetReadyRef(const ActorID &actor_id,
+                                           bool force_kill,
+                                           bool no_restart,
+                                           const std::string &serialized_object_data,
+                                           const std::string &serialized_object_metadata,
+                                           ObjectID *ready_ref) {
+  // Mint an owned object that fate-shares with this worker; the GCS kill reply
+  // completes it. Same owned-object pattern as AsyncWaitPlacementGroupReady.
+  ObjectID ref = ObjectID::FromIndex(worker_context_->GetCurrentInternalTaskId(),
+                                     worker_context_->GetNextPutIndex());
+  reference_counter_->AddOwnedObject(ref,
+                                     /*contained_object_ids=*/{},
+                                     rpc_address_,
+                                     CurrentCallSite(),
+                                     /*object_size=*/-1,
+                                     LineageReconstructionEligibility::INELIGIBLE_PUT,
+                                     /*add_local_ref=*/true,
+                                     /*pinned_at_node_id=*/std::nullopt);
+
+  auto complete = [this, ref, serialized_object_data, serialized_object_metadata](
+                      const Status &kill_status) {
+    // The GCS removes the actor entry before replying, and NotFound means there
+    // was nothing to remove; with unlimited retries any other status is an
+    // unexpected GCS-side failure (same contract as AsyncWaitPlacementGroupReady).
+    RAY_CHECK(kill_status.ok() || kill_status.IsNotFound()) << kill_status.ToString();
+    auto data = std::make_shared<LocalMemoryBuffer>(serialized_object_data.size());
+    memcpy(data->Data(), serialized_object_data.data(), serialized_object_data.size());
+    auto metadata =
+        std::make_shared<LocalMemoryBuffer>(serialized_object_metadata.size());
+    memcpy(metadata->Data(),
+           serialized_object_metadata.data(),
+           serialized_object_metadata.size());
+    // Fire-and-forget callers drop the ref before this reply arrives; pass the
+    // current reference state so the value is not stored for a ref nobody holds
+    // (same late-arrival pattern as FutureResolver).
+    memory_store_->Put(RayObject(data, metadata, std::vector<rpc::ObjectReference>()),
+                       ref,
+                       /*has_reference=*/reference_counter_->HasReference(ref));
+  };
+
+  const Status status = KillActorImpl(actor_id, force_kill, no_restart, complete);
+  if (!status.ok()) {
+    // The ref was never handed to the caller; drop the owned object we minted.
+    reference_counter_->RemoveLocalReference(ref, /*deleted=*/nullptr);
+    return status;
+  }
+  *ready_ref = ref;
+  return Status::OK();
 }
 
 void CoreWorker::RemoveActorHandleReference(const ActorID &actor_id) {

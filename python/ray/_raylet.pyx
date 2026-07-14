@@ -4190,19 +4190,23 @@ cdef class CoreWorker:
                     raise Exception(f"Failed to submit task to actor {actor_id} "
                                     f"due to {status.message()}")
 
-    def kill_actor(self, ActorID actor_id, c_bool no_restart):
+    def kill_actor_and_get_ready_ref(self, ActorID actor_id, c_bool no_restart,
+                                     serialized_object):
         cdef:
             CActorID c_actor_id = actor_id.native()
+            CObjectID c_object_id
             CRayStatus status = CRayStatus.OK()
-
+            c_string data = serialized_object.to_bytes()
+            c_string metadata = serialized_object.metadata
         with nogil:
-            status = CCoreWorkerProcess.GetCoreWorker().KillActor(
-                c_actor_id, True, no_restart)
-
+            status = CCoreWorkerProcess.GetCoreWorker().KillActorAndGetReadyRef(
+                c_actor_id, True, no_restart, data, metadata, &c_object_id)
         if status.IsNotFound():
             raise ActorHandleNotFoundError(status.message().decode())
-
         check_status(status)
+        # skip_adding_local_ref is True because it's already added through the
+        # AddOwnedObject call inside KillActorAndGetReadyRef.
+        return ObjectRef(c_object_id.Binary(), skip_adding_local_ref=True)
 
     def cancel_task(self, ObjectRef object_ref, c_bool force_kill,
                     c_bool recursive):

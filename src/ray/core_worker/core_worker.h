@@ -1138,6 +1138,33 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
   /// \param[out] Status
   Status KillActor(const ActorID &actor_id, bool force_kill, bool no_restart);
 
+  /// Like KillActor, but also hands back an ObjectID that becomes ready once
+  /// the GCS has processed the kill: the actor's entry was removed (its name
+  /// is released, so a same-named actor can safely be recreated), or there was
+  /// nothing to remove (already gone; or the actor restarts and keeps its name
+  /// when no_restart=false). Readiness does not guarantee the worker process
+  /// has exited. `serialized_object_*` is the value the ObjectID resolves to
+  /// on success (typically a serialized None). Mirrors
+  /// AsyncWaitPlacementGroupReady's owned-object + GCS-reply pattern.
+  ///
+  /// \param[in] actor_id ID of the actor to kill.
+  /// \param[in] force_kill Whether to force kill an actor by killing the worker.
+  /// \param[in] no_restart If set to true, the killed actor will not be
+  /// restarted anymore.
+  /// \param[in] serialized_object_data Value stored on success.
+  /// \param[in] serialized_object_metadata Metadata stored on success.
+  /// \param[out] ready_ref The owned ObjectID that becomes ready once the GCS has
+  /// processed the kill. Only set when the returned status is OK.
+  /// \return NotFound if the actor handle is not known to this worker (e.g. a
+  /// stale cross-session handle), so the caller can raise ActorHandleNotFoundError;
+  /// OK otherwise.
+  Status KillActorAndGetReadyRef(const ActorID &actor_id,
+                                 bool force_kill,
+                                 bool no_restart,
+                                 const std::string &serialized_object_data,
+                                 const std::string &serialized_object_metadata,
+                                 ObjectID *ready_ref);
+
   /// Stops the task associated with the given Object ID.
   ///
   /// \param[in] object_id of the task to kill (must be a Non-Actor task)
@@ -1554,6 +1581,14 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
                               const absl::flat_hash_set<NodeID> &locations);
 
  private:
+  /// Shared body of KillActor / KillActorAndGetReadyRef: waits out an in-flight
+  /// registration, checks the handle table, and on success fires the GCS kill
+  /// with `kill_done` as its reply callback.
+  Status KillActorImpl(const ActorID &actor_id,
+                       bool force_kill,
+                       bool no_restart,
+                       const rpc::StatusCallback &kill_done);
+
   /// Resolve a raylet RPC client by node id. Should be used to only get a temporary RPC
   /// client, since the retryable GRPC client relies on clients going out of scope to
   /// determine when to fail any pending RPCs

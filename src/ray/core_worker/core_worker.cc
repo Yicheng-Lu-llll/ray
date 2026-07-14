@@ -3918,11 +3918,23 @@ StatusSet<StatusT::InvalidArgument> CoreWorker::ProcessSubscribeMessage(
                         sub_message.DebugString()));
   }
 
-  if (sub_message.has_worker_ref_removed_message()) {
-    ProcessSubscribeForRefRemoved(sub_message.worker_ref_removed_message());
-  } else {  // worker_object_locations_message case
-    ProcessSubscribeObjectLocations(sub_message.worker_object_locations_message());
-  }
+  // The subscribe processors below read and mutate ReferenceCounter state (and
+  // publish the initial snapshot / ref-removed message through it). Post them to
+  // io_service_ so that ReferenceCounter::mutex_ is only ever taken from the main
+  // IO thread, keeping it uncontended. This also builds the initial location
+  // snapshot on the same thread that applies location updates, so a snapshot can
+  // never be sequenced after an update it does not include. The registration
+  // above already happened on this (dedicated pubsub) thread, so the snapshot is
+  // never published before the subscriber is registered.
+  io_service_.post(
+      [this, sub_message]() {
+        if (sub_message.has_worker_ref_removed_message()) {
+          ProcessSubscribeForRefRemoved(sub_message.worker_ref_removed_message());
+        } else {  // worker_object_locations_message case
+          ProcessSubscribeObjectLocations(sub_message.worker_object_locations_message());
+        }
+      },
+      "CoreWorker.ProcessSubscribeMessage");
   return StatusT::OK();
 }
 

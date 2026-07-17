@@ -871,10 +871,11 @@ void GcsServer::InitRuntimeEnvManager() {
 }
 
 void GcsServer::InitGcsWorkerManager(const GcsInitData &gcs_init_data) {
+  auto &worker_io_context = io_context_provider_.GetIOContext<GcsWorkerManager>();
   gcs_worker_manager_ = std::make_unique<GcsWorkerManager>(
-      *gcs_table_storage_, io_context_provider_.GetDefaultIOContext(), *gcs_publisher_);
+      *gcs_table_storage_, worker_io_context, *gcs_publisher_);
   rpc_server_.RegisterService(std::make_unique<rpc::WorkerInfoGrpcService>(
-      io_context_provider_.GetDefaultIOContext(),
+      worker_io_context,
       *gcs_worker_manager_,
       RayConfig::instance().gcs_max_active_rpcs_per_handler()));
   // No-op unless dead worker entries survived a GCS restart (Redis FT).
@@ -1019,24 +1020,31 @@ void GcsServer::InstallEventListeners() {
   // Install worker event listener.
   gcs_worker_manager_->AddWorkerDeadListener(
       [this](const std::shared_ptr<rpc::WorkerTableData> &worker_failure_data) {
-        auto &worker_address = worker_failure_data->worker_address();
-        auto worker_id = WorkerID::FromBinary(worker_address.worker_id());
-        worker_client_pool_.Disconnect(worker_id);
-        auto node_id = NodeID::FromBinary(worker_address.node_id());
-        auto worker_ip = worker_address.ip_address();
-        const rpc::RayException *creation_task_exception = nullptr;
-        if (worker_failure_data->has_creation_task_exception()) {
-          creation_task_exception = &worker_failure_data->creation_task_exception();
-        }
-        gcs_actor_manager_->OnWorkerDead(node_id,
-                                         worker_id,
-                                         worker_ip,
-                                         worker_failure_data->exit_type(),
-                                         worker_failure_data->exit_detail(),
-                                         creation_task_exception);
-        pubsub_handler_->AsyncRemoveSubscriberFrom(worker_id.Binary());
-        observability_pubsub_handler_->AsyncRemoveSubscriberFrom(worker_id.Binary());
-        gcs_task_manager_->OnWorkerDead(worker_id, worker_failure_data);
+        // The listener fires on the worker-info io_context; the consumers below
+        // (actor manager in particular) own main-io_context state, so hop back.
+        io_context_provider_.GetDefaultIOContext().post(
+            [this, worker_failure_data] {
+              auto &worker_address = worker_failure_data->worker_address();
+              auto worker_id = WorkerID::FromBinary(worker_address.worker_id());
+              worker_client_pool_.Disconnect(worker_id);
+              auto node_id = NodeID::FromBinary(worker_address.node_id());
+              auto worker_ip = worker_address.ip_address();
+              const rpc::RayException *creation_task_exception = nullptr;
+              if (worker_failure_data->has_creation_task_exception()) {
+                creation_task_exception = &worker_failure_data->creation_task_exception();
+              }
+              gcs_actor_manager_->OnWorkerDead(node_id,
+                                               worker_id,
+                                               worker_ip,
+                                               worker_failure_data->exit_type(),
+                                               worker_failure_data->exit_detail(),
+                                               creation_task_exception);
+              pubsub_handler_->AsyncRemoveSubscriberFrom(worker_id.Binary());
+              observability_pubsub_handler_->AsyncRemoveSubscriberFrom(
+                  worker_id.Binary());
+              gcs_task_manager_->OnWorkerDead(worker_id, worker_failure_data);
+            },
+            "GcsServer.WorkerDeadListener");
       });
 
   // Install job event listeners.

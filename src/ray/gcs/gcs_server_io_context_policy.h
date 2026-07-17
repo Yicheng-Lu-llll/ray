@@ -22,6 +22,7 @@
 #include "ray/gcs/gcs_kv_manager.h"
 #include "ray/gcs/gcs_node_manager.h"
 #include "ray/gcs/gcs_task_manager.h"
+#include "ray/gcs/gcs_worker_manager.h"
 #include "ray/observability/ray_event_recorder.h"
 #include "ray/pubsub/gcs_publisher.h"
 #include "ray/ray_syncer/ray_syncer.h"
@@ -64,6 +65,8 @@ struct GcsServerIOContextPolicy {
       return IndexOf("internal_kv_io_context");
     } else if constexpr (std::is_same_v<T, GcsNodeManager>) {
       return IndexOf("node_manager_io_context");
+    } else if constexpr (std::is_same_v<T, GcsWorkerManager>) {
+      return IndexOf("worker_info_io_context");
     } else {
       // default io context
       return -1;
@@ -74,7 +77,7 @@ struct GcsServerIOContextPolicy {
   // and a complete set of those returned from GetDedicatedIOContextIndex. Or you
   // can get runtime crashes when accessing a missing name, or get leaks by
   // creating unused threads.
-  constexpr static std::array<IOContextMetadata, 7> kAllDedicatedIOContexts{{
+  constexpr static std::array<IOContextMetadata, 8> kAllDedicatedIOContexts{{
       // task_io_context only runs GcsTaskManager, which ingests and serves
       // task-state events (observability) and drops events under load by design.
       // It is not on the GCS control plane, so a backlog here (e.g. under a
@@ -94,6 +97,13 @@ struct GcsServerIOContextPolicy {
        /*enable_lag_probe=*/true,
        /*used_for_health_check=*/false},
       {"internal_kv_io_context",
+       /*enable_lag_probe=*/true,
+       /*used_for_health_check=*/true},
+      // Worker bookkeeping (AddWorkerInfo at worker start, worker-failure
+      // reports, worker-table queries). O(workers) traffic that otherwise
+      // competes with actor ingest on the main io_context; the worker-dead
+      // listener that touches main-thread state is posted back by GcsServer.
+      {"worker_info_io_context",
        /*enable_lag_probe=*/true,
        /*used_for_health_check=*/true},
       {"node_manager_io_context",

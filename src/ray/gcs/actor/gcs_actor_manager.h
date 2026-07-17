@@ -250,7 +250,7 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
   /// \return Status::AlreadyExists if this is a named actor and an
   /// actor with the specified name already exists. The callback will not be called in
   /// this case.
-  Status RegisterActor(const rpc::RegisterActorRequest &request,
+  Status RegisterActor(const rpc::TaskSpec &task_spec,
                        std::function<void(Status)> success_callback);
 
   /// Create actor asynchronously.

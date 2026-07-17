@@ -401,6 +401,10 @@ service WorkerInfoGcsService {
 
 message CreateActorRequest {
   TaskSpec task_spec = 1;
+  // If true and the actor is not registered yet, the GCS registers it inline
+  // from task_spec before creating (single-message create for dependency-free
+  // anonymous actors; the separate RegisterActor RPC is skipped client-side).
+  bool register_if_absent = 2;
 }
 
 message CreateActorReply {

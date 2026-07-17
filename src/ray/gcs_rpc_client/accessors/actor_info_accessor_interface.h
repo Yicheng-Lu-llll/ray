@@ -18,6 +18,7 @@
 #include <string>
 
 #include "ray/common/id.h"
+#include "ray/common/ray_config.h"
 #include "ray/common/task/task_spec.h"
 #include "ray/rpc/rpc_callback_types.h"
 #include "src/ray/protobuf/gcs.pb.h"
@@ -25,6 +26,17 @@
 
 namespace ray {
 namespace gcs {
+
+/// True iff this actor creation uses the single-message protocol: the client
+/// skips the separate RegisterActor RPC and the CreateActor request carries
+/// register_if_absent (see actor_single_message_create_enabled). Single source
+/// of truth for the client-side skip and the request flag — keep callers in
+/// sync by construction.
+inline bool UsesSingleMessageCreate(const TaskSpecification &task_spec) {
+  return ::RayConfig::instance().actor_single_message_create_enabled() &&
+         task_spec.GetMessage().actor_creation_task_spec().name().empty() &&
+         task_spec.GetDependencies().empty();
+}
 
 /**
   @interface ActorInfoAccessorInterface

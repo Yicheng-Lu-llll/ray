@@ -217,7 +217,8 @@ class GcsActorManagerTest : public ::testing::Test {
     drain_io_context();
     auto request =
         GenRegisterActorRequest(job_id, max_restarts, detached, name, ray_namespace);
-    auto status = gcs_actor_manager_->RegisterActor(request, [](const Status &) {});
+    auto status =
+        gcs_actor_manager_->RegisterActor(request.task_spec(), [](const Status &) {});
     io_service_.run_one();
     io_service_.run_one();
     auto actor_id =
@@ -225,6 +226,11 @@ class GcsActorManagerTest : public ::testing::Test {
     return gcs_actor_manager_->registered_actors_.contains(actor_id)
                ? gcs_actor_manager_->registered_actors_[actor_id]
                : nullptr;
+  }
+
+  std::shared_ptr<gcs::GcsActor> GetRegisteredActor(const ActorID &actor_id) {
+    auto it = gcs_actor_manager_->registered_actors_.find(actor_id);
+    return it == gcs_actor_manager_->registered_actors_.end() ? nullptr : it->second;
   }
 
   void OnNodeDead(const NodeID &node_id) {
@@ -375,6 +381,143 @@ class GcsActorManagerTest : public ::testing::Test {
   ray::observability::FakeGauge fake_actor_by_state_gauge_;
   ray::observability::FakeGauge fake_gcs_actor_by_state_gauge_;
 };
+
+TEST_F(GcsActorManagerTest, TestSingleMessageCreateRegistersInlineAndCreates) {
+  // register_if_absent + server flag on: a CreateActor for an unknown actor
+  // registers it inline from the same spec and proceeds to creation; one reply,
+  // carrying the actor address.
+  RayConfig::instance().initialize(R"({"actor_single_message_create_enabled": true})");
+  auto job_id = JobID::FromInt(1);
+  auto register_request = GenRegisterActorRequest(job_id, /*max_restarts=*/0);
+  const auto actor_id = ActorID::FromBinary(
+      register_request.task_spec().actor_creation_task_spec().actor_id());
+
+  rpc::CreateActorRequest create_request;
+  create_request.mutable_task_spec()->CopyFrom(register_request.task_spec());
+  create_request.set_register_if_absent(true);
+  rpc::CreateActorReply create_reply;
+  int reply_count = 0;
+  gcs_actor_manager_->HandleCreateActor(
+      create_request,
+      &create_reply,
+      [&reply_count](Status, std::function<void()>, std::function<void()>) {
+        ++reply_count;
+      });
+  drain_io_context();
+
+  auto actor = GetRegisteredActor(actor_id);
+  ASSERT_NE(actor, nullptr);
+  ASSERT_EQ(reply_count, 0);  // Reply only once the creation finishes.
+  ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
+  mock_actor_scheduler_->actors.pop_back();
+
+  actor->UpdateAddress(RandomAddress());
+  gcs_actor_manager_->OnActorCreationSuccess(actor, rpc::PushTaskReply());
+  drain_io_context();
+  ASSERT_EQ(actor->GetState(), rpc::ActorTableData::ALIVE);
+  ASSERT_EQ(reply_count, 1);
+  ASSERT_EQ(create_reply.actor_address().worker_id(),
+            actor->GetAddress().worker_id());
+  RayConfig::instance().initialize(R"({"actor_single_message_create_enabled": false})");
+}
+
+TEST_F(GcsActorManagerTest, TestSingleMessageCreateServerFlagOff) {
+  // Server-side flag off: register_if_absent is ignored (cluster-level kill
+  // switch) and an unknown actor's CreateActor keeps today's failure.
+  auto job_id = JobID::FromInt(1);
+  auto register_request = GenRegisterActorRequest(job_id, /*max_restarts=*/0);
+  rpc::CreateActorRequest create_request;
+  create_request.mutable_task_spec()->CopyFrom(register_request.task_spec());
+  create_request.set_register_if_absent(true);
+  rpc::CreateActorReply create_reply;
+  int reply_count = 0;
+  gcs_actor_manager_->HandleCreateActor(
+      create_request,
+      &create_reply,
+      [&reply_count](Status, std::function<void()>, std::function<void()>) {
+        ++reply_count;
+      });
+  drain_io_context();
+  ASSERT_EQ(reply_count, 1);
+  ASSERT_NE(create_reply.status().code(), static_cast<int>(StatusCode::OK));
+  ASSERT_EQ(mock_actor_scheduler_->actors.size(), 0);
+}
+
+TEST_F(GcsActorManagerTest, TestSingleMessageCreateDuplicateRequest) {
+  // A resent CreateActor after the inline registration must not register twice;
+  // it parks on the same creation and both replies fire on success.
+  RayConfig::instance().initialize(R"({"actor_single_message_create_enabled": true})");
+  auto job_id = JobID::FromInt(1);
+  auto register_request = GenRegisterActorRequest(job_id, /*max_restarts=*/0);
+  const auto actor_id = ActorID::FromBinary(
+      register_request.task_spec().actor_creation_task_spec().actor_id());
+
+  rpc::CreateActorRequest create_request;
+  create_request.mutable_task_spec()->CopyFrom(register_request.task_spec());
+  create_request.set_register_if_absent(true);
+  int reply_count = 0;
+  auto count_replies = [&reply_count](
+                           Status, std::function<void()>, std::function<void()>) {
+    ++reply_count;
+  };
+  rpc::CreateActorReply create_reply1;
+  gcs_actor_manager_->HandleCreateActor(create_request, &create_reply1, count_replies);
+  drain_io_context();
+  rpc::CreateActorReply create_reply2;
+  gcs_actor_manager_->HandleCreateActor(create_request, &create_reply2, count_replies);
+  drain_io_context();
+
+  ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
+  auto actor = GetRegisteredActor(actor_id);
+  ASSERT_NE(actor, nullptr);
+  mock_actor_scheduler_->actors.pop_back();
+  actor->UpdateAddress(RandomAddress());
+  gcs_actor_manager_->OnActorCreationSuccess(actor, rpc::PushTaskReply());
+  drain_io_context();
+  ASSERT_EQ(actor->GetState(), rpc::ActorTableData::ALIVE);
+  ASSERT_EQ(reply_count, 2);
+  RayConfig::instance().initialize(R"({"actor_single_message_create_enabled": false})");
+}
+
+TEST_F(GcsActorManagerTest, TestSingleMessageCreateDoesNotResurrectDeadActor) {
+  // A retried create for an actor id that already lived and died (still in the
+  // dead-actor cache) must not be resurrected by the inline registration.
+  RayConfig::instance().initialize(R"({"actor_single_message_create_enabled": true})");
+  auto job_id = JobID::FromInt(1);
+  auto registered_actor = RegisterActor(job_id);
+  ASSERT_NE(registered_actor, nullptr);
+  const auto actor_id = registered_actor->GetActorID();
+  // Snapshot the spec while the actor is alive (it is not readable once DEAD).
+  rpc::TaskSpec task_spec_snapshot =
+      registered_actor->GetCreationTaskSpecification().GetMessage();
+  // Kill it through the public handler so it moves to the dead-actor cache.
+  rpc::KillActorViaGcsRequest kill_request;
+  kill_request.set_actor_id(actor_id.Binary());
+  kill_request.set_force_kill(true);
+  kill_request.set_no_restart(true);
+  rpc::KillActorViaGcsReply kill_reply;
+  gcs_actor_manager_->HandleKillActorViaGcs(
+      kill_request, &kill_reply, [](Status, std::function<void()>, std::function<void()>) {});
+  drain_io_context();
+  ASSERT_EQ(GetRegisteredActor(actor_id), nullptr);
+
+  rpc::CreateActorRequest create_request;
+  create_request.mutable_task_spec()->CopyFrom(task_spec_snapshot);
+  create_request.set_register_if_absent(true);
+  rpc::CreateActorReply create_reply;
+  int reply_count = 0;
+  gcs_actor_manager_->HandleCreateActor(
+      create_request,
+      &create_reply,
+      [&reply_count](Status, std::function<void()>, std::function<void()>) {
+        ++reply_count;
+      });
+  drain_io_context();
+  ASSERT_EQ(reply_count, 1);
+  ASSERT_NE(create_reply.status().code(), static_cast<int>(StatusCode::OK));
+  ASSERT_EQ(GetRegisteredActor(actor_id), nullptr);
+  RayConfig::instance().initialize(R"({"actor_single_message_create_enabled": false})");
+}
 
 TEST_F(GcsActorManagerTest, TestBasic) {
   auto job_id = JobID::FromInt(1);
@@ -994,7 +1137,7 @@ TEST_F(GcsActorManagerTest, TestActorWithEmptyName) {
                                           /*detached=*/true,
                                           /*name=*/"");
 
-  Status status = gcs_actor_manager_->RegisterActor(request1, [](const Status &) {});
+  Status status = gcs_actor_manager_->RegisterActor(request1.task_spec(), [](const Status &) {});
   io_service_.run_one();
 
   // Ensure successful registration.
@@ -1008,7 +1151,7 @@ TEST_F(GcsActorManagerTest, TestActorWithEmptyName) {
                                           /*max_restarts=*/0,
                                           /*detached=*/true,
                                           /*name=*/"");
-  status = gcs_actor_manager_->RegisterActor(request2, [](const Status &) {});
+  status = gcs_actor_manager_->RegisterActor(request2.task_spec(), [](const Status &) {});
   io_service_.run_one();
   // Ensure successful registration.
   ASSERT_TRUE(status.ok());
@@ -1023,7 +1166,7 @@ TEST_F(GcsActorManagerTest, TestNamedActors) {
                                           /*detached=*/true,
                                           /*name=*/"actor1",
                                           /*ray_namespace=*/"test_named_actor");
-  Status status = gcs_actor_manager_->RegisterActor(request1, [](const Status &) {});
+  Status status = gcs_actor_manager_->RegisterActor(request1.task_spec(), [](const Status &) {});
   io_service_.run_one();
   ASSERT_TRUE(status.ok());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor1", "test_named_actor").Binary(),
@@ -1034,7 +1177,7 @@ TEST_F(GcsActorManagerTest, TestNamedActors) {
                                           /*detached=*/true,
                                           /*name=*/"actor2",
                                           /*ray_namesapce=*/"test_named_actor");
-  status = gcs_actor_manager_->RegisterActor(request2, [](const Status &) {});
+  status = gcs_actor_manager_->RegisterActor(request2.task_spec(), [](const Status &) {});
   io_service_.run_one();
   ASSERT_TRUE(status.ok());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor2", "test_named_actor").Binary(),
@@ -1050,7 +1193,7 @@ TEST_F(GcsActorManagerTest, TestNamedActors) {
                                           /*detached=*/true,
                                           /*name=*/"actor2",
                                           /*ray_namesapce=*/"test_named_actor");
-  status = gcs_actor_manager_->RegisterActor(request3, [](const Status &) {});
+  status = gcs_actor_manager_->RegisterActor(request3.task_spec(), [](const Status &) {});
   io_service_.run_one();
   ASSERT_TRUE(status.IsAlreadyExists());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor2", "test_named_actor").Binary(),
@@ -1062,7 +1205,7 @@ TEST_F(GcsActorManagerTest, TestNamedActors) {
                                           /*detached=*/true,
                                           /*name=*/"actor2",
                                           /*ray_namesapce=*/"test_named_actor");
-  status = gcs_actor_manager_->RegisterActor(request4, [](const Status &) {});
+  status = gcs_actor_manager_->RegisterActor(request4.task_spec(), [](const Status &) {});
   io_service_.run_one();
   ASSERT_TRUE(status.IsAlreadyExists());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor2", "test_named_actor").Binary(),
@@ -1243,7 +1386,7 @@ TEST_F(GcsActorManagerTest, TestNamedActorDeletionNotHappendWhenReconstructed) {
                                           /*max_restarts=*/0,
                                           /*detached=*/true,
                                           /*name=*/"actor");
-  status = gcs_actor_manager_->RegisterActor(request2, [](const Status &) {});
+  status = gcs_actor_manager_->RegisterActor(request2.task_spec(), [](const Status &) {});
   io_service_.run_one();
   ASSERT_TRUE(status.IsAlreadyExists());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor", "test").Binary(),
@@ -1506,7 +1649,7 @@ TEST_F(GcsActorManagerTest, TestRayNamespace) {
                                           /*max_restarts=*/0,
                                           /*detached=*/true,
                                           /*name=*/"actor");
-  Status status = gcs_actor_manager_->RegisterActor(request1, [](const Status &) {});
+  Status status = gcs_actor_manager_->RegisterActor(request1.task_spec(), [](const Status &) {});
   ASSERT_TRUE(status.ok());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor", "test").Binary(),
             request1.task_spec().actor_creation_task_spec().actor_id());
@@ -1519,7 +1662,7 @@ TEST_F(GcsActorManagerTest, TestRayNamespace) {
                                           second_namespace);
   // Create a second actor of the same name. Its job id belongs to a different
   // namespace though.
-  status = gcs_actor_manager_->RegisterActor(request2, [](const Status &) {});
+  status = gcs_actor_manager_->RegisterActor(request2.task_spec(), [](const Status &) {});
   ASSERT_TRUE(status.ok());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor", second_namespace).Binary(),
             request2.task_spec().actor_creation_task_spec().actor_id());
@@ -1533,7 +1676,7 @@ TEST_F(GcsActorManagerTest, TestRayNamespace) {
                                           /*detached=*/true,
                                           /*name=*/"actor",
                                           /*ray_namespace=*/"test");
-  status = gcs_actor_manager_->RegisterActor(request3, [](const Status &) {});
+  status = gcs_actor_manager_->RegisterActor(request3.task_spec(), [](const Status &) {});
   ASSERT_TRUE(status.IsAlreadyExists());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor", "test").Binary(),
             request1.task_spec().actor_creation_task_spec().actor_id());
@@ -1548,7 +1691,7 @@ TEST_F(GcsActorManagerTest, TestReuseActorNameInNamespace) {
   auto request_1 = GenRegisterActorRequest(job_id_1, 0, true, actor_name, ray_namespace);
   auto actor_id_1 =
       ActorID::FromBinary(request_1.task_spec().actor_creation_task_spec().actor_id());
-  Status status = gcs_actor_manager_->RegisterActor(request_1, [](const Status &) {});
+  Status status = gcs_actor_manager_->RegisterActor(request_1.task_spec(), [](const Status &) {});
   ASSERT_TRUE(status.ok());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName(actor_name, ray_namespace).Binary(),
             actor_id_1.Binary());
@@ -1566,7 +1709,7 @@ TEST_F(GcsActorManagerTest, TestReuseActorNameInNamespace) {
   auto request_2 = GenRegisterActorRequest(job_id_2, 0, true, actor_name, ray_namespace);
   auto actor_id_2 =
       ActorID::FromBinary(request_2.task_spec().actor_creation_task_spec().actor_id());
-  status = gcs_actor_manager_->RegisterActor(request_2, [](const Status &) {});
+  status = gcs_actor_manager_->RegisterActor(request_2.task_spec(), [](const Status &) {});
   ASSERT_TRUE(status.ok());
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName(actor_name, ray_namespace).Binary(),
             actor_id_2.Binary());
@@ -1607,7 +1750,7 @@ TEST_F(GcsActorManagerTest, TestGetAllActorInfoFilters) {
                                             /*max_restarts=*/0,
                                             /*detached=*/false);
     Status register_status =
-        gcs_actor_manager_->RegisterActor(request1, [](const Status &) {});
+        gcs_actor_manager_->RegisterActor(request1.task_spec(), [](const Status &) {});
     ASSERT_TRUE(register_status.ok());
     io_service_.run_one();
   }
@@ -1683,7 +1826,7 @@ TEST_F(GcsActorManagerTest, TestGetAllActorInfoLimit) {
     auto request1 = GenRegisterActorRequest(job_id_1,
                                             /*max_restarts=*/0,
                                             /*detached=*/false);
-    Status status = gcs_actor_manager_->RegisterActor(request1, [](const Status &) {});
+    Status status = gcs_actor_manager_->RegisterActor(request1.task_spec(), [](const Status &) {});
     ASSERT_TRUE(status.ok());
     io_service_.run_one();
   }
@@ -2174,7 +2317,7 @@ TEST_F(GcsActorManagerTest, TestNodeFailureDestroysAllOwnedActors) {
     register_request.mutable_task_spec()->CopyFrom(actor_creation_task_spec.GetMessage());
 
     Status status =
-        gcs_actor_manager_->RegisterActor(register_request, [](const Status &) {});
+        gcs_actor_manager_->RegisterActor(register_request.task_spec(), [](const Status &) {});
     ASSERT_TRUE(status.ok()) << status.ToString();
     drain_io_context();
 

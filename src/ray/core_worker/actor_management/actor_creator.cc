@@ -79,7 +79,35 @@ void ActorCreator::AsyncWaitForActorRegisterFinish(const ActorID &actor_id,
 void ActorCreator::AsyncCreateActor(
     const TaskSpecification &task_spec,
     const rpc::ClientCallback<rpc::CreateActorReply> &callback) {
-  actor_client_.AsyncCreateActor(task_spec, callback);
+  const auto actor_id = task_spec.ActorCreationId();
+  // Single-message create skips AsyncRegisterActor, but the local "is the GCS
+  // aware of this actor yet" signal (registering_actors_) has consumers beyond
+  // registration itself (kill, handle serialization, dependency resolution).
+  // Keep the bookkeeping alive over the create RPC instead, and resolve the
+  // parked waiters when the create reply arrives.
+  const bool bookkeep_registration =
+      gcs::UsesSingleMessageCreate(task_spec) && !IsActorInRegistering(actor_id);
+  if (bookkeep_registration) {
+    (*registering_actors_)[actor_id] = {};
+  }
+  actor_client_.AsyncCreateActor(
+      task_spec,
+      [this, actor_id, bookkeep_registration, callback](
+          Status status, rpc::CreateActorReply &&reply) {
+        if (bookkeep_registration) {
+          std::vector<rpc::StatusCallback> cbs =
+              std::move((*registering_actors_)[actor_id]);
+          registering_actors_->erase(actor_id);
+          // A created actor was necessarily registered, even if its creation
+          // task later failed in application code.
+          const Status register_outcome =
+              (status.ok() || status.IsCreationTaskError()) ? Status::OK() : status;
+          for (auto &cb : cbs) {
+            cb(register_outcome);
+          }
+        }
+        callback(status, std::move(reply));
+      });
 }
 
 }  // namespace core

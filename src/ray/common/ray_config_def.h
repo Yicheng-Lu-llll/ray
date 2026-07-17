@@ -313,6 +313,23 @@ RAY_CONFIG(int64_t, raylet_client_connect_timeout_milliseconds, 1000)
 /// the worker SIGKILL.
 RAY_CONFIG(int64_t, kill_worker_timeout_milliseconds, 5000)
 
+/// If true, dependency-free anonymous actors are created with a single
+/// CreateActor message (register_if_absent): the client skips the separate
+/// RegisterActor RPC and the GCS registers inline. The separate registration
+/// historically served two purposes: covering the
+/// owner-dies-while-resolving-dependencies window (#8045, zero-width for
+/// dependency-free actors), and giving the client a local "is this actor known
+/// to the GCS yet" signal -- the latter is preserved by ActorCreator keeping
+/// its registering bookkeeping alive until the create reply. Named actors keep
+/// the synchronous registration (name arbitration).
+///
+/// Read on both sides: the client uses it to skip the RPC, the GCS to honor
+/// register_if_absent (so it doubles as a cluster-level kill switch). Rollout
+/// order is strict: upgrade + enable on the GCS first, then enable on
+/// clients; a client with the flag on talking to a GCS without it fails all
+/// dependency-free anonymous actor creations. Default off.
+RAY_CONFIG(bool, actor_single_message_create_enabled, false)
+
 /// Timeout for graceful actor shutdown (e.g. when actor goes out of scope).
 /// If an actor does not gracefully shut down within this timeout, it will be force
 /// killed. Set to -1 for infinite timeout to prevent the actor from being force killed

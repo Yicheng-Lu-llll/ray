@@ -252,6 +252,11 @@ class GcsServer {
   /// Shared across all Raylet & Core Worker clients.
   rpc::ClientCallManager client_call_manager_;
   rpc::RayletClientPool raylet_client_pool_;
+  /// Dedicated to the resource-load pull loop; see
+  /// GcsServerIOContextPolicy::ResourceLoadPuller.
+  std::unique_ptr<rpc::ClientCallManager> resource_load_call_manager_;
+  std::unique_ptr<rpc::RayletClientPool> resource_load_raylet_client_pool_;
+  std::shared_ptr<PeriodicalRunner> resource_load_periodical_runner_;
   rpc::CoreWorkerClientPool worker_client_pool_;
   std::shared_ptr<ClusterResourceScheduler> cluster_resource_scheduler_;
   std::unique_ptr<gcs::GcsTableStorage> gcs_table_storage_;

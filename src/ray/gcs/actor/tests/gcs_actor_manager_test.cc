@@ -227,6 +227,18 @@ class GcsActorManagerTest : public ::testing::Test {
                : nullptr;
   }
 
+  Status RegisterActorRaw(const rpc::RegisterActorRequest &request) {
+    auto status = gcs_actor_manager_->RegisterActor(request, [](const Status &) {});
+    io_service_.run_one();
+    io_service_.run_one();
+    return status;
+  }
+
+  std::shared_ptr<gcs::GcsActor> GetRegisteredActor(const ActorID &actor_id) {
+    auto it = gcs_actor_manager_->registered_actors_.find(actor_id);
+    return it == gcs_actor_manager_->registered_actors_.end() ? nullptr : it->second;
+  }
+
   void OnNodeDead(const NodeID &node_id) {
     auto node_info = std::make_shared<rpc::GcsNodeInfo>();
     node_info->set_node_id(node_id.Binary());
@@ -375,6 +387,37 @@ class GcsActorManagerTest : public ::testing::Test {
   ray::observability::FakeGauge fake_actor_by_state_gauge_;
   ray::observability::FakeGauge fake_gcs_actor_by_state_gauge_;
 };
+
+TEST_F(GcsActorManagerTest, TestKillIntentBeforeRegistration) {
+  // A ray.kill that races ahead of the (async) registration must not be lost:
+  // the GCS records a kill intent on the NotFound path and destroys the actor
+  // as soon as its registration lands.
+  auto job_id = JobID::FromInt(1);
+  auto request = GenRegisterActorRequest(job_id, /*max_restarts=*/0);
+  const auto actor_id =
+      ActorID::FromBinary(request.task_spec().actor_creation_task_spec().actor_id());
+
+  // Kill an actor the GCS has never seen (registration still "in flight").
+  rpc::KillActorViaGcsRequest kill_request;
+  kill_request.set_actor_id(actor_id.Binary());
+  kill_request.set_force_kill(true);
+  kill_request.set_no_restart(true);
+  rpc::KillActorViaGcsReply kill_reply;
+  bool replied = false;
+  gcs_actor_manager_->HandleKillActorViaGcs(
+      kill_request,
+      &kill_reply,
+      [&replied](Status, std::function<void()>, std::function<void()>) {
+        replied = true;
+      });
+  ASSERT_TRUE(replied);
+
+  // Now the registration arrives; the pending intent must destroy the actor.
+  ASSERT_TRUE(RegisterActorRaw(request).ok());
+
+  auto actor = GetRegisteredActor(actor_id);
+  ASSERT_TRUE(actor == nullptr || actor->GetState() == rpc::ActorTableData::DEAD);
+}
 
 TEST_F(GcsActorManagerTest, TestBasic) {
   auto job_id = JobID::FromInt(1);

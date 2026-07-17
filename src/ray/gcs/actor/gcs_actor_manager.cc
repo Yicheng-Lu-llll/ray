@@ -647,6 +647,19 @@ void GcsActorManager::HandleKillActorViaGcs(rpc::KillActorViaGcsRequest request,
         << "Finished killing actor, force_kill = " << force_kill
         << ", no_restart = " << no_restart;
   } else {
+    // The actor may simply not be registered yet: registration is async on the
+    // owner, so a racing ray.kill (e.g. from another worker holding an escaped
+    // handle) can arrive first. Record a TTL'd kill intent; if the
+    // registration lands within the TTL it is destroyed immediately
+    // (see RegisterActor), so this NotFound (treated as success by callers)
+    // eventually becomes true instead of leaking a live actor.
+    const int64_t intent_ttl = RayConfig::instance().gcs_kill_intent_ttl_ms();
+    if (request.no_restart() && intent_ttl > 0) {
+      const int64_t now = clock_.NowUnixMillis();
+      absl::erase_if(kill_intents_, [now](const auto &kv) { return kv.second <= now; });
+      kill_intents_[actor_id] = now + intent_ttl;
+      RAY_LOG(INFO).WithField(actor_id) << "Recorded kill intent for unregistered actor";
+    }
     GCS_RPC_SEND_REPLY(send_reply_callback,
                        reply,
                        Status::NotFound(absl::StrFormat(
@@ -787,6 +800,23 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
               io_context_});
        },
        io_context_});
+
+  // A ray.kill for this actor may have arrived before its registration (owner
+  // registration is async, so a racing kill from another worker can beat it
+  // here). Consume the pending intent and destroy now that all registration
+  // bookkeeping is in place: this is exactly the existing
+  // kill-during-registration flow (the registration reply is answered with
+  // SchedulingCancelled by the persistence callback once it observes the
+  // destroy).
+  if (auto intent = kill_intents_.find(actor_id); intent != kill_intents_.end()) {
+    const bool expired = intent->second <= clock_.NowUnixMillis();
+    kill_intents_.erase(intent);
+    if (!expired) {
+      RAY_LOG(INFO).WithField(actor_id)
+          << "Registration arrived with a pending kill intent; destroying actor";
+      DestroyActor(actor_id, GenKilledByApplicationCause(GetActorTableData(actor_id)));
+    }
+  }
 
   return Status::OK();
 }

@@ -313,6 +313,12 @@ RAY_CONFIG(int64_t, raylet_client_connect_timeout_milliseconds, 1000)
 /// the worker SIGKILL.
 RAY_CONFIG(int64_t, kill_worker_timeout_milliseconds, 5000)
 
+/// TTL for a "kill intent" recorded when ray.kill targets an actor the GCS has
+/// not seen yet (its async registration is still in flight). If the
+/// registration lands within the TTL, the actor is destroyed immediately,
+/// closing the kill-before-register race. 0 disables intent recording.
+RAY_CONFIG(int64_t, gcs_kill_intent_ttl_ms, 60 * 1000)
+
 /// Timeout for graceful actor shutdown (e.g. when actor goes out of scope).
 /// If an actor does not gracefully shut down within this timeout, it will be force
 /// killed. Set to -1 for infinite timeout to prevent the actor from being force killed

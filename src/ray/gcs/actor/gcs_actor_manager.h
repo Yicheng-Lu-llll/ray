@@ -533,6 +533,12 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
       actor_state_counter_;
   ray::observability::MetricInterface &actor_by_state_gauge_;
   ray::observability::MetricInterface &gcs_actor_by_state_gauge_;
+  /// Kill intents for actors whose registration has not reached the GCS yet
+  /// (ray.kill raced an in-flight async registration). Keyed by actor id,
+  /// value = absolute expiry in ms. Consumed (and the actor destroyed) if the
+  /// registration lands before expiry. See gcs_kill_intent_ttl_ms.
+  absl::flat_hash_map<ActorID, int64_t> kill_intents_;
+
   ClockInterface &clock_;
 
   /// Total number of successfully created actors in the cluster lifetime.

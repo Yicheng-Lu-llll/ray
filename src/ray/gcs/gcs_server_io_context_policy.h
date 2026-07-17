@@ -30,6 +30,10 @@
 namespace ray {
 namespace gcs {
 
+/// Tag type for the periodic resource-load pull loop; not a real class, it only
+/// keys a dedicated io_context in the policy below.
+struct ResourceLoadPuller {};
+
 /// Static metadata describing a single dedicated io_context.
 struct IOContextMetadata {
   /// Name of the io_context (and its thread). Must be unique and non-empty.
@@ -64,6 +68,8 @@ struct GcsServerIOContextPolicy {
       return IndexOf("internal_kv_io_context");
     } else if constexpr (std::is_same_v<T, GcsNodeManager>) {
       return IndexOf("node_manager_io_context");
+    } else if constexpr (std::is_same_v<T, ResourceLoadPuller>) {
+      return IndexOf("resource_load_io_context");
     } else {
       // default io context
       return -1;
@@ -74,7 +80,7 @@ struct GcsServerIOContextPolicy {
   // and a complete set of those returned from GetDedicatedIOContextIndex. Or you
   // can get runtime crashes when accessing a missing name, or get leaks by
   // creating unused threads.
-  constexpr static std::array<IOContextMetadata, 7> kAllDedicatedIOContexts{{
+  constexpr static std::array<IOContextMetadata, 8> kAllDedicatedIOContexts{{
       // task_io_context only runs GcsTaskManager, which ingests and serves
       // task-state events (observability) and drops events under load by design.
       // It is not on the GCS control plane, so a backlog here (e.g. under a
@@ -96,6 +102,13 @@ struct GcsServerIOContextPolicy {
       {"internal_kv_io_context",
        /*enable_lag_probe=*/true,
        /*used_for_health_check=*/true},
+      // The autoscaler/dashboard resource-load pull loop issues one
+      // GetResourceLoad RPC per node per period (O(nodes)/s at scale); its own
+      // thread keeps that issuance off the main io_context. It is bookkeeping,
+      // not control plane, so it does not gate the SERVING state.
+      {"resource_load_io_context",
+       /*enable_lag_probe=*/true,
+       /*used_for_health_check=*/false},
       {"node_manager_io_context",
        /*enable_lag_probe=*/true,
        /*used_for_health_check=*/true},

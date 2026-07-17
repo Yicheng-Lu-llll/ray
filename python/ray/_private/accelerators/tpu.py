@@ -5,7 +5,6 @@ import re
 from functools import lru_cache
 from typing import Dict, List, Optional, Set, Tuple
 
-import requests
 
 import ray
 from ray._private.accelerators.accelerator import AcceleratorManager
@@ -124,6 +123,10 @@ VALID_TPU_TOPOLOGY = {
 
 def _get_tpu_metadata(key: str) -> Optional[str]:
     """Poll and get TPU metadata."""
+    # Deferred: keep requests off every `import ray`; only TPU metadata
+    # polling needs it.
+    import requests
+
     try:
         accelerator_type_request = requests.get(
             os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, key),

@@ -203,6 +203,11 @@ def test_default_worker_import_dependency(shutdown_only):
     # https://github.com/ray-project/ray/issues/41338
     blocked_deps += ["pydantic"]
 
+    # requests (TPU metadata polling only) and jsonschema (runtime_env plugin
+    # schema validation only) are deferred off the import path; importing them
+    # eagerly costs ~100ms of every worker start.
+    blocked_deps += ["requests", "jsonschema"]
+
     # Remove the ray module and the blocked deps from sys.modules.
     sys.modules.pop("ray", None)
     assert "ray" not in sys.modules

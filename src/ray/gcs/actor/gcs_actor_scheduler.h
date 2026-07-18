@@ -119,6 +119,7 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
   /// schedule an Actor Creation Task on a worker.
   explicit GcsActorScheduler(
       instrumented_io_context &io_context,
+      instrumented_io_context &push_io_context,
       GcsActorTable &gcs_actor_table,
       const GcsNodeManager &gcs_node_manager,
       GcsActorSchedulerFailureCallback schedule_failure_handler,
@@ -358,6 +359,9 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
   rpc::RayletClientPool &raylet_client_pool_;
   /// Core worker client pool shared by the GCS.
   rpc::CoreWorkerClientPool &worker_client_pool_;
+  /// Builds and sends the actor-creation task pushes off the main io_context;
+  /// see GcsServerIOContextPolicy::ActorCreationPusher.
+  instrumented_io_context &push_io_context_;
 
   /// The resource changed listeners.
   std::vector<std::function<void()>> resource_changed_listeners_;

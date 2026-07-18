@@ -133,6 +133,7 @@ class GcsActorSchedulerTest : public ::testing::Test {
         [this](const rpc::Address &address) { return worker_client_; });
     gcs_actor_scheduler_ = std::make_shared<MockedGcsActorScheduler>(
         io_context_->GetIoService(),
+        io_context_->GetIoService(),
         *gcs_actor_table_,
         *gcs_node_manager_,
         /*schedule_failure_handler=*/
@@ -366,7 +367,7 @@ TEST_F(GcsActorSchedulerTest, TestScheduleRetryWhenCreating) {
   // Reply a IOError, then the actor creation request will retry again.
   ASSERT_TRUE(worker_client_->ReplyPushTask(Status::IOError("")));
   ASSERT_EQ(1, gcs_actor_scheduler_->num_retry_creating_count_);
-  ASSERT_EQ(1, worker_client_->GetNumCallbacks());
+  WaitForCondition([&]() { return worker_client_->GetNumCallbacks() == 1; }, 1000);
 
   // Reply the actor creation request, then the actor should be scheduled successfully.
   ASSERT_TRUE(worker_client_->ReplyPushTask());
@@ -634,7 +635,7 @@ TEST_F(GcsActorSchedulerTest, TestReschedule) {
   gcs_actor_scheduler_->Reschedule(actor);
   ASSERT_EQ(0, raylet_client_->num_workers_requested);
   ASSERT_EQ(0, raylet_client_->callbacks.size());
-  ASSERT_EQ(1, worker_client_->GetNumCallbacks());
+  WaitForCondition([&]() { return worker_client_->GetNumCallbacks() == 1; }, 1000);
 
   // Reply the actor creation request, then the actor should be scheduled successfully.
   ASSERT_TRUE(worker_client_->ReplyPushTask());

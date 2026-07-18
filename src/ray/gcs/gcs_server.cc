@@ -599,6 +599,7 @@ void GcsServer::InitGcsActorManager(
 
   scheduler =
       std::make_unique<GcsActorScheduler>(io_context_provider_.GetDefaultIOContext(),
+                                          io_context_provider_.GetIOContext<ActorCreationPusher>(),
                                           gcs_table_storage_->ActorTable(),
                                           *gcs_node_manager_,
                                           schedule_failure_handler,

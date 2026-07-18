@@ -27,6 +27,7 @@ namespace gcs {
 
 GcsActorScheduler::GcsActorScheduler(
     instrumented_io_context &io_context,
+    instrumented_io_context &push_io_context,
     GcsActorTable &gcs_actor_table,
     const GcsNodeManager &gcs_node_manager,
     GcsActorSchedulerFailureCallback schedule_failure_handler,
@@ -42,6 +43,7 @@ GcsActorScheduler::GcsActorScheduler(
       schedule_success_handler_(std::move(schedule_success_handler)),
       raylet_client_pool_(raylet_client_pool),
       worker_client_pool_(worker_client_pool),
+      push_io_context_(push_io_context),
       scheduler_placement_time_ms_histogram_(scheduler_placement_time_ms_histogram),
       clock_(clock) {
   RAY_CHECK(schedule_failure_handler_ != nullptr && schedule_success_handler_ != nullptr);
@@ -394,19 +396,8 @@ void GcsActorScheduler::CreateActorOnWorker(std::shared_ptr<GcsActor> actor,
           .WithField(actor->GetActorID().JobId())
       << "Submitting actor creation task to worker.";
 
-  auto request = std::make_unique<rpc::PushTaskRequest>();
-  request->set_intended_worker_id(worker->GetWorkerID().Binary());
-  request->mutable_task_spec()->CopyFrom(
-      actor->GetCreationTaskSpecification().GetMessage());
-  google::protobuf::RepeatedPtrField<rpc::ResourceMapEntry> resources;
-  for (auto resource : worker->GetLeasedResources()) {
-    resources.Add(std::move(resource));
-  }
-  request->mutable_resource_mapping()->CopyFrom(resources);
-
   auto client = worker_client_pool_.GetOrConnect(worker->GetAddress());
-  client->PushNormalTask(
-      std::move(request),
+  auto push_callback =
       [this, actor, worker](Status status, const rpc::PushTaskReply &reply) {
         // If the actor is still in the creating map and the status is ok, remove the
         // actor from the creating map and invoke the schedule_success_handler_.
@@ -453,7 +444,27 @@ void GcsActorScheduler::CreateActorOnWorker(std::shared_ptr<GcsActor> actor,
                 actor->LocalRayletAddress().value(), worker->GetAddress(), actor_id);
           }
         }
-      });
+      };
+  // Build and send the request on the push io_context (see the policy entry for
+  // the rationale). The spec snapshot below is a self-contained copy and the
+  // leased resources are copied, so nothing here aliases main-thread state; the
+  // reply callback is posted back to the main io_context by the client pool's
+  // ClientCallManager, so all state mutations stay single-threaded.
+  push_io_context_.post(
+      [client,
+       worker_id = worker->GetWorkerID(),
+       spec = actor->GetCreationTaskSpecification(),
+       resources = worker->GetLeasedResources(),
+       push_callback = std::move(push_callback)]() mutable {
+        auto request = std::make_unique<rpc::PushTaskRequest>();
+        request->set_intended_worker_id(worker_id.Binary());
+        request->mutable_task_spec()->CopyFrom(spec.GetMessage());
+        for (auto &resource : resources) {
+          *request->mutable_resource_mapping()->Add() = std::move(resource);
+        }
+        client->PushNormalTask(std::move(request), push_callback);
+      },
+      "GcsActorScheduler.PushActorCreationTask");
 }
 
 void GcsActorScheduler::RetryCreatingActorOnWorker(

@@ -82,6 +82,7 @@ class GcsActorSchedulerMockTest : public Test {
         [this](const rpc::Address &address) { return core_worker_client; });
     actor_scheduler = std::make_unique<GcsActorScheduler>(
         io_context,
+        io_context,
         *actor_table,
         *gcs_node_manager,
         [this](auto a, auto b, auto c) { schedule_failure_handler(a); },

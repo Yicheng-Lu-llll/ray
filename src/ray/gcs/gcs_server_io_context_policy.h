@@ -30,6 +30,10 @@
 namespace ray {
 namespace gcs {
 
+/// Tag type for the actor-creation push sender; not a real class, it only keys
+/// a dedicated io_context in the policy below.
+struct ActorCreationPusher {};
+
 /// Static metadata describing a single dedicated io_context.
 struct IOContextMetadata {
   /// Name of the io_context (and its thread). Must be unique and non-empty.
@@ -64,6 +68,8 @@ struct GcsServerIOContextPolicy {
       return IndexOf("internal_kv_io_context");
     } else if constexpr (std::is_same_v<T, GcsNodeManager>) {
       return IndexOf("node_manager_io_context");
+    } else if constexpr (std::is_same_v<T, ActorCreationPusher>) {
+      return IndexOf("actor_creation_push_io_context");
     } else {
       // default io context
       return -1;
@@ -74,7 +80,7 @@ struct GcsServerIOContextPolicy {
   // and a complete set of those returned from GetDedicatedIOContextIndex. Or you
   // can get runtime crashes when accessing a missing name, or get leaks by
   // creating unused threads.
-  constexpr static std::array<IOContextMetadata, 7> kAllDedicatedIOContexts{{
+  constexpr static std::array<IOContextMetadata, 8> kAllDedicatedIOContexts{{
       // task_io_context only runs GcsTaskManager, which ingests and serves
       // task-state events (observability) and drops events under load by design.
       // It is not on the GCS control plane, so a backlog here (e.g. under a
@@ -99,6 +105,18 @@ struct GcsServerIOContextPolicy {
       {"node_manager_io_context",
        /*enable_lag_probe=*/true,
        /*used_for_health_check=*/true},
+      // Builds and sends the actor-creation task pushes: the request-side grpc
+      // work (proto copies, serialization, call creation, and the cold
+      // per-worker channel's connection establishment) costs ~0.5ms per actor
+      // and otherwise runs inline on the main io_context. Replies still land on
+      // the main io_context (the client pool's ClientCallManager is bound
+      // there). Excluded from the health check: this thread legitimately
+      // backlogs during an actor-creation storm (send-only work; the GCS is
+      // still serving), and flipping to NOT_SERVING then would trigger a
+      // harmful failover. The lag probe still reports it.
+      {"actor_creation_push_io_context",
+       /*enable_lag_probe=*/true,
+       /*used_for_health_check=*/false},
   }};
 
   // Returns int (not size_t) to match GetDedicatedIOContextIndex's return type and

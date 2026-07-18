@@ -61,14 +61,6 @@ RAY_CONFIG(int64_t, handler_warning_timeout_ms, 1000)
 /// The duration between loads pulled by GCS
 RAY_CONFIG(uint64_t, gcs_pull_resource_loads_period_milliseconds, 1000)
 
-/// If true, the periodic GetResourceLoad pull (autoscaler/dashboard node bookkeeping)
-/// issues its per-node RPCs on a dedicated io_context/thread instead of the GCS main
-/// io_context, and applies the results back on the main io_context. The per-sweep RPC
-/// issuance is O(nodes) and otherwise steals the single main thread from actor
-/// registration/scheduling at large scale. When false (the default), behavior is
-/// unchanged.
-RAY_CONFIG(bool, gcs_offload_resource_load_pull, false)
-
 /// The duration between reporting resources sent by the raylets.
 RAY_CONFIG(uint64_t, raylet_report_resources_period_milliseconds, 100)
 

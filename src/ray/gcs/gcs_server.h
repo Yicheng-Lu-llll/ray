@@ -253,13 +253,6 @@ class GcsServer {
   rpc::ClientCallManager client_call_manager_;
   rpc::RayletClientPool raylet_client_pool_;
   rpc::CoreWorkerClientPool worker_client_pool_;
-  /// Dedicated thread + client pool for the periodic GetResourceLoad pull, created only when
-  /// `gcs_offload_resource_load_pull` is set. Keeps the O(nodes) per-sweep RPC issuance off the
-  /// GCS main io_context. Stopped early in Stop() so its callbacks never outlive the managers
-  /// they dispatch to. Declared here (destroyed in reverse order: io_thread_ before its pool/ccm).
-  std::unique_ptr<rpc::ClientCallManager> resource_load_pull_client_call_manager_;
-  std::unique_ptr<rpc::RayletClientPool> resource_load_pull_raylet_client_pool_;
-  std::unique_ptr<InstrumentedIOContextWithThread> resource_load_pull_io_thread_;
   std::shared_ptr<ClusterResourceScheduler> cluster_resource_scheduler_;
   std::unique_ptr<gcs::GcsTableStorage> gcs_table_storage_;
   /// gcs_resource_manager_ depends on cluster_lease_manager_.

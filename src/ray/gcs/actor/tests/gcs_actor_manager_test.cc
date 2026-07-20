@@ -413,6 +413,46 @@ TEST_F(GcsActorManagerTest, TestBasic) {
   RAY_CHECK_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::DEAD, ""), 1);
 }
 
+TEST_F(GcsActorManagerTest, TestCreateActorSwapsInResolvedSpec) {
+  auto job_id = JobID::FromInt(1);
+  auto registered_actor = RegisterActor(job_id);
+
+  rpc::CreateActorRequest create_actor_request;
+  create_actor_request.mutable_task_spec()->CopyFrom(
+      registered_actor->GetCreationTaskSpecification().GetMessage());
+  // The owner sends the dependency-resolved spec at create time; mark it so
+  // the test can tell it apart from the spec captured at registration.
+  create_actor_request.mutable_task_spec()->set_call_site("resolved-spec");
+  // The resolved spec also rewrites args; give it a plasma dependency the
+  // registered spec did not have so the rebuilt lease view is observable.
+  auto *resolved_arg = create_actor_request.mutable_task_spec()->add_args();
+  resolved_arg->mutable_object_ref()->set_object_id(ObjectID::FromRandom().Binary());
+
+  RAY_CHECK_OK(gcs_actor_manager_->CreateActor(create_actor_request,
+                                               [](const std::shared_ptr<gcs::GcsActor> &,
+                                                  const rpc::PushTaskReply &,
+                                                  const Status &) {}));
+
+  ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
+  auto scheduled = mock_actor_scheduler_->actors.back();
+  mock_actor_scheduler_->actors.pop_back();
+  // The registered GcsActor is updated in place (not rebuilt), so existing
+  // references stay valid and the scheduled actor carries the resolved spec.
+  ASSERT_EQ(scheduled.get(), registered_actor.get());
+  ASSERT_EQ(scheduled->GetCreationTaskSpecification().GetMessage().call_site(),
+            "resolved-spec");
+  ASSERT_EQ(scheduled->GetState(), rpc::ActorTableData::PENDING_CREATION);
+  // The lease view is rebuilt from the resolved spec, not left at the
+  // registration-time one.
+  const auto dependency_ids = scheduled->GetLeaseSpecification().GetDependencyIds();
+  ASSERT_EQ(dependency_ids.size(), 1UL);
+  ASSERT_EQ(dependency_ids[0].Binary(), resolved_arg->object_ref().object_id());
+  // In-place update retracts DEPENDENCIES_UNREADY immediately instead of
+  // depending on the old object's destruction time.
+  ASSERT_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::DEPENDENCIES_UNREADY, ""),
+            0);
+}
+
 TEST_F(GcsActorManagerTest, TestActorStateMetrics) {
   auto job_id = JobID::FromInt(1);
   auto registered_actor = RegisterActor(job_id);
@@ -432,9 +472,6 @@ TEST_F(GcsActorManagerTest, TestActorStateMetrics) {
   gcs_actor_manager_->OnActorCreationSuccess(actor, rpc::PushTaskReply());
   io_service_.run_one();
 
-  // cleanup the registered_actor so that the destructor can be called to update the
-  // count
-  registered_actor.reset();
   gcs_actor_manager_->RecordMetrics();
   auto gcs_actor_tag_to_value = fake_gcs_actor_by_state_gauge_.GetTagToValue();
   // 5 states: REGISTERED, CREATED, DESTROYED, UNRESOLVED, PENDING

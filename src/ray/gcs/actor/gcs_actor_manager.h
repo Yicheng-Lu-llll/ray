@@ -262,8 +262,7 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
   /// the actor is already registered to `registered_actors_` and its state is `ALIVE`.
   /// \return Status::Invalid if this is a named actor and an actor with the specified
   /// name already exists. The callback will not be called in this case.
-  Status CreateActor(const rpc::CreateActorRequest &request,
-                     CreateActorCallback callback);
+  Status CreateActor(rpc::CreateActorRequest request, CreateActorCallback callback);
 
   /// Get the actor ID for the named actor. Returns nil if the actor was not found.
   /// \param name The name of the detached actor to look up.
@@ -562,6 +561,7 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
 
   FRIEND_TEST(GcsActorManagerTest, TestKillActorWhenActorIsCreating);
   FRIEND_TEST(GcsActorManagerTest, TestBasic);
+  FRIEND_TEST(GcsActorManagerTest, TestCreateActorSwapsInResolvedSpec);
   FRIEND_TEST(GcsActorManagerTest, TestDeadCount);
   FRIEND_TEST(GcsActorManagerTest, TestNonDeadEntryEvictionDecrementsCounter);
   FRIEND_TEST(GcsActorManagerTest, TestSchedulingFailed);

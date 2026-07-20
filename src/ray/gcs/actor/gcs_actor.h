@@ -238,6 +238,13 @@ class GcsActor {
   TaskSpecification GetCreationTaskSpecification() const;
   const LeaseSpecification &GetLeaseSpecification() const;
 
+  /// Replace the creation task spec with its dependency-resolved version and
+  /// rebuild the lease view derived from it (the lease caches dependency
+  /// information). Must be called before the first Schedule(): rebuilding the
+  /// lease view later would drop scheduler-written state, and any previously
+  /// obtained LeaseSpecification reference is invalidated.
+  void UpdateResolvedTaskSpec(rpc::TaskSpec resolved_spec);
+
   /// Get the immutable ActorTableData of this actor.
   const rpc::ActorTableData &GetActorTableData() const;
   /// Get the mutable ActorTableData of this actor.

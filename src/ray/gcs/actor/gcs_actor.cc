@@ -74,6 +74,14 @@ void GcsActor::UpdateState(rpc::ActorTableData::ActorState state) {
   RefreshMetrics();
 }
 
+void GcsActor::UpdateResolvedTaskSpec(rpc::TaskSpec resolved_spec) {
+  task_spec_->Swap(&resolved_spec);
+  // The lease view caches dependency information from the spec, so it must be
+  // rebuilt from the resolved one (the pre-resolution lease would still list
+  // the unresolved dependencies).
+  lease_spec_ = std::make_unique<LeaseSpecification>(*task_spec_);
+}
+
 rpc::ActorTableData::ActorState GcsActor::GetState() const {
   return actor_table_data_.state();
 }

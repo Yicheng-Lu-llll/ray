@@ -438,7 +438,7 @@ void GcsActorManager::HandleCreateActor(rpc::CreateActorRequest request,
 
   RAY_LOG(INFO).WithField(actor_id.JobId()).WithField(actor_id) << "Creating actor";
   Status status = CreateActor(
-      request,
+      std::move(request),
       [reply, send_reply_callback, actor_id](const std::shared_ptr<gcs::GcsActor> &actor,
                                              const rpc::PushTaskReply &task_reply,
                                              const Status &creation_task_status) {
@@ -791,14 +791,14 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
   return Status::OK();
 }
 
-Status GcsActorManager::CreateActor(const ray::rpc::CreateActorRequest &request,
+Status GcsActorManager::CreateActor(ray::rpc::CreateActorRequest request,
                                     CreateActorCallback callback) {
   // NOTE: After the abnormal recovery of the network between GCS client and GCS server or
   // the GCS server is restarted, it is required to continue to create actor
   // successfully.
   RAY_CHECK(callback);
-  const auto &actor_creation_task_spec = request.task_spec().actor_creation_task_spec();
-  auto actor_id = ActorID::FromBinary(actor_creation_task_spec.actor_id());
+  auto actor_id =
+      ActorID::FromBinary(request.task_spec().actor_creation_task_spec().actor_id());
 
   auto iter = registered_actors_.find(actor_id);
   if (iter == registered_actors_.end()) {
@@ -844,27 +844,21 @@ Status GcsActorManager::CreateActor(const ray::rpc::CreateActorRequest &request,
   }
 
   // Remove the actor from the unresolved actor map.
-  const auto &actor_namespace = iter->second->GetRayNamespace();
-  RAY_CHECK(!actor_namespace.empty())
+  const auto &actor = iter->second;
+  RAY_CHECK(!actor->GetRayNamespace().empty())
       << "`ray_namespace` should be set when creating actor in core worker.";
-  auto actor = std::make_shared<GcsActor>(request.task_spec(),
-                                          actor_namespace,
-                                          actor_state_counter_,
-                                          ray_event_recorder_,
-                                          session_name_);
+  // The registered spec predates dependency resolution; only the args (and
+  // the lease view derived from them) change, so update the registered actor
+  // in place with the spec moved out of the request.
+  actor->UpdateResolvedTaskSpec(std::move(*request.mutable_task_spec()));
   actor->UpdateState(rpc::ActorTableData::PENDING_CREATION);
-  const auto &actor_table_data = actor->GetActorTableData();
   actor->GetMutableTaskSpec()->set_dependency_resolution_timestamp_ms(
       clock_.NowUnixMillis());
 
   // Pub this state for dashboard showing.
-  gcs_publisher_->PublishActor(actor_id, actor_table_data);
+  gcs_publisher_->PublishActor(actor_id, actor->GetActorTableData());
   actor->WriteActorExportEvent(false);
   RemoveUnresolvedActor(actor);
-
-  // Update the registered actor as its creation task specification may have changed due
-  // to resolved dependencies.
-  registered_actors_[actor_id] = actor;
 
   // Schedule the actor.
   gcs_actor_scheduler_->Schedule(actor);

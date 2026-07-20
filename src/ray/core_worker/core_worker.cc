@@ -2801,6 +2801,11 @@ Status CoreWorker::AllocateReturnObject(const ObjectID &object_id,
                                         const rpc::Address &owner_address,
                                         int64_t *task_output_inlined_bytes,
                                         std::shared_ptr<RayObject> *return_object) {
+  // A returned value is a handle-escape path just like `ray.put`: once the
+  // return object reaches the caller, any actor handle inside it must already
+  // be known to the GCS, or the owner dying before the in-flight registration
+  // lands strands the borrower with no death notification.
+  RAY_RETURN_NOT_OK(WaitForActorRegistered(contained_object_ids));
   bool object_already_exists = false;
   std::shared_ptr<Buffer> data_buffer;
   if (data_size > 0) {

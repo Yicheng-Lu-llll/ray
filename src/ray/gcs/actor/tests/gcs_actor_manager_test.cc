@@ -453,6 +453,39 @@ TEST_F(GcsActorManagerTest, TestCreateActorSwapsInResolvedSpec) {
             0);
 }
 
+TEST_F(GcsActorManagerTest, TestJobScopedActorDestroyedOnJobFinished) {
+  auto job_id = JobID::FromInt(7);
+  // A lifetime="job" actor: detached machinery plus the job-scope label.
+  auto job_scoped_request = GenRegisterActorRequest(
+      job_id, /*max_restarts=*/0, /*detached=*/true, /*name=*/"jobbed", "test");
+  job_scoped_request.mutable_task_spec()->mutable_labels()->insert(
+      {"ray.io/lifetime", "job"});
+  // A plain detached actor in the same job must survive the job.
+  auto detached_request = GenRegisterActorRequest(
+      job_id, /*max_restarts=*/0, /*detached=*/true, /*name=*/"kept", "test");
+
+  rpc::RegisterActorReply job_scoped_reply;
+  rpc::RegisterActorReply detached_reply;
+  gcs_actor_manager_->HandleRegisterActor(
+      job_scoped_request,
+      &job_scoped_reply,
+      [](Status, std::function<void()>, std::function<void()>) {});
+  gcs_actor_manager_->HandleRegisterActor(
+      detached_request,
+      &detached_reply,
+      [](Status, std::function<void()>, std::function<void()>) {});
+  drain_io_context();
+  ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("jobbed", "test").IsNil(), false);
+
+  gcs_actor_manager_->OnJobFinished(job_id);
+  drain_io_context();
+
+  // The job-scoped actor is gone and its name released; the detached one
+  // survives.
+  ASSERT_TRUE(gcs_actor_manager_->GetActorIDByName("jobbed", "test").IsNil());
+  ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("kept", "test").IsNil(), false);
+}
+
 TEST_F(GcsActorManagerTest, TestActorStateMetrics) {
   auto job_id = JobID::FromInt(1);
   auto registered_actor = RegisterActor(job_id);

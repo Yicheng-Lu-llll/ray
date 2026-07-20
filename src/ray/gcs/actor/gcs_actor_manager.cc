@@ -101,6 +101,17 @@ const ray::rpc::ActorDeathCause GenOwnerDiedCause(
   return death_cause;
 }
 
+const ray::rpc::ActorDeathCause GenJobFinishedCause(
+    const ray::rpc::ActorTableData *actor_data) {
+  ray::rpc::ActorDeathCause death_cause;
+  auto actor_died_error_ctx = death_cause.mutable_actor_died_error_context();
+  actor_died_error_ctx->set_reason(ray::rpc::ActorDiedErrorContext::RAY_KILL);
+  AddActorInfo(actor_data, actor_died_error_ctx);
+  actor_died_error_ctx->set_error_message(
+      "The actor is dead because its lifetime is \"job\" and the job finished.");
+  return death_cause;
+}
+
 const ray::rpc::ActorDeathCause GenKilledByApplicationCause(
     const ray::rpc::ActorTableData *actor_data) {
   ray::rpc::ActorDeathCause death_cause;
@@ -1276,6 +1287,25 @@ void GcsActorManager::OnWorkerDead(const ray::NodeID &node_id,
   // Otherwise, try to reconstruct the actor that was already created or in the creation
   // process.
   RestartActor(actor_id, /*need_reschedule=*/need_reconstruct, death_cause);
+}
+
+void GcsActorManager::OnJobFinished(const JobID &job_id) {
+  std::vector<ActorID> job_scoped_actors;
+  for (const auto &[actor_id, actor] : registered_actors_) {
+    if (actor_id.JobId() != job_id) {
+      continue;
+    }
+    const auto &labels = actor->GetActorTableData().labels();
+    auto label_it = labels.find("ray.io/lifetime");
+    if (label_it != labels.end() && label_it->second == "job") {
+      job_scoped_actors.push_back(actor_id);
+    }
+  }
+  for (const auto &actor_id : job_scoped_actors) {
+    RAY_LOG(INFO).WithField(actor_id).WithField(job_id)
+        << "Destroying lifetime=job actor because its job finished";
+    DestroyActor(actor_id, GenJobFinishedCause(GetActorTableData(actor_id)));
+  }
 }
 
 void GcsActorManager::OnNodeDead(std::shared_ptr<const rpc::GcsNodeInfo> node,

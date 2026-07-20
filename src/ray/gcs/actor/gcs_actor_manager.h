@@ -176,6 +176,11 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
   void OnNodeDead(std::shared_ptr<const rpc::GcsNodeInfo> node,
                   const std::string &node_ip_address);
 
+  /// Destroy all `lifetime="job"` actors of the finished job (label
+  /// `ray.io/lifetime=job`; carried as the detached machinery plus this
+  /// job-finished cleanup). True detached actors are untouched.
+  void OnJobFinished(const JobID &job_id);
+
   /// Handle a worker failure. This will restart the associated actor, if any,
   /// which may be pending or already created. If the worker owned other
   /// actors, those actors will be destroyed.
@@ -562,6 +567,7 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
   FRIEND_TEST(GcsActorManagerTest, TestKillActorWhenActorIsCreating);
   FRIEND_TEST(GcsActorManagerTest, TestBasic);
   FRIEND_TEST(GcsActorManagerTest, TestCreateActorSwapsInResolvedSpec);
+  FRIEND_TEST(GcsActorManagerTest, TestJobScopedActorDestroyedOnJobFinished);
   FRIEND_TEST(GcsActorManagerTest, TestDeadCount);
   FRIEND_TEST(GcsActorManagerTest, TestNonDeadEntryEvictionDecrementsCounter);
   FRIEND_TEST(GcsActorManagerTest, TestSchedulingFailed);

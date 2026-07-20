@@ -1044,6 +1044,7 @@ void GcsServer::InstallEventListeners() {
     const auto job_id = JobID::FromBinary(job_data.job_id());
     gcs_task_manager_->OnJobFinished(job_id, job_data.end_time());
     gcs_placement_group_manager_->CleanPlacementGroupIfNeededWhenJobDead(job_id);
+    gcs_actor_manager_->OnJobFinished(job_id);
   });
 }
 

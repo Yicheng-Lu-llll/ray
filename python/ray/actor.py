@@ -2001,10 +2001,17 @@ class ActorClass(Generic[T]):
             detached = True
         elif lifetime == "non_detached":
             detached = False
+        elif lifetime == "job":
+            # Job-scoped: detached machinery (no ref counting, survives owner
+            # death) plus automatic destruction when the job finishes.
+            detached = True
+            job_labels = dict(actor_options.get("_labels") or {})
+            job_labels["ray.io/lifetime"] = "job"
+            actor_options["_labels"] = job_labels
         else:
             raise ValueError(
                 "actor `lifetime` argument must be one of 'detached', "
-                "'non_detached' and 'None'."
+                "'non_detached', 'job' and 'None'."
             )
 
         # Export the actor.

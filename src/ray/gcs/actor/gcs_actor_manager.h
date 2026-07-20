@@ -561,6 +561,7 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
   uint64_t counts_[CountType::CountType_MAX] = {0};
 
   FRIEND_TEST(GcsActorManagerTest, TestKillActorWhenActorIsCreating);
+  FRIEND_TEST(GcsActorManagerTest, TestKillDormantActorReleasesName);
   FRIEND_TEST(GcsActorManagerTest, TestBasic);
   FRIEND_TEST(GcsActorManagerTest, TestDeadCount);
   FRIEND_TEST(GcsActorManagerTest, TestNonDeadEntryEvictionDecrementsCounter);

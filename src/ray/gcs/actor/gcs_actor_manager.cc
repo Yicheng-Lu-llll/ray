@@ -1095,9 +1095,13 @@ void GcsActorManager::DestroyActor(const ActorID &actor_id,
              mutable_actor_table_data->death_cause()
                      .actor_died_error_context()
                      .reason() == rpc::ActorDiedErrorContext::OUT_OF_SCOPE &&
-             death_cause.actor_died_error_context().reason() ==
-                 rpc::ActorDiedErrorContext::REF_DELETED) {
-    // Update death cause from restartable OUT_OF_SCOPE to non-restartable REF_DELETED
+             (death_cause.actor_died_error_context().reason() ==
+                  rpc::ActorDiedErrorContext::REF_DELETED ||
+              death_cause.actor_died_error_context().reason() ==
+                  rpc::ActorDiedErrorContext::RAY_KILL)) {
+    // Upgrade the restartable OUT_OF_SCOPE record to the non-restartable cause
+    // (REF_DELETED, or RAY_KILL for `ray.kill(no_restart=True)` on a dormant
+    // actor) so the entry is actually dropped and its name released below.
     mutable_actor_table_data->mutable_death_cause()->CopyFrom(death_cause);
   }
   mutable_actor_table_data->set_timestamp(time);

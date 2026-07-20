@@ -413,6 +413,49 @@ TEST_F(GcsActorManagerTest, TestBasic) {
   RAY_CHECK_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::DEAD, ""), 1);
 }
 
+TEST_F(GcsActorManagerTest, TestKillDormantActorReleasesName) {
+  // A named actor with restart budget that died OUT_OF_SCOPE stays registered
+  // (dormant, lineage-restartable) and keeps its name. `ray.kill` on it must
+  // upgrade the death cause so the entry is dropped and the name released;
+  // previously the upgrade branch only accepted REF_DELETED, so the kill
+  // replied OK while the name stayed taken.
+  auto job_id = JobID::FromInt(1);
+  auto registered_actor =
+      RegisterActor(job_id, /*max_restarts=*/-1, /*detached=*/false, /*name=*/"dormant");
+  const auto actor_id = registered_actor->GetActorID();
+
+  rpc::CreateActorRequest create_actor_request;
+  create_actor_request.mutable_task_spec()->CopyFrom(
+      registered_actor->GetCreationTaskSpecification().GetMessage());
+  RAY_CHECK_OK(gcs_actor_manager_->CreateActor(create_actor_request,
+                                               [](const std::shared_ptr<gcs::GcsActor> &,
+                                                  const rpc::PushTaskReply &,
+                                                  const Status &) {}));
+  auto actor = mock_actor_scheduler_->actors.back();
+  mock_actor_scheduler_->actors.pop_back();
+  actor->UpdateAddress(RandomAddress());
+  gcs_actor_manager_->OnActorCreationSuccess(actor, rpc::PushTaskReply());
+  io_service_.run_one();
+
+  // Out-of-scope with restart budget -> dormant: DEAD but still registered,
+  // name still taken.
+  ReportActorOutOfScope(actor_id, /*num_restarts_due_to_lineage_reconstrcution=*/0);
+  ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
+  ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("dormant", "test"), actor_id);
+
+  rpc::KillActorViaGcsReply reply;
+  rpc::KillActorViaGcsRequest request;
+  request.set_actor_id(actor_id.Binary());
+  request.set_force_kill(true);
+  request.set_no_restart(true);
+  gcs_actor_manager_->HandleKillActorViaGcs(
+      request, &reply, [](Status, std::function<void()>, std::function<void()>) {});
+  io_service_.run_one();
+
+  // The kill released the name and dropped the registration.
+  ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("dormant", "test"), ActorID::Nil());
+}
+
 TEST_F(GcsActorManagerTest, TestActorStateMetrics) {
   auto job_id = JobID::FromInt(1);
   auto registered_actor = RegisterActor(job_id);

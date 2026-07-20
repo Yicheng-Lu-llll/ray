@@ -50,6 +50,28 @@ RayletClient::RayletClient(const rpc::Address &address,
           /*server_name=*/std::string("Raylet ") + address.ip_address())),
       pins_in_flight_(std::make_shared<std::atomic<int64_t>>(0)) {}
 
+RayletClient::RayletClient(std::shared_ptr<grpc::Channel> channel,
+                           const rpc::Address &address,
+                           rpc::ClientCallManager &client_call_manager,
+                           std::function<void()> raylet_unavailable_timeout_callback)
+    : grpc_client_(std::make_shared<rpc::GrpcClient<rpc::NodeManagerService>>(
+          std::move(channel), client_call_manager, address.ip_address())),
+      retryable_grpc_client_(rpc::RetryableGrpcClient::Create(
+          grpc_client_->Channel(),
+          client_call_manager.GetMainService(),
+          /*max_pending_requests_bytes=*/std::numeric_limits<uint64_t>::max(),
+          /*check_channel_status_interval_milliseconds=*/
+          ::RayConfig::instance()
+              .grpc_client_check_connection_status_interval_milliseconds(),
+          /*server_reconnect_timeout_base_seconds=*/
+          ::RayConfig::instance().raylet_rpc_server_reconnect_timeout_base_s(),
+          /*server_reconnect_timeout_max_seconds=*/
+          ::RayConfig::instance().raylet_rpc_server_reconnect_timeout_max_s(),
+          /*server_unavailable_timeout_callback=*/
+          std::move(raylet_unavailable_timeout_callback),
+          /*server_name=*/std::string("Raylet ") + address.ip_address())),
+      pins_in_flight_(std::make_shared<std::atomic<int64_t>>(0)) {}
+
 void RayletClient::RequestWorkerLease(
     rpc::RequestWorkerLeaseRequest &&request,
     const rpc::ClientCallback<rpc::RequestWorkerLeaseReply> &callback) {

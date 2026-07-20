@@ -345,6 +345,10 @@ bool ClusterLeaseManager::CancelLease(
 void ClusterLeaseManager::FillResourceUsage(rpc::ResourcesData &data) {
   // This populates load information.
   scheduler_resource_reporter_.FillResourceUsage(data);
+  if (RayConfig::instance().testing_slim_resource_load_reply()) {
+    // EXPERIMENT-ONLY demand-only reply; see the config's comment.
+    return;
+  }
   // This populates usage information.
   syncer::ResourceViewSyncMessage resource_view_sync_message;
   cluster_resource_scheduler_.GetLocalResourceManager().PopulateResourceViewSyncMessage(

@@ -523,13 +523,25 @@ void GcsServer::InitGcsResourceManager(const GcsInitData &gcs_init_data) {
           RayConfig::instance().gcs_pull_resource_loads_period_milliseconds());
   resource_load_raylet_client_pool_ =
       std::make_unique<rpc::RayletClientPool>([this](const rpc::Address &addr) {
+        auto unavailable_callback = [this, addr]() {
+          this->resource_load_raylet_client_pool_->Disconnect(
+              NodeID::FromBinary(addr.node_id()));
+        };
+        if (RayConfig::instance().testing_gcs_pull_share_raylet_channels()) {
+          // EXPERIMENT-ONLY: reuse the main pool's channel for this node; only
+          // the stub and completion queue are dedicated. See config comment.
+          auto shared_channel =
+              this->raylet_client_pool_.GetOrConnectByAddress(addr)->GetChannel();
+          if (shared_channel != nullptr) {
+            return std::make_shared<ray::rpc::RayletClient>(
+                std::move(shared_channel),
+                addr,
+                *this->resource_load_call_manager_,
+                std::move(unavailable_callback));
+          }
+        }
         return std::make_shared<ray::rpc::RayletClient>(
-            addr,
-            *this->resource_load_call_manager_,
-            /*raylet_unavailable_timeout_callback=*/[this, addr]() {
-              this->resource_load_raylet_client_pool_->Disconnect(
-                  NodeID::FromBinary(addr.node_id()));
-            });
+            addr, *this->resource_load_call_manager_, std::move(unavailable_callback));
       });
   resource_load_periodical_runner_ = PeriodicalRunner::Create(resource_load_io_context);
   resource_load_periodical_runner_->RunFnPeriodically(
@@ -545,10 +557,13 @@ void GcsServer::InitGcsResourceManager(const GcsInitData &gcs_init_data) {
           // GetResourceLoad will also get usage. Historically it didn't.
           raylet_client->GetResourceLoad([this](auto &status, auto &&load_and_usage) {
             if (status.ok()) {
+              // PR-5 re-evaluation probe 0: sample the reply size (the
+              // suspected tax scales with bytes parsed off the main thread).
+              RAY_LOG_EVERY_N(INFO, 5000) << "pullprobe reply_bytes="
+                                          << load_and_usage.resources().ByteSizeLong();
               io_context_provider_.GetDefaultIOContext().post(
                   [this,
-                   resources =
-                       std::move(*load_and_usage.mutable_resources())]() mutable {
+                   resources = std::move(*load_and_usage.mutable_resources())]() mutable {
                     // TODO(vitsai): Remove duplicate reporting to GcsResourceManager
                     // after verifying that non-autoscaler paths are taken care of.
                     // Currently, GcsResourceManager aggregates reporting from

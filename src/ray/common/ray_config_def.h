@@ -61,6 +61,20 @@ RAY_CONFIG(int64_t, handler_warning_timeout_ms, 1000)
 /// The duration between loads pulled by GCS
 RAY_CONFIG(uint64_t, gcs_pull_resource_loads_period_milliseconds, 1000)
 
+/// EXPERIMENT-ONLY (PR-5 re-evaluation probes): when true, GetResourceLoad
+/// replies carry only the demand section (resource_load_by_shape); the
+/// usage/supply section is omitted. Isolates how much of the offload arms'
+/// per-op tax scales with parallel reply bytes. Breaks autoscaler-v2 supply
+/// freshness — never enable outside a benchmark.
+RAY_CONFIG(bool, testing_slim_resource_load_reply, false)
+
+/// EXPERIMENT-ONLY (PR-5 re-evaluation probes): build the resource-load pull
+/// loop's raylet clients on the main RayletClientPool's existing channels
+/// (new stubs polled by the dedicated completion queue) instead of opening a
+/// second set of ~num_nodes connections. Isolates the duplicated
+/// channel/transport objects as a tax carrier.
+RAY_CONFIG(bool, testing_gcs_pull_share_raylet_channels, false)
+
 /// The duration between reporting resources sent by the raylets.
 RAY_CONFIG(uint64_t, raylet_report_resources_period_milliseconds, 100)
 

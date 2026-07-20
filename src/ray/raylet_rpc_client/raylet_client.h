@@ -45,6 +45,14 @@ class RayletClient : public RayletClientInterface {
                         rpc::ClientCallManager &client_call_manager,
                         std::function<void()> raylet_unavailable_timeout_callback);
 
+  /// EXPERIMENT-ONLY overload (PR-5 re-evaluation probes): build on an
+  /// existing channel — a new stub whose calls are polled by
+  /// \p client_call_manager — instead of opening a new connection.
+  RayletClient(std::shared_ptr<grpc::Channel> channel,
+               const rpc::Address &address,
+               rpc::ClientCallManager &client_call_manager,
+               std::function<void()> raylet_unavailable_timeout_callback);
+
   std::shared_ptr<grpc::Channel> GetChannel() const override;
 
   void RequestWorkerLease(

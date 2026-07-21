@@ -319,7 +319,8 @@ void GcsActorManager::HandleRegisterActor(rpc::RegisterActorRequest request,
 
   RAY_LOG(INFO).WithField(actor_id.JobId()).WithField(actor_id) << "Registering actor";
   Status status = RegisterActor(
-      request, [reply, send_reply_callback, actor_id](const Status &register_status) {
+      request.task_spec(),
+      [reply, send_reply_callback, actor_id](const Status &register_status) {
         if (register_status.ok()) {
           RAY_LOG(INFO).WithField(actor_id.JobId()).WithField(actor_id)
               << "Registered actor";
@@ -437,24 +438,78 @@ void GcsActorManager::HandleCreateActor(rpc::CreateActorRequest request,
       ActorID::FromBinary(request.task_spec().actor_creation_task_spec().actor_id());
 
   RAY_LOG(INFO).WithField(actor_id.JobId()).WithField(actor_id) << "Creating actor";
-  Status status = CreateActor(
-      request,
-      [reply, send_reply_callback, actor_id](const std::shared_ptr<gcs::GcsActor> &actor,
-                                             const rpc::PushTaskReply &task_reply,
-                                             const Status &creation_task_status) {
-        if (creation_task_status.IsSchedulingCancelled()) {
-          // Actor creation is cancelled.
-          reply->mutable_death_cause()->CopyFrom(
-              actor->GetActorTableData().death_cause());
-        } else {
-          reply->mutable_actor_address()->CopyFrom(actor->GetAddress());
-          reply->mutable_borrowed_refs()->CopyFrom(task_reply.borrowed_refs());
-        }
-
-        RAY_LOG(INFO).WithField(actor_id.JobId()).WithField(actor_id)
-            << "Finished creating actor. Status: " << creation_task_status;
-        GCS_RPC_SEND_REPLY(send_reply_callback, reply, creation_task_status);
-      });
+  {
+    auto pending_register_iter = actor_to_register_callbacks_.find(actor_id);
+    if (pending_register_iter != actor_to_register_callbacks_.end()) {
+      // An escape-triggered standalone registration is still persisting and
+      // this create raced it (the client does not serialize the create behind
+      // that registration). Park the create until the registration completes
+      // so storage writes and pubsub keep the eager protocol's ordering
+      // (registration fully persisted before the create runs).
+      auto request_holder = std::make_shared<rpc::CreateActorRequest>(std::move(request));
+      pending_register_iter->second.emplace_back(
+          [this, request_holder, reply, send_reply_callback, actor_id](
+              const Status &status) {
+            if (!status.ok()) {
+              FillDeathCauseIfCancelled(status, actor_id, reply);
+              GCS_RPC_SEND_REPLY(send_reply_callback, reply, status);
+              return;
+            }
+            HandleCreateActor(std::move(*request_holder), reply, send_reply_callback);
+          });
+      return;
+    }
+  }
+  auto create_callback = [reply, send_reply_callback, actor_id](
+                             const std::shared_ptr<gcs::GcsActor> &actor,
+                             const rpc::PushTaskReply &task_reply,
+                             const Status &creation_task_status) {
+    if (creation_task_status.IsSchedulingCancelled()) {
+      // Actor creation is cancelled.
+      reply->mutable_death_cause()->CopyFrom(actor->GetActorTableData().death_cause());
+    } else {
+      reply->mutable_actor_address()->CopyFrom(actor->GetAddress());
+      reply->mutable_borrowed_refs()->CopyFrom(task_reply.borrowed_refs());
+    }
+    RAY_LOG(INFO).WithField(actor_id.JobId()).WithField(actor_id)
+        << "Finished creating actor. Status: " << creation_task_status;
+    GCS_RPC_SEND_REPLY(send_reply_callback, reply, creation_task_status);
+  };
+  if (request.register_if_absent()) {
+    // Lazy registration: the actor's handle may never have escaped the owner,
+    // so this create request carries the registration. Register inline from
+    // the same spec (the full registration flow: bookkeeping, owner watch,
+    // persistence), then enter creation. RegisterActor itself resolves the
+    // other cases: an already-registered actor's callback fires immediately
+    // (or parks behind its persisting registration), and an actor id still in
+    // the dead-actor cache is rejected with SchedulingCancelled instead of
+    // being resurrected by a retried create.
+    auto request_holder = std::make_shared<rpc::CreateActorRequest>(std::move(request));
+    Status register_status = RegisterActor(
+        request_holder->task_spec(),
+        [this, request_holder, reply, send_reply_callback, actor_id, create_callback](
+            const Status &status) {
+          if (!status.ok()) {
+            RAY_LOG(WARNING).WithField(actor_id)
+                << "Inline registration for a lazily registered create failed: "
+                << status;
+            FillDeathCauseIfCancelled(status, actor_id, reply);
+            GCS_RPC_SEND_REPLY(send_reply_callback, reply, status);
+            return;
+          }
+          Status create_status = CreateActor(*request_holder, create_callback);
+          if (!create_status.ok()) {
+            GCS_RPC_SEND_REPLY(send_reply_callback, reply, create_status);
+          }
+        });
+    if (!register_status.ok()) {
+      FillDeathCauseIfCancelled(register_status, actor_id, reply);
+      GCS_RPC_SEND_REPLY(send_reply_callback, reply, register_status);
+    }
+    ++counts_[CountType::CREATE_ACTOR_REQUEST];
+    return;
+  }
+  Status status = CreateActor(request, create_callback);
   if (!status.ok()) {
     RAY_LOG(WARNING).WithField(actor_id.JobId()).WithField(actor_id)
         << "Failed to create actor. Status: " << status.ToString();
@@ -657,11 +712,23 @@ void GcsActorManager::HandleKillActorViaGcs(rpc::KillActorViaGcsRequest request,
   ++counts_[CountType::KILL_ACTOR_REQUEST];
 }
 
-Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &request,
+void GcsActorManager::FillDeathCauseIfCancelled(const Status &status,
+                                                const ActorID &actor_id,
+                                                rpc::CreateActorReply *reply) const {
+  if (!status.IsSchedulingCancelled()) {
+    return;
+  }
+  const auto *actor_data = GetActorTableData(actor_id);
+  if (actor_data != nullptr) {
+    reply->mutable_death_cause()->CopyFrom(actor_data->death_cause());
+  }
+}
+
+Status GcsActorManager::RegisterActor(const rpc::TaskSpec &task_spec,
                                       std::function<void(Status)> register_callback) {
   RAY_CHECK(thread_checker_.IsOnSameThread());
   RAY_CHECK(register_callback);
-  const auto &actor_creation_task_spec = request.task_spec().actor_creation_task_spec();
+  const auto &actor_creation_task_spec = task_spec.actor_creation_task_spec();
   auto actor_id = ActorID::FromBinary(actor_creation_task_spec.actor_id());
 
   auto iter = registered_actors_.find(actor_id);
@@ -682,18 +749,22 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
     return Status::OK();
   }
 
-  const auto job_id = JobID::FromBinary(request.task_spec().job_id());
+  if (destroyed_actor_observability_data_.contains(actor_id)) {
+    // The actor was already destroyed (e.g. its handle went out of scope
+    // while the original registration was still persisting). Re-registering
+    // it would resurrect a dead actor.
+    return Status::SchedulingCancelled("Actor was already destroyed: " + actor_id.Hex());
+  }
+
+  const auto job_id = JobID::FromBinary(task_spec.job_id());
 
   // Use the namespace in task options by default. Otherwise use the
   // namespace from the job.
   std::string ray_namespace = actor_creation_task_spec.ray_namespace();
   RAY_CHECK(!ray_namespace.empty())
       << "`ray_namespace` should be set when creating actor in core worker.";
-  auto actor = std::make_shared<GcsActor>(request.task_spec(),
-                                          ray_namespace,
-                                          actor_state_counter_,
-                                          ray_event_recorder_,
-                                          session_name_);
+  auto actor = std::make_shared<GcsActor>(
+      task_spec, ray_namespace, actor_state_counter_, ray_event_recorder_, session_name_);
   if (!actor->GetName().empty()) {
     auto &actors_in_namespace = named_actors_[actor->GetRayNamespace()];
     auto it = actors_in_namespace.find(actor->GetName());
@@ -737,13 +808,13 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
   } else {
     // If it's a detached actor, we need to register the runtime env it used to GC.
     runtime_env_manager_.AddURIReference(actor->GetActorID().Hex(),
-                                         request.task_spec().runtime_env_info());
+                                         task_spec.runtime_env_info());
   }
 
   // The backend storage is supposed to be reliable, so the status must be ok.
   gcs_table_storage_->ActorTaskSpecTable().Put(
       actor_id,
-      request.task_spec(),
+      task_spec,
       {[this, actor](Status status) {
          gcs_table_storage_->ActorTable().Put(
              actor->GetActorID(),
@@ -758,6 +829,12 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
                 auto callback_iter =
                     actor_to_register_callbacks_.find(actor->GetActorID());
                 RAY_CHECK(callback_iter != actor_to_register_callbacks_.end());
+                // Move the callbacks out before invoking any of them: a
+                // callback may re-enter registration for this actor id (the
+                // lazy-registration paths do), and a fired callback must never
+                // be invocable twice -- it may own a one-shot gRPC reply.
+                auto callbacks = std::move(callback_iter->second);
+                actor_to_register_callbacks_.erase(callback_iter);
                 if (registered_actor_it == registered_actors_.end()) {
                   // NOTE(sang): This logic assumes that the ordering of backend call is
                   // guaranteed. It is currently true because we use a single TCP socket
@@ -767,7 +844,7 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
                       << "Actor was killed before it was persisted in GCS Table Storage. "
                          "Owning worker should not try to create this actor";
 
-                  for (auto &callback : callback_iter->second) {
+                  for (auto &callback : callbacks) {
                     callback(Status::SchedulingCancelled("Actor creation cancelled."));
                   }
                   return;
@@ -779,10 +856,9 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
                 // (duplicated requests are included) and remove all of them from
                 // actor_to_register_callbacks_.
                 // Reply to the owner to indicate that the actor has been registered.
-                for (auto &callback : callback_iter->second) {
+                for (auto &callback : callbacks) {
                   callback(Status::OK());
                 }
-                actor_to_register_callbacks_.erase(callback_iter);
               },
               io_context_});
        },

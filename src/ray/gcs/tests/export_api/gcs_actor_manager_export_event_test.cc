@@ -251,7 +251,7 @@ class GcsActorManagerTest : public ::testing::Test {
     io_service_.post(
         [this, request, &promise]() {
           auto status = gcs_actor_manager_->RegisterActor(
-              request, [this, request, &promise](const Status &) {
+              request.task_spec(), [this, request, &promise](const Status &) {
                 auto actor_id = ActorID::FromBinary(
                     request.task_spec().actor_creation_task_spec().actor_id());
                 promise.set_value(

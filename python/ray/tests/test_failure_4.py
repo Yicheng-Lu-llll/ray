@@ -811,6 +811,45 @@ def test_shows_both_user_exception_system_error_same_time(ray_start_cluster):
     ), task
 
 
+def test_returned_actor_handle_waits_for_registration(monkeypatch, shutdown_only):
+    """A task-returned actor handle must not reach the caller before the GCS
+    knows the actor: if the owner dies while the registration is still in
+    flight, the borrower would wait for ALIVE forever with no death
+    notification. The return path shares `ray.put`'s escape gate."""
+    # Delay CreateActor too: without it, the create's inline registration can
+    # make the actor known quickly even with the return gate reverted, and on
+    # a slow runner worker startup alone can absorb the register delay -- the
+    # GCS-knows assert below would then pass for the wrong reason.
+    monkeypatch.setenv(
+        "RAY_testing_asio_delay_us",
+        "ActorInfoGcsService.grpc_server.RegisterActor=2000000:2000000,"
+        "ActorInfoGcsService.grpc_server.CreateActor=2000000:2000000",
+    )
+    ray.init(num_cpus=2)
+
+    @ray.remote
+    class Counter:
+        def ping(self):
+            return "pong"
+
+    @ray.remote
+    def make_actor():
+        return Counter.remote()
+
+    start = time.time()
+    handle = ray.get(make_actor.remote())
+    elapsed = time.time() - start
+    # The return waited out the delayed registration instead of letting the
+    # handle escape first.
+    assert elapsed >= 1.5, elapsed
+    # By the time the caller holds the handle, the GCS knows the actor: the
+    # escape-triggered standalone registration completed, and the delayed
+    # create cannot be the one that made it visible.
+    actor_info = ray._private.state.actors(handle._actor_id.hex())
+    assert actor_info, actor_info
+    assert ray.get(handle.ping.remote()) == "pong"
+
+
 if __name__ == "__main__":
 
     sys.exit(pytest.main(["-sv", __file__]))

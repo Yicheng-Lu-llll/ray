@@ -2252,6 +2252,21 @@ Status CoreWorker::CreateActor(const RayFunction &function,
       /*max_retries=*/0);
 
   if (actor_name.empty()) {
+    if (task_spec.UsesLazyRegistration()) {
+      // Lazy registration: no RegisterActor RPC
+      // now. The pending-lazy mark is set on the io service ahead of anything
+      // else that can observe the handle there, so the first escape of the
+      // handle out of the owner (task argument, ray.put, task return, kill)
+      // triggers the registration, and the CreateActor request registers
+      // inline (register_if_absent) if nothing escaped first.
+      io_service_.post(
+          [this, task_spec = std::move(task_spec)]() {
+            actor_creator_->MarkPendingLazyRegistration(task_spec);
+            actor_task_submitter_->SubmitActorCreationTask(task_spec);
+          },
+          "CoreWorker.SubmitActorCreationTask.LazyRegistration");
+      return Status::OK();
+    }
     io_service_.post(
         [this, task_spec = std::move(task_spec)]() {
           actor_creator_->AsyncRegisterActor(task_spec, [this, task_spec](Status status) {
@@ -2664,7 +2679,9 @@ Status CoreWorker::KillActor(const ActorID &actor_id, bool force_kill, bool no_r
           }
           p->set_value(std::move(status));
         };
-        if (actor_creator_->IsActorInRegistering(actor_id)) {
+        if (actor_creator_->MarkDeadBeforeCreate(actor_id)) {
+          // The GCS may not know the actor yet; the wait below triggers the
+          // registration if it is still pending so the kill has a target.
           actor_creator_->AsyncWaitForActorRegisterFinish(actor_id, std::move(cb));
         } else if (actor_manager_->CheckActorHandleExists(actor_id)) {
           cb(Status::OK());
@@ -2707,7 +2724,12 @@ ActorID CoreWorker::DeserializeAndRegisterActorHandle(const std::string &seriali
 
 Status CoreWorker::SerializeActorHandle(const ActorID &actor_id,
                                         std::string *output,
-                                        ObjectID *actor_handle_id) const {
+                                        ObjectID *actor_handle_id) {
+  // The serialized bytes can reach a borrower out of band (e.g. plain
+  // pickling), bypassing the ray.put / task-argument gates, so the escape
+  // gate lives here: the GCS must know the actor before its handle leaves the
+  // owner, or the owner dying leaves the borrower with no death notification.
+  RAY_RETURN_NOT_OK(WaitForActorRegistered({ObjectID::ForActorHandle(actor_id)}));
   auto actor_handle = actor_manager_->GetActorHandle(actor_id);
   actor_handle->Serialize(output);
   *actor_handle_id = ObjectID::ForActorHandle(actor_id);
@@ -2807,6 +2829,11 @@ Status CoreWorker::AllocateReturnObject(const ObjectID &object_id,
                                         const rpc::Address &owner_address,
                                         int64_t *task_output_inlined_bytes,
                                         std::shared_ptr<RayObject> *return_object) {
+  // A returned value is a handle-escape path just like `ray.put`: once the
+  // return object reaches the caller, any actor handle inside it must already
+  // be known to the GCS, or the owner dying before the in-flight registration
+  // lands strands the borrower with no death notification.
+  RAY_RETURN_NOT_OK(WaitForActorRegistered(contained_object_ids));
   bool object_already_exists = false;
   std::shared_ptr<Buffer> data_buffer;
   if (data_size > 0) {
@@ -3874,6 +3901,12 @@ void CoreWorker::HandleWaitForActorRefDeleted(
         << "Replying to HandleWaitForActorRefDeleted";
     send_reply_callback(Status::OK(), nullptr, nullptr);
   };
+
+  // This poll can only originate from a completed registration, so the GCS
+  // provably knows the actor: drop any pending-lazy entry so neither this
+  // handler nor a later escape re-sends the registration the create already
+  // carried.
+  actor_creator_->OnRegistrationConfirmedByGcs(actor_id);
 
   /// The callback for each request is stored in the reference counter due to retries
   /// and message reordering where the callback of the retry of the request could be

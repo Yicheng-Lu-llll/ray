@@ -243,15 +243,23 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
 
   /// Register actor asynchronously.
   ///
-  /// \param request Contains the meta info to create the actor.
-  /// \param success_callback Will be invoked after the actor is created successfully or
-  /// be invoked immediately if the actor is already registered to `registered_actors_`
-  /// and its state is `ALIVE`.
-  /// \return Status::AlreadyExists if this is a named actor and an
-  /// actor with the specified name already exists. The callback will not be called in
-  /// this case.
-  Status RegisterActor(const rpc::RegisterActorRequest &request,
+  /// \param task_spec The specification of the actor creation task.
+  /// \param success_callback Will be invoked after the actor is registered
+  /// successfully or be invoked immediately if the actor is already registered
+  /// to `registered_actors_` and its state is `ALIVE`.
+  /// \return Status::AlreadyExists if this is a named actor and an actor with
+  /// the specified name already exists, or Status::SchedulingCancelled if the
+  /// actor id is still in the dead-actor cache (re-registering would resurrect
+  /// a destroyed actor). The callback is not called in either case.
+  Status RegisterActor(const rpc::TaskSpec &task_spec,
                        std::function<void(Status)> success_callback);
+
+  /// Copy the actor's death cause into a create reply for a SchedulingCancelled
+  /// status, so every cancellation path surfaces the same error the create
+  /// callback does. No-op for other statuses or unknown actors.
+  void FillDeathCauseIfCancelled(const Status &status,
+                                 const ActorID &actor_id,
+                                 rpc::CreateActorReply *reply) const;
 
   /// Create actor asynchronously.
   ///
@@ -452,9 +460,12 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
     return actor_state_counter_->Get(std::make_pair(state, name));
   }
 
-  /// Callbacks of pending `RegisterActor` requests.
-  /// Maps actor ID to actor registration callbacks, which is used to filter duplicated
-  /// messages from a driver/worker caused by some network problems.
+  /// Callbacks parked on an in-flight registration, invoked once it is
+  /// persisted. Holds retried `RegisterActor` replies (filtering duplicated
+  /// messages from a driver/worker caused by network problems) and, since lazy
+  /// registration, whole `CreateActor` continuations that raced the
+  /// registration; an entry's presence is also how `HandleCreateActor` detects
+  /// "registration still persisting".
   absl::flat_hash_map<ActorID, std::vector<std::function<void(Status)>>>
       actor_to_register_callbacks_;
   /// Callbacks of pending `RestartActorForLineageReconstruction` requests.

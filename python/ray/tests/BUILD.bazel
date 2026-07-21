@@ -63,6 +63,7 @@ py_test_module_list(
         "test_get_or_create_actor.py",
         "test_healthcheck.py",
         "test_iter.py",
+        "test_lazy_actor_registration.py",
         "test_metric_cardinality.py",
         "test_metrics_agent.py",
         "test_metrics_head.py",

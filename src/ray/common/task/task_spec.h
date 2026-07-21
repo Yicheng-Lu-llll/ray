@@ -351,6 +351,15 @@ class TaskSpecification : public MessageWrapper<rpc::TaskSpec> {
 
   bool IsDetachedActor() const;
 
+  /// Whether this actor creation skips the eager RegisterActor RPC: the first
+  /// escape of the handle out of the owner triggers a standalone registration,
+  /// and the CreateActor request carries the registration for the
+  /// never-escaped case. Single source of truth for the client-side skip and
+  /// the request flag. Named actors are excluded (synchronous name
+  /// arbitration); detached actors are excluded (their lifetime exceeds the
+  /// owner's, so the GCS should know them as early as possible).
+  bool UsesLazyRegistration() const;
+
   std::string DebugString() const;
 
   // A one-line summary of the runtime environment for the task. May contain sensitive

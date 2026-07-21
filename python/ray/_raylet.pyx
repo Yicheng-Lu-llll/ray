@@ -4443,8 +4443,15 @@ cdef class CoreWorker:
         cdef:
             c_string output
             CObjectID c_actor_handle_id
-        check_status(CCoreWorkerProcess.GetCoreWorker().SerializeActorHandle(
-            actor_id.native(), &output, &c_actor_handle_id))
+            CActorID c_actor_id = actor_id.native()
+            CRayStatus status
+        # Serialization is a handle escape: this can block on the actor's
+        # registration (see CoreWorker::SerializeActorHandle), so release the
+        # GIL.
+        with nogil:
+            status = CCoreWorkerProcess.GetCoreWorker().SerializeActorHandle(
+                c_actor_id, &output, &c_actor_handle_id)
+        check_status(status)
         return output, ObjectRef(c_actor_handle_id.Binary())
 
     def add_object_ref_reference(self, ObjectRef object_ref):

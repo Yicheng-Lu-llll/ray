@@ -229,6 +229,9 @@ void ActorInfoAccessor::AsyncCreateActor(
   RAY_CHECK(task_spec.IsActorCreationTask() && callback);
   rpc::CreateActorRequest request;
   request.mutable_task_spec()->CopyFrom(task_spec.GetMessage());
+  if (task_spec.UsesLazyRegistration()) {
+    request.set_register_if_absent(true);
+  }
   context_->GetGcsRpcClient().CreateActor(
       std::move(request),
       [callback](const Status &status, rpc::CreateActorReply &&reply) {

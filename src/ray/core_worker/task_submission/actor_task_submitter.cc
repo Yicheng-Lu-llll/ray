@@ -42,6 +42,18 @@ void ActorTaskSubmitter::NotifyGCSWhenActorOutOfScope(
         }
       }
     }
+    // If the GCS may not know the actor yet (lazy registration pending or a
+    // registration in flight), suppress the create instead of building an
+    // actor no reference can ever use: without this, the out-of-scope report
+    // below is dropped by the GCS as unknown and the later create still runs
+    // the constructor before the registration-time watch destroys the actor.
+    // The creator's bookkeeping lives on the io service thread; this callback
+    // can fire from the thread that dropped the last reference. Posting also
+    // serializes the mark against AsyncCreateActor: landing after the create
+    // was sent degrades to a no-op (the GCS knows the actor by then).
+    io_service_.post(
+        [this, actor_id]() { actor_creator_.MarkDeadBeforeCreate(actor_id); },
+        "ActorTaskSubmitter.MarkDeadBeforeCreate");
     actor_creator_.AsyncReportActorOutOfScope(
         actor_id, num_restarts_due_to_lineage_reconstruction, [actor_id](Status status) {
           if (!status.ok()) {
@@ -104,8 +116,15 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
     if (!status.ok()) {
       RAY_LOG(WARNING).WithField(actor_id).WithField(task_id)
           << "Resolving actor creation task dependencies failed " << status;
-      RAY_UNUSED(task_manager_.FailOrRetryPendingTask(
-          task_id, rpc::ErrorType::DEPENDENCY_RESOLUTION_FAILED, &status));
+      bool will_retry = task_manager_.FailOrRetryPendingTask(
+          task_id, rpc::ErrorType::DEPENDENCY_RESOLUTION_FAILED, &status);
+      if (!will_retry) {
+        // No create will ever consume the lazily retained spec or tombstone.
+        // Only safe when the task is done for good: a retry resubmits the
+        // creation, and later escapes still need the pending entry to
+        // register.
+        actor_creator_.ClearPendingLazyState(actor_id);
+      }
       return;
     }
     RAY_LOG(DEBUG).WithField(actor_id).WithField(task_id)

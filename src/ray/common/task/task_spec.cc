@@ -549,6 +549,11 @@ bool TaskSpecification::IsAsyncioActor() const {
   return message_->actor_creation_task_spec().is_asyncio();
 }
 
+bool TaskSpecification::UsesLazyRegistration() const {
+  RAY_CHECK(IsActorCreationTask());
+  return message_->actor_creation_task_spec().name().empty() && !IsDetachedActor();
+}
+
 bool TaskSpecification::IsDetachedActor() const {
   if (IsActorCreationTask()) {
     return message_->actor_creation_task_spec().is_detached();

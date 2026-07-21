@@ -1196,9 +1196,14 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
   /// serialized actor handle in the language frontend is stored inside an
   /// object, then this must be recorded in the worker's ReferenceCounter.
   /// \return Status::Invalid if we don't have the specified handle.
+  ///
+  /// Serialization is a handle escape (the bytes can reach a borrower out of
+  /// band, bypassing the ray.put / task-argument gates), so this blocks until
+  /// the actor's registration is known to the GCS, triggering it if it is
+  /// still pending lazily.
   Status SerializeActorHandle(const ActorID &actor_id,
                               std::string *output,
-                              ObjectID *actor_handle_id) const;
+                              ObjectID *actor_handle_id);
 
   ///
   /// Public methods related to task execution. Should not be used by driver processes.

@@ -165,6 +165,12 @@ message ActorTableData {
   // The key-value labels for actor.
   map<string, string> labels = 37;
   optional FallbackStrategy fallback_strategy = 38;
+  // The root detached actor id of this actor's ownership chain (Nil if owned
+  // by the job). Mirrored from the task spec at registration so a
+  // DEPENDENCIES_UNREADY actor persisted without its task spec (slim
+  // registration defers the spec to actor creation) can still be classified on
+  // GCS restart.
+  bytes root_detached_actor_id = 39;
 }
 
 message ErrorTableData {

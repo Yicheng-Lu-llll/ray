@@ -186,6 +186,7 @@ void ActorInfoAccessor::AsyncRegisterActor(const ray::TaskSpecification &task_sp
   RAY_CHECK(task_spec.IsActorCreationTask() && callback);
   rpc::RegisterActorRequest request;
   request.mutable_task_spec()->CopyFrom(task_spec.GetMessage());
+  StripRegistrationTaskSpec(*request.mutable_task_spec());
   context_->GetGcsRpcClient().RegisterActor(
       std::move(request),
       [callback](const Status &status, rpc::RegisterActorReply &&reply) {
@@ -199,6 +200,7 @@ Status ActorInfoAccessor::SyncRegisterActor(const ray::TaskSpecification &task_s
   rpc::RegisterActorRequest request;
   rpc::RegisterActorReply reply;
   request.mutable_task_spec()->CopyFrom(task_spec.GetMessage());
+  StripRegistrationTaskSpec(*request.mutable_task_spec());
   auto status = context_->GetGcsRpcClient().SyncRegisterActor(
       std::move(request), &reply, rpc::GetGcsTimeoutMs());
   return ComputeGcsStatus(status, reply.status());

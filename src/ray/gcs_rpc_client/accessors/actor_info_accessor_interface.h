@@ -26,6 +26,23 @@
 namespace ray {
 namespace gcs {
 
+/// Slim registration: strip the fields the GCS never consumes at
+/// registration time from a RegisterActor request's task spec -- the
+/// constructor arguments (the dominant payload; inlined values can reach
+/// megabytes) and the runtime env info. Every consumer of the stripped
+/// fields runs at or after creation, and the CreateActor request re-sends
+/// the full (resolved) spec. Named and detached actors keep the full spec:
+/// they are queryable by strangers (`ray.get_actor` serves the spec to
+/// build handles).
+inline void StripRegistrationTaskSpec(rpc::TaskSpec &task_spec) {
+  const auto &creation_spec = task_spec.actor_creation_task_spec();
+  if (!creation_spec.name().empty() || creation_spec.is_detached()) {
+    return;
+  }
+  task_spec.clear_args();
+  task_spec.clear_runtime_env_info();
+}
+
 /**
   @interface ActorInfoAccessorInterface
 

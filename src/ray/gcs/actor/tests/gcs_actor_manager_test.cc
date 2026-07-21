@@ -34,6 +34,7 @@
 #include "ray/gcs/gcs_function_manager.h"
 #include "ray/gcs/gcs_init_data.h"
 #include "ray/gcs/store_client/in_memory_store_client.h"
+#include "ray/gcs_rpc_client/accessors/actor_info_accessor_interface.h"
 #include "ray/observability/fake_metric.h"
 #include "ray/pubsub/fake_publisher.h"
 #include "ray/pubsub/gcs_publisher.h"
@@ -218,8 +219,7 @@ class GcsActorManagerTest : public ::testing::Test {
     auto request =
         GenRegisterActorRequest(job_id, max_restarts, detached, name, ray_namespace);
     auto status = gcs_actor_manager_->RegisterActor(request, [](const Status &) {});
-    io_service_.run_one();
-    io_service_.run_one();
+    drain_io_context();
     auto actor_id =
         ActorID::FromBinary(request.task_spec().actor_creation_task_spec().actor_id());
     return gcs_actor_manager_->registered_actors_.contains(actor_id)
@@ -316,6 +316,7 @@ class GcsActorManagerTest : public ::testing::Test {
     rpc::CreateActorReply create_reply1;
     gcs_actor_manager_->HandleCreateActor(
         create_request1, &create_reply1, send_reply_callback);
+    drain_io_context();
 
     actor = mock_actor_scheduler_->actors.back();
     mock_actor_scheduler_->actors.pop_back();
@@ -392,10 +393,12 @@ TEST_F(GcsActorManagerTest, TestBasic) {
                          const rpc::PushTaskReply &reply,
                          const Status &) { finished_actors.emplace_back(actor); });
   RAY_CHECK_OK(status);
+  drain_io_context();
   RAY_CHECK_EQ(gcs_actor_manager_->CountFor(rpc::ActorTableData::PENDING_CREATION, ""),
                1);
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -426,6 +429,7 @@ TEST_F(GcsActorManagerTest, TestActorStateMetrics) {
                                          const rpc::PushTaskReply &reply,
                                          const Status &) {});
   RAY_CHECK_OK(status);
+  drain_io_context();
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
   actor->UpdateAddress(RandomAddress());
@@ -489,6 +493,7 @@ TEST_F(GcsActorManagerTest, TestDeadCount) {
                                            const rpc::PushTaskReply &reply,
                                            const Status &) {});
     RAY_CHECK_OK(status);
+    drain_io_context();
     auto actor = mock_actor_scheduler_->actors.back();
     mock_actor_scheduler_->actors.pop_back();
     // Check that the actor is in state `ALIVE`.
@@ -561,6 +566,7 @@ TEST_F(GcsActorManagerTest, TestNonDeadEntryEvictionDecrementsCounter) {
                                            const rpc::PushTaskReply &reply,
                                            const Status &) {});
     RAY_CHECK_OK(status);
+    drain_io_context();
     auto actor = mock_actor_scheduler_->actors.back();
     mock_actor_scheduler_->actors.pop_back();
     // Check that the actor is in state `ALIVE`.
@@ -607,6 +613,7 @@ TEST_F(GcsActorManagerTest, TestActorCreationRaceWithRestart) {
       });
 
   // Get the actor instance from the scheduler.
+  drain_io_context();
   ASSERT_FALSE(mock_actor_scheduler_->actors.empty());
   auto actor = mock_actor_scheduler_->actors.back();
 
@@ -670,6 +677,7 @@ TEST_F(GcsActorManagerTest, TestActorCreationRaceWithRestartActorNotAlive) {
       });
 
   // Get the actor instance from the scheduler.
+  drain_io_context();
   ASSERT_FALSE(mock_actor_scheduler_->actors.empty());
   auto actor = mock_actor_scheduler_->actors.back();
 
@@ -718,6 +726,7 @@ TEST_F(GcsActorManagerTest, TestSchedulingFailed) {
       }));
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.clear();
@@ -747,6 +756,7 @@ TEST_F(GcsActorManagerTest, TestWorkerFailure) {
       }));
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -794,6 +804,7 @@ TEST_F(GcsActorManagerTest, TestNodeFailure) {
   RAY_CHECK_OK(status);
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -844,6 +855,7 @@ TEST_F(GcsActorManagerTest, TestActorReconstruction) {
   RAY_CHECK_OK(status);
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -913,6 +925,7 @@ TEST_F(GcsActorManagerTest, TestActorRestartWhenOwnerDead) {
       }));
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -965,6 +978,7 @@ TEST_F(GcsActorManagerTest, TestDetachedActorRestartWhenCreatorDead) {
       }));
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -1088,6 +1102,7 @@ TEST_F(GcsActorManagerTest, TestNamedActorDeletionWorkerFailure) {
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName(actor_name, "test").Binary(),
             request1.task_spec().actor_creation_task_spec().actor_id());
 
+  drain_io_context();
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
 
@@ -1162,6 +1177,7 @@ TEST_F(GcsActorManagerTest, TestNamedActorDeletionNodeFailure) {
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor", "test").Binary(),
             request1.task_spec().actor_creation_task_spec().actor_id());
 
+  drain_io_context();
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
 
@@ -1219,6 +1235,7 @@ TEST_F(GcsActorManagerTest, TestNamedActorDeletionNotHappendWhenReconstructed) {
   ASSERT_EQ(gcs_actor_manager_->GetActorIDByName("actor", "test").Binary(),
             request1.task_spec().actor_creation_task_spec().actor_id());
 
+  drain_io_context();
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
 
@@ -1267,6 +1284,7 @@ TEST_F(GcsActorManagerTest, TestDestroyActorBeforeActorCreationCompletes) {
       }));
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.clear();
@@ -1304,6 +1322,7 @@ TEST_F(GcsActorManagerTest, TestRaceConditionCancelLease) {
       }));
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -1348,6 +1367,7 @@ TEST_F(GcsActorManagerTest, TestRegisterActor) {
         finished_actors.emplace_back(result_actor);
       }));
   // Make sure the actor is scheduling.
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -1473,6 +1493,7 @@ TEST_F(GcsActorManagerTest, TestOwnerAndChildDiedAtTheSameTimeRaceCondition) {
                          const Status &) {
         finished_actors.emplace_back(result_actor);
       }));
+  drain_io_context();
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
 
@@ -1589,6 +1610,7 @@ TEST_F(GcsActorManagerTest, TestGetAllActorInfoFilters) {
                          const Status &) { finished_actors.emplace_back(result_actor); });
 
   ASSERT_TRUE(create_status.ok());
+  drain_io_context();
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
 
@@ -1721,6 +1743,7 @@ TEST_F(GcsActorManagerTest, TestKillActorWhenActorIsCreating) {
   RAY_CHECK_OK(status);
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -1779,6 +1802,7 @@ TEST_F(GcsActorManagerTest, TestRestartActorForLineageReconstruction) {
                         const Status &) { created_actors.emplace_back(result_actor); }));
 
   ASSERT_EQ(created_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -1941,6 +1965,7 @@ TEST_F(GcsActorManagerTest, TestRestartPermanentlyDeadActorForLineageReconstruct
                         const Status &) { created_actors.emplace_back(result_actor); }));
 
   ASSERT_EQ(created_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -1997,6 +2022,7 @@ TEST_F(GcsActorManagerTest, TestIdempotencyOfRestartActorForLineageReconstructio
                         const Status &) { created_actors.emplace_back(result_actor); }));
 
   ASSERT_EQ(created_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -2085,6 +2111,7 @@ TEST_F(GcsActorManagerTest, TestDestroyActorWhenActorIsCreating) {
   RAY_CHECK_OK(status);
 
   ASSERT_EQ(finished_actors.size(), 0);
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -2191,6 +2218,7 @@ TEST_F(GcsActorManagerTest, TestNodeFailureDestroysAllOwnedActors) {
         [](std::shared_ptr<gcs::GcsActor>, const rpc::PushTaskReply &, const Status &) {
         }));
 
+    drain_io_context();
     ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
     std::shared_ptr<gcs::GcsActor> scheduled_actor = mock_actor_scheduler_->actors.back();
     mock_actor_scheduler_->actors.pop_back();
@@ -2249,6 +2277,7 @@ TEST_F(GcsActorManagerTest, TestRestartPreemptedActor) {
                                          const Status &) {});
   RAY_CHECK_OK(status);
 
+  drain_io_context();
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
   auto actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
@@ -2486,6 +2515,7 @@ TEST_F(GcsActorManagerTest, TestRegisterNamedActorOnDeletedActorRefCreatesNewAct
 
   ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1)
       << "Failed to schedule the be to created actor. Was the actor created correctly?";
+  drain_io_context();
   std::shared_ptr<gcs::GcsActor> new_actor = mock_actor_scheduler_->actors.back();
   mock_actor_scheduler_->actors.pop_back();
 
@@ -2620,6 +2650,210 @@ TEST_F(GcsActorManagerTest, TestInitializeRestoresLocalRayletAddressForAliveActo
   ASSERT_EQ(local_raylet_address->node_id(), node_id.Binary());
   ASSERT_EQ(local_raylet_address->ip_address(), "127.0.0.1");
   ASSERT_EQ(local_raylet_address->port(), 9999);
+}
+
+TEST_F(GcsActorManagerTest, TestSlimRegistrationPersistsSpecAtCreateNotRegister) {
+  // Slim registration: no task spec is persisted at registration; the
+  // (dependency-resolved) spec is first persisted at creation, and the
+  // scheduling is chained behind that write.
+  auto send_reply_callback = [](Status, std::function<void()>, std::function<void()>) {};
+  auto job_id = JobID::FromInt(1);
+  auto register_request = GenRegisterActorRequest(job_id,
+                                                  /*max_restarts=*/0,
+                                                  /*detached=*/false);
+  rpc::RegisterActorReply register_reply;
+  gcs_actor_manager_->HandleRegisterActor(
+      register_request, &register_reply, send_reply_callback);
+  drain_io_context();
+  auto actor_id = ActorID::FromBinary(
+      register_request.task_spec().actor_creation_task_spec().actor_id());
+  ASSERT_NE(GetRegisteredActor(*gcs_actor_manager_, actor_id), nullptr);
+
+  auto read_spec_table = [this]() {
+    absl::flat_hash_map<ActorID, rpc::TaskSpec> specs;
+    bool done = false;
+    gcs_table_storage_->ActorTaskSpecTable().GetAll(
+        {[&specs, &done](absl::flat_hash_map<ActorID, rpc::TaskSpec> result) {
+           specs = std::move(result);
+           done = true;
+         },
+         io_service_});
+    drain_io_context();
+    EXPECT_TRUE(done);
+    return specs;
+  };
+  // Nothing persisted at registration.
+  ASSERT_EQ(read_spec_table().size(), 0);
+
+  rpc::CreateActorRequest create_request;
+  create_request.mutable_task_spec()->CopyFrom(register_request.task_spec());
+  rpc::CreateActorReply create_reply;
+  gcs_actor_manager_->HandleCreateActor(
+      create_request, &create_reply, send_reply_callback);
+  // The schedule is deferred behind the spec write.
+  ASSERT_TRUE(mock_actor_scheduler_->actors.empty());
+  drain_io_context();
+  auto specs = read_spec_table();
+  ASSERT_EQ(specs.size(), 1);
+  ASSERT_TRUE(specs.contains(actor_id));
+  ASSERT_EQ(mock_actor_scheduler_->actors.size(), 1);
+}
+
+TEST_F(GcsActorManagerTest, TestSlimRegistrationDestroyWhileSpecWriteInFlight) {
+  // ray.kill lands while the create-time spec write is still in flight: the
+  // destroy wins and the deferred schedule must not run on the dead actor.
+  auto send_reply_callback = [](Status, std::function<void()>, std::function<void()>) {};
+  auto job_id = JobID::FromInt(1);
+  auto register_request = GenRegisterActorRequest(job_id,
+                                                  /*max_restarts=*/0,
+                                                  /*detached=*/false);
+  rpc::RegisterActorReply register_reply;
+  gcs_actor_manager_->HandleRegisterActor(
+      register_request, &register_reply, send_reply_callback);
+  drain_io_context();
+  auto actor_id = ActorID::FromBinary(
+      register_request.task_spec().actor_creation_task_spec().actor_id());
+
+  rpc::CreateActorRequest create_request;
+  create_request.mutable_task_spec()->CopyFrom(register_request.task_spec());
+  rpc::CreateActorReply create_reply;
+  gcs_actor_manager_->HandleCreateActor(
+      create_request, &create_reply, send_reply_callback);
+  ASSERT_TRUE(mock_actor_scheduler_->actors.empty());
+
+  // Kill before draining: the spec-write callback fires after the destroy.
+  rpc::KillActorViaGcsRequest kill_request;
+  kill_request.set_actor_id(actor_id.Binary());
+  kill_request.set_force_kill(true);
+  kill_request.set_no_restart(true);
+  rpc::KillActorViaGcsReply kill_reply;
+  gcs_actor_manager_->HandleKillActorViaGcs(
+      kill_request, &kill_reply, send_reply_callback);
+  drain_io_context();
+  ASSERT_TRUE(mock_actor_scheduler_->actors.empty());
+  ASSERT_EQ(GetRegisteredActor(*gcs_actor_manager_, actor_id), nullptr);
+}
+
+TEST_F(GcsActorManagerTest, TestSlimRegistrationInitializeToleratesUnreadyWithoutSpec) {
+  // Slim registration: DEPENDENCIES_UNREADY actors persist no task spec. A
+  // GCS restart must rebuild them as stubs from the actor table row alone and
+  // keep the pre-creation duties working (owner-death destroy, name release).
+  auto job_id = JobID::FromInt(9);
+  rpc::JobTableData job_data;
+  job_data.set_job_id(job_id.Binary());
+  job_data.set_is_dead(false);
+
+  auto actor_id = ActorID::Of(job_id, TaskID::Nil(), 0);
+  rpc::ActorTableData row;
+  row.set_actor_id(actor_id.Binary());
+  row.set_job_id(job_id.Binary());
+  row.set_state(rpc::ActorTableData::DEPENDENCIES_UNREADY);
+  row.set_ray_namespace("test");
+  row.set_is_detached(false);
+  auto owner_node = NodeID::FromRandom();
+  auto *owner = row.mutable_owner_address();
+  owner->set_node_id(owner_node.Binary());
+  owner->set_worker_id(WorkerID::FromRandom().Binary());
+  owner->set_ip_address("127.0.0.1");
+  owner->set_port(2000);
+
+  TestGcsInitData gcs_init_data(*gcs_table_storage_);
+  absl::flat_hash_map<JobID, rpc::JobTableData> jobs;
+  jobs[job_id] = job_data;
+  gcs_init_data.SetJobTableData(jobs);
+  absl::flat_hash_map<ActorID, rpc::ActorTableData> actors;
+  actors[actor_id] = row;
+  gcs_init_data.SetActorTableData(actors);
+  gcs_init_data.SetActorTaskSpecTableData({});  // No spec on purpose.
+
+  auto mgr = CreateActorManagerForInitializeTest();
+  mgr->Initialize(gcs_init_data);
+  ASSERT_EQ(RegisteredActorCount(*mgr), 1u);
+  auto actor = GetRegisteredActor(*mgr, actor_id);
+  ASSERT_NE(actor, nullptr);
+  ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEPENDENCIES_UNREADY);
+
+  // Owner node dies: the stub must be destroyable.
+  auto node_info = std::make_shared<rpc::GcsNodeInfo>();
+  node_info->set_node_id(owner_node.Binary());
+  mgr->OnNodeDead(node_info, "127.0.0.1");
+  drain_io_context();
+  auto destroyed = GetRegisteredActor(*mgr, actor_id);
+  ASSERT_TRUE(destroyed == nullptr || destroyed->GetState() == rpc::ActorTableData::DEAD);
+}
+
+TEST_F(GcsActorManagerTest, TestSlimRegistrationInitializeSkipsInconsistentSpeclessRow) {
+  // A spec-less row past DEPENDENCIES_UNREADY is inconsistent persistence
+  // (e.g. a destroy interrupted mid-write). The reload must skip it with an
+  // error instead of crash-looping the GCS.
+  auto job_id = JobID::FromInt(33);
+  rpc::JobTableData job_data;
+  job_data.set_job_id(job_id.Binary());
+  job_data.set_is_dead(false);
+
+  auto actor_id = ActorID::Of(job_id, TaskID::Nil(), 0);
+  rpc::ActorTableData row;
+  row.set_actor_id(actor_id.Binary());
+  row.set_job_id(job_id.Binary());
+  row.set_state(rpc::ActorTableData::PENDING_CREATION);
+  row.set_ray_namespace("test");
+  row.set_is_detached(false);
+  auto *owner = row.mutable_owner_address();
+  owner->set_node_id(NodeID::FromRandom().Binary());
+  owner->set_worker_id(WorkerID::FromRandom().Binary());
+
+  TestGcsInitData gcs_init_data(*gcs_table_storage_);
+  absl::flat_hash_map<JobID, rpc::JobTableData> jobs;
+  jobs[job_id] = job_data;
+  gcs_init_data.SetJobTableData(jobs);
+  absl::flat_hash_map<ActorID, rpc::ActorTableData> actors;
+  actors[actor_id] = row;
+  gcs_init_data.SetActorTableData(actors);
+  gcs_init_data.SetActorTaskSpecTableData({});
+
+  auto mgr = CreateActorManagerForInitializeTest();
+  mgr->Initialize(gcs_init_data);
+  ASSERT_EQ(RegisteredActorCount(*mgr), 0u);
+}
+
+TEST(SlimRegistrationStubExportTest, StubExportEventDoesNotCrash) {
+  // A spec-less stub being destroyed writes a lifecycle export event; the
+  // labels come from the (absent) task spec and must not be dereferenced.
+  RayConfig::instance().initialize(R"({"enable_export_api_write": true})");
+  auto counter = std::make_shared<
+      CounterMap<std::pair<rpc::ActorTableData::ActorState, std::string>>>();
+  observability::FakeRayEventRecorder recorder;
+  rpc::ActorTableData row;
+  row.set_state(rpc::ActorTableData::DEPENDENCIES_UNREADY);
+  row.set_ray_namespace("test");
+  gcs::GcsActor stub(row, counter, recorder, "session");
+  stub.WriteActorExportEvent(false);
+  RayConfig::instance().initialize(R"({"enable_export_api_write": false})");
+}
+
+TEST(SlimRegistrationStripTest, StripsArgsAndRuntimeEnvUnlessDetached) {
+  rpc::TaskSpec spec;
+  spec.add_args()->set_data("payload");
+  spec.mutable_runtime_env_info()->set_serialized_runtime_env("{\"pip\": [\"x\"]}");
+  spec.mutable_actor_creation_task_spec()->set_is_detached(false);
+  StripRegistrationTaskSpec(spec);
+  ASSERT_EQ(spec.args_size(), 0);
+  ASSERT_FALSE(spec.has_runtime_env_info());
+
+  // Named and detached actors are untouched (queryable by strangers).
+  rpc::TaskSpec named_spec;
+  named_spec.add_args()->set_data("payload");
+  named_spec.mutable_actor_creation_task_spec()->set_name("n");
+  StripRegistrationTaskSpec(named_spec);
+  ASSERT_EQ(named_spec.args_size(), 1);
+
+  rpc::TaskSpec detached_spec;
+  detached_spec.add_args()->set_data("payload");
+  detached_spec.mutable_runtime_env_info()->set_serialized_runtime_env("env");
+  detached_spec.mutable_actor_creation_task_spec()->set_is_detached(true);
+  StripRegistrationTaskSpec(detached_spec);
+  ASSERT_EQ(detached_spec.args_size(), 1);
+  ASSERT_TRUE(detached_spec.has_runtime_env_info());
 }
 
 }  // namespace gcs

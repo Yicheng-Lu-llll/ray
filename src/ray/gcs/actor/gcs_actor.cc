@@ -152,8 +152,12 @@ void GcsActor::WriteActorExportEvent(
   export_actor_data_ptr->set_node_id(actor_table_data_.node_id());
   export_actor_data_ptr->set_placement_group_id(actor_table_data_.placement_group_id());
   export_actor_data_ptr->set_repr_name(actor_table_data_.repr_name());
-  export_actor_data_ptr->mutable_labels()->insert(task_spec_.get()->labels().begin(),
-                                                  task_spec_.get()->labels().end());
+  if (task_spec_ != nullptr) {
+    // Spec-less stubs exist for DEPENDENCIES_UNREADY actors reloaded after a
+    // GCS restart under slim registration; they have no labels yet.
+    export_actor_data_ptr->mutable_labels()->insert(task_spec_.get()->labels().begin(),
+                                                    task_spec_.get()->labels().end());
+  }
   *export_actor_data_ptr->mutable_label_selector() = actor_table_data_.label_selector();
 
   RayExportEvent(export_actor_data_ptr).SendEvent();

@@ -155,9 +155,20 @@ bool OnInitializeActorShouldLoad(const ray::gcs::GcsInitData &gcs_init_data,
     return false;
   }
 
-  const auto &actor_task_spec = ray::map_find_or_die(actor_task_specs, actor_id);
-  ray::ActorID root_detached_actor_id =
-      ray::TaskSpecification(actor_task_spec).RootDetachedActorId();
+  ray::ActorID root_detached_actor_id;
+  const auto spec_iter = actor_task_specs.find(actor_id);
+  if (spec_iter != actor_task_specs.end()) {
+    root_detached_actor_id =
+        ray::TaskSpecification(spec_iter->second).RootDetachedActorId();
+  } else {
+    // Slim registration (see StripRegistrationTaskSpec): DEPENDENCIES_UNREADY actors
+    // persist no task spec; the actor table row mirrors the root detached
+    // actor id instead.
+    root_detached_actor_id =
+        actor_table_data->second.root_detached_actor_id().empty()
+            ? ray::ActorID::Nil()
+            : ray::ActorID::FromBinary(actor_table_data->second.root_detached_actor_id());
+  }
   if (root_detached_actor_id.IsNil()) {
     // owner is job, NOT detached actor, should die with job
     auto job_iter = jobs.find(actor_id.JobId());
@@ -741,52 +752,62 @@ Status GcsActorManager::RegisterActor(const ray::rpc::RegisterActorRequest &requ
   }
 
   // The backend storage is supposed to be reliable, so the status must be ok.
-  gcs_table_storage_->ActorTaskSpecTable().Put(
-      actor_id,
-      request.task_spec(),
-      {[this, actor](Status status) {
-         gcs_table_storage_->ActorTable().Put(
-             actor->GetActorID(),
-             *actor->GetMutableActorTableData(),
-             {[this, actor](Status put_status) {
-                RAY_CHECK(thread_checker_.IsOnSameThread());
-                // The backend storage is supposed to be reliable, so the status must be
-                // ok.
-                RAY_CHECK_OK(put_status);
-                actor->WriteActorExportEvent(true);
-                auto registered_actor_it = registered_actors_.find(actor->GetActorID());
-                auto callback_iter =
-                    actor_to_register_callbacks_.find(actor->GetActorID());
-                RAY_CHECK(callback_iter != actor_to_register_callbacks_.end());
-                if (registered_actor_it == registered_actors_.end()) {
-                  // NOTE(sang): This logic assumes that the ordering of backend call is
-                  // guaranteed. It is currently true because we use a single TCP socket
-                  // to call the default Redis backend. If ordering is not guaranteed, we
-                  // should overwrite the actor state to DEAD to avoid race condition.
-                  RAY_LOG(INFO).WithField(actor->GetActorID())
-                      << "Actor was killed before it was persisted in GCS Table Storage. "
-                         "Owning worker should not try to create this actor";
+  // Slim registration: persist no task spec here --
+  // the full dependency-resolved spec is first persisted at creation, and a
+  // DEPENDENCIES_UNREADY actor's duties across a GCS restart (destroy on
+  // owner death, name release) only need the actor table row.
+  auto flush_actor_row = [this, actor](Status status) {
+    gcs_table_storage_->ActorTable().Put(
+        actor->GetActorID(),
+        *actor->GetMutableActorTableData(),
+        {[this, actor](Status put_status) {
+           RAY_CHECK(thread_checker_.IsOnSameThread());
+           // The backend storage is supposed to be reliable, so the status must be
+           // ok.
+           RAY_CHECK_OK(put_status);
+           actor->WriteActorExportEvent(true);
+           auto registered_actor_it = registered_actors_.find(actor->GetActorID());
+           auto callback_iter = actor_to_register_callbacks_.find(actor->GetActorID());
+           RAY_CHECK(callback_iter != actor_to_register_callbacks_.end());
+           if (registered_actor_it == registered_actors_.end()) {
+             // NOTE(sang): This logic assumes that the ordering of backend call is
+             // guaranteed. It is currently true because we use a single TCP socket
+             // to call the default Redis backend. If ordering is not guaranteed, we
+             // should overwrite the actor state to DEAD to avoid race condition.
+             RAY_LOG(INFO).WithField(actor->GetActorID())
+                 << "Actor was killed before it was persisted in GCS Table Storage. "
+                    "Owning worker should not try to create this actor";
 
-                  for (auto &callback : callback_iter->second) {
-                    callback(Status::SchedulingCancelled("Actor creation cancelled."));
-                  }
-                  return;
-                }
+             for (auto &callback : callback_iter->second) {
+               callback(Status::SchedulingCancelled("Actor creation cancelled."));
+             }
+             return;
+           }
 
-                gcs_publisher_->PublishActor(actor->GetActorID(),
-                                             actor->GetActorTableData());
-                // Invoke all callbacks for all registration requests of this actor
-                // (duplicated requests are included) and remove all of them from
-                // actor_to_register_callbacks_.
-                // Reply to the owner to indicate that the actor has been registered.
-                for (auto &callback : callback_iter->second) {
-                  callback(Status::OK());
-                }
-                actor_to_register_callbacks_.erase(callback_iter);
-              },
-              io_context_});
-       },
-       io_context_});
+           gcs_publisher_->PublishActor(actor->GetActorID(), actor->GetActorTableData());
+           // Invoke all callbacks for all registration requests of this actor
+           // (duplicated requests are included) and remove all of them from
+           // actor_to_register_callbacks_.
+           // Reply to the owner to indicate that the actor has been registered.
+           for (auto &callback : callback_iter->second) {
+             callback(Status::OK());
+           }
+           actor_to_register_callbacks_.erase(callback_iter);
+         },
+         io_context_});
+  };
+  if (actor->GetName().empty() && !actor->IsDetached()) {
+    flush_actor_row(Status::OK());
+  } else {
+    gcs_table_storage_->ActorTaskSpecTable().Put(
+        actor_id,
+        request.task_spec(),
+        {[actor, flush_actor_row](Status status) {
+           actor->SetTaskSpecPersisted();
+           flush_actor_row(status);
+         },
+         io_context_});
+  }
 
   return Status::OK();
 }
@@ -843,6 +864,43 @@ Status GcsActorManager::CreateActor(const ray::rpc::CreateActorRequest &request,
     return Status::OK();
   }
 
+  if (!iter->second->TaskSpecPersisted()) {
+    // Slim registration: persist the resolved spec
+    // BEFORE any state mutation, so a destroy landing while the write is in
+    // flight still sees a plain DEPENDENCIES_UNREADY actor and takes the
+    // existing scheduler-free destroy path, and so the on-disk invariant "a
+    // row past DEPENDENCIES_UNREADY implies a durable spec" holds by
+    // construction. Keyed on TaskSpecPersisted() so an actor
+    // registered before this change (spec already durable) skips the extra
+    // write.
+    auto request_copy = std::make_shared<rpc::CreateActorRequest>(request);
+    gcs_table_storage_->ActorTaskSpecTable().Put(
+        actor_id,
+        request.task_spec(),
+        {[this, actor_id, request_copy](Status status) {
+           RAY_CHECK_OK(status);
+           auto it = registered_actors_.find(actor_id);
+           if (it == registered_actors_.end() ||
+               it->second->GetState() != rpc::ActorTableData::DEPENDENCIES_UNREADY) {
+             // Destroyed while the spec write was in flight: the destroy path
+             // already replied to the parked creation callbacks.
+             return;
+           }
+           ExecuteCreateActor(*request_copy);
+         },
+         io_context_});
+    return Status::OK();
+  }
+  ExecuteCreateActor(request);
+  return Status::OK();
+}
+
+void GcsActorManager::ExecuteCreateActor(const rpc::CreateActorRequest &request) {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
+  auto actor_id =
+      ActorID::FromBinary(request.task_spec().actor_creation_task_spec().actor_id());
+  auto iter = registered_actors_.find(actor_id);
+  RAY_CHECK(iter != registered_actors_.end());
   // Remove the actor from the unresolved actor map.
   const auto &actor_namespace = iter->second->GetRayNamespace();
   RAY_CHECK(!actor_namespace.empty())
@@ -852,6 +910,9 @@ Status GcsActorManager::CreateActor(const ray::rpc::CreateActorRequest &request,
                                           actor_state_counter_,
                                           ray_event_recorder_,
                                           session_name_);
+  // Either just persisted by CreateActor, or persisted by the legacy
+  // registration path.
+  actor->SetTaskSpecPersisted();
   actor->UpdateState(rpc::ActorTableData::PENDING_CREATION);
   const auto &actor_table_data = actor->GetActorTableData();
   actor->GetMutableTaskSpec()->set_dependency_resolution_timestamp_ms(
@@ -868,7 +929,6 @@ Status GcsActorManager::CreateActor(const ray::rpc::CreateActorRequest &request,
 
   // Schedule the actor.
   gcs_actor_scheduler_->Schedule(actor);
-  return Status::OK();
 }
 
 ActorID GcsActorManager::GetActorIDByName(const std::string &name,
@@ -1739,12 +1799,35 @@ void GcsActorManager::Initialize(const GcsInitData &gcs_init_data) {
     //   - Non-deatched actors whose owner (job or root_detached_actor) is alive.
     //   - Detached actors which lives even when their original owner is dead.
     if (OnInitializeActorShouldLoad(gcs_init_data, actor_id)) {
-      const auto &actor_task_spec = map_find_or_die(actor_task_specs, actor_id);
-      auto actor = std::make_shared<GcsActor>(actor_table_data,
-                                              actor_task_spec,
-                                              actor_state_counter_,
-                                              ray_event_recorder_,
-                                              session_name_);
+      std::shared_ptr<GcsActor> actor;
+      auto spec_iter = actor_task_specs.find(actor_id);
+      if (spec_iter != actor_task_specs.end()) {
+        actor = std::make_shared<GcsActor>(actor_table_data,
+                                           spec_iter->second,
+                                           actor_state_counter_,
+                                           ray_event_recorder_,
+                                           session_name_);
+      } else {
+        // Slim registration (see StripRegistrationTaskSpec): DEPENDENCIES_UNREADY
+        // actors persist no task spec -- it is first persisted at creation.
+        // Rebuild a stub from the actor table row (it carries the owner
+        // address, name, namespace and detached flag -- everything the
+        // pre-creation duties need); the client's resent CreateActor brings
+        // the full resolved spec.
+        if (actor_table_data.state() != rpc::ActorTableData::DEPENDENCIES_UNREADY ||
+            !actor_table_data.name().empty() || actor_table_data.is_detached()) {
+          // Inconsistent persistence (e.g. a destroy interrupted mid-write):
+          // don't load a spec-less actor we cannot manage -- log and skip
+          // instead of crash-looping the GCS.
+          RAY_LOG(ERROR).WithField(actor_id)
+              << "Actor has no persisted task spec but is not an anonymous "
+                 "DEPENDENCIES_UNREADY actor; skipping load. state = "
+              << rpc::ActorTableData::ActorState_Name(actor_table_data.state());
+          continue;
+        }
+        actor = std::make_shared<GcsActor>(
+            actor_table_data, actor_state_counter_, ray_event_recorder_, session_name_);
+      }
       registered_actors_.emplace(actor_id, actor);
       function_manager_.AddJobReference(actor->GetActorID().JobId());
       if (!actor->GetName().empty()) {

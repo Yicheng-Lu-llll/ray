@@ -265,6 +265,11 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
   Status CreateActor(const rpc::CreateActorRequest &request,
                      CreateActorCallback callback);
 
+  /// Run the creation-side state mutation and scheduling for an actor whose
+  /// (resolved) task spec is durably persisted. Split out of CreateActor so
+  /// the slim-registration path can chain it behind the spec write.
+  void ExecuteCreateActor(const rpc::CreateActorRequest &request);
+
   /// Get the actor ID for the named actor. Returns nil if the actor was not found.
   /// \param name The name of the detached actor to look up.
   /// \returns ActorID The ID of the actor. Nil if the actor was not found.

@@ -88,6 +88,8 @@ class GcsActor {
         session_name_(session_name) {
     lease_spec_ = std::make_unique<LeaseSpecification>(*task_spec_);
     RAY_CHECK(actor_table_data_.state() != rpc::ActorTableData::DEAD);
+    // This constructor loads the spec from storage, so it is durable.
+    task_spec_persisted_ = true;
     RefreshMetrics();
   }
 
@@ -112,6 +114,7 @@ class GcsActor {
     const auto &actor_creation_task_spec = task_spec_->actor_creation_task_spec();
     actor_table_data_.set_actor_id(actor_creation_task_spec.actor_id());
     actor_table_data_.set_job_id(task_spec_->job_id());
+    actor_table_data_.set_root_detached_actor_id(task_spec_->root_detached_actor_id());
     actor_table_data_.set_max_restarts(actor_creation_task_spec.max_actor_restarts());
     actor_table_data_.set_num_restarts(0);
     actor_table_data_.set_num_restarts_due_to_lineage_reconstruction(0);
@@ -243,6 +246,13 @@ class GcsActor {
   /// Get the mutable ActorTableData of this actor.
   rpc::ActorTableData *GetMutableActorTableData();
   rpc::TaskSpec *GetMutableTaskSpec();
+
+  /// Whether some version of this actor's task spec is durably persisted in
+  /// ActorTaskSpecTable. Slim registration skips the
+  /// registration-time persistence; the creation path persists the resolved
+  /// spec before any state mutation whenever this is still false.
+  bool TaskSpecPersisted() const { return task_spec_persisted_; }
+  void SetTaskSpecPersisted() { task_spec_persisted_ = true; }
   rpc::LeaseSpec *GetMutableLeaseSpec();
   /// Write an event containing this actor's ActorTableData
   /// to file for the Export API.
@@ -328,6 +338,8 @@ class GcsActor {
   /// the gcs actor and so on (see gcs.proto).
   rpc::ActorTableData actor_table_data_;
   const std::unique_ptr<rpc::TaskSpec> task_spec_;
+  /// See TaskSpecPersisted().
+  bool task_spec_persisted_ = false;
   /// Resources acquired by this actor.
   ResourceRequest acquired_resources_;
   /// Reference to the counter to use for actor state metrics tracking.

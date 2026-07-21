@@ -798,5 +798,14 @@ class TestPlacementGroupValidation:
             _validate_bundle_label_selector([{"INVALID key!": "value"}])
 
 
+def test_bundle_specs_drop_zero_valued_resources(ray_start_regular):
+    """The prefilled bundle cache must match what the GCS stores: the C++ spec
+    builder strips zero-valued resources, so the handle returned by
+    placement_group() and one fetched from the GCS later must agree."""
+    pg = ray.util.placement_group([{"CPU": 1, "GPU": 0}])
+    ray.get(pg.ready())
+    assert pg.bundle_specs == [{"CPU": 1.0}]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main(["-sv", __file__]))

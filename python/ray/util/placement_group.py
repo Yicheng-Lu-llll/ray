@@ -223,7 +223,12 @@ def placement_group(
 
     return PlacementGroup(
         placement_group_id,
-        bundle_cache=[{k: float(v) for k, v in bundle.items()} for bundle in bundles],
+        # Drop zero-valued resources to match the bundles the GCS stores (the
+        # C++ spec builder strips them), so this prefilled cache agrees with
+        # what a lazily fetched handle would see.
+        bundle_cache=[
+            {k: float(v) for k, v in bundle.items() if v != 0} for bundle in bundles
+        ],
     )
 
 

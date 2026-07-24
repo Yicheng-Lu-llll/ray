@@ -134,21 +134,17 @@ def test_get_object_status_rpc_retry_and_idempotency(
 def test_actor_ref_deleted_rpc_retry_and_idempotency(
     monkeypatch, shutdown_only, deterministic_failure
 ):
-    """Test that the actor ref deleted RPCs retry correctly and are idempotent
-    when network failures occur. The same signal travels on two RPCs: the GCS
-    parks WaitForActorRefDeleted on the owner to learn when the actor's
-    references are gone, and the owner pushes ReportActorRefDeleted to the GCS
-    when the ref count hits zero. Each RPC gets one injected failure.
+    """Test that the ReportActorRefDeleted RPC retries correctly and is
+    idempotent when network failures occur. The owner pushes it to the GCS
+    once all references to the actor (including lineage refs) are deleted,
+    so the GCS destroys the actor.
     """
     failure = RPC_FAILURE_MAP[deterministic_failure].copy()
     failure["num_failures"] = 1
     monkeypatch.setenv(
         "RAY_testing_rpc_failure",
         json.dumps(
-            {
-                "CoreWorkerService.grpc_client.WaitForActorRefDeleted": failure,
-                "ray::rpc::ActorInfoGcsService.grpc_client.ReportActorRefDeleted": failure,
-            }
+            {"ray::rpc::ActorInfoGcsService.grpc_client.ReportActorRefDeleted": failure}
         ),
     )
 

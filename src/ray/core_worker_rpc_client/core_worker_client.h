@@ -93,13 +93,6 @@ class CoreWorkerClient : public std::enable_shared_from_this<CoreWorkerClient>,
 
   VOID_RETRYABLE_RPC_CLIENT_METHOD(retryable_grpc_client_,
                                    CoreWorkerService,
-                                   WaitForActorRefDeleted,
-                                   grpc_client_,
-                                   /*method_timeout_ms*/ -1,
-                                   override)
-
-  VOID_RETRYABLE_RPC_CLIENT_METHOD(retryable_grpc_client_,
-                                   CoreWorkerService,
                                    PubsubLongPolling,
                                    grpc_client_,
                                    /*method_timeout_ms*/ -1,

@@ -443,6 +443,11 @@ RAY_CONFIG(uint32_t, maximum_gcs_dead_worker_cached_count, 100000)
 /// GcsNodeInfo entry ≈ ~150-250 bytes serialized (~500B-1KB deserialized).
 /// Worst-case footprint: 1,000 x ~500B-1KB =~ 0.5-1MB
 RAY_CONFIG(uint32_t, maximum_gcs_dead_node_cached_count, 1000)
+
+/// Maximum number of recently dead owner workers remembered by the GCS actor
+/// manager to reject actor registrations whose owner already died before the
+/// registration was processed.
+RAY_CONFIG(uint32_t, maximum_gcs_dead_owner_worker_cached_count, 32768)
 /// The storage backend to use for the GCS. It can be 'memory', 'redis', or
 /// 'rocksdb'.
 RAY_CONFIG(std::string, gcs_storage, "memory")

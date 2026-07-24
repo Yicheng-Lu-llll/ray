@@ -58,10 +58,6 @@ class FakeCoreWorkerClient : public CoreWorkerClientInterface {
   void GetObjectStatus(GetObjectStatusRequest &&request,
                        const ClientCallback<GetObjectStatusReply> &callback) override {}
 
-  void WaitForActorRefDeleted(
-      WaitForActorRefDeletedRequest &&request,
-      const ClientCallback<WaitForActorRefDeletedReply> &callback) override {}
-
   void UpdateObjectLocationBatch(
       UpdateObjectLocationBatchRequest &&request,
       const ClientCallback<UpdateObjectLocationBatchReply> &callback) override {}

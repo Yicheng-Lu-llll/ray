@@ -120,16 +120,6 @@ class ActorManager {
                              const rpc::Address &caller_address,
                              bool owned);
 
-  /// Wait for actor reference deletion.
-  /// This is only called on the owner.
-  ///
-  /// \param actor_id The actor id that owns the callback.
-  /// \param actor_ref_deleted_callback The callback function that will be called when
-  /// an actor_id has no references.
-  void WaitForActorRefDeleted(
-      const ActorID &actor_id,
-      std::function<void(const ActorID &)> actor_ref_deleted_callback);
-
   /// Get a list of actor_ids from existing actor handles.
   /// This is used for debugging purpose.
   std::vector<ObjectID> GetActorHandleIDsFromHandles();

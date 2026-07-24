@@ -41,12 +41,6 @@ class MockCoreWorker : public CoreWorker {
                rpc::SendReplyCallback send_reply_callback),
               (override));
   MOCK_METHOD(void,
-              HandleWaitForActorRefDeleted,
-              (rpc::WaitForActorRefDeletedRequest request,
-               rpc::WaitForActorRefDeletedReply *reply,
-               rpc::SendReplyCallback send_reply_callback),
-              (override));
-  MOCK_METHOD(void,
               HandlePubsubLongPolling,
               (rpc::PubsubLongPollingRequest request,
                rpc::PubsubLongPollingReply *reply,

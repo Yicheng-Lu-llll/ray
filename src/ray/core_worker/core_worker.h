@@ -1375,11 +1375,6 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
                              rpc::GetObjectStatusReply *reply,
                              rpc::SendReplyCallback send_reply_callback);
 
-  /// Implements gRPC server handler.
-  void HandleWaitForActorRefDeleted(rpc::WaitForActorRefDeletedRequest request,
-                                    rpc::WaitForActorRefDeletedReply *reply,
-                                    rpc::SendReplyCallback send_reply_callback);
-
   // Implements gRPC server handler.
   void HandlePubsubLongPolling(rpc::PubsubLongPollingRequest request,
                                rpc::PubsubLongPollingReply *reply,

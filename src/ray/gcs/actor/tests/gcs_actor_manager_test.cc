@@ -2421,9 +2421,14 @@ TEST_F(GcsActorManagerTest, TestGetNamedActorOnDeletedActorRefReturnsNotFound) {
   // Actor should now be DEAD
   ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
 
-  // Simulate the reply of WaitForActorRefDeleted request to trigger actor ref deletion
-  ASSERT_TRUE(worker_client_->Reply())
-      << "Failed to notify the actor manager that the actor has been deleted.";
+  // The owner reports that all references (including lineage refs) are deleted.
+  rpc::ReportActorRefDeletedRequest ref_deleted_request;
+  ref_deleted_request.set_actor_id(actor->GetActorID().Binary());
+  rpc::ReportActorRefDeletedReply ref_deleted_reply;
+  gcs_actor_manager_->HandleReportActorRefDeleted(
+      ref_deleted_request,
+      &ref_deleted_reply,
+      [](auto status, auto success_callback, auto failure_callback) {});
   // Actor ref should be deleted and is no longer reconstructable
   drain_io_context();
 
@@ -2462,9 +2467,14 @@ TEST_F(GcsActorManagerTest, TestRegisterNamedActorOnDeletedActorRefCreatesNewAct
   // Actor should now be DEAD
   ASSERT_EQ(actor->GetState(), rpc::ActorTableData::DEAD);
 
-  // Simulate the reply of WaitForActorRefDeleted request to trigger actor ref deletion
-  ASSERT_TRUE(worker_client_->Reply())
-      << "Failed to notify the actor manager that the actor has been deleted.";
+  // The owner reports that all references (including lineage refs) are deleted.
+  rpc::ReportActorRefDeletedRequest ref_deleted_request;
+  ref_deleted_request.set_actor_id(actor->GetActorID().Binary());
+  rpc::ReportActorRefDeletedReply ref_deleted_reply;
+  gcs_actor_manager_->HandleReportActorRefDeleted(
+      ref_deleted_request,
+      &ref_deleted_reply,
+      [](auto status, auto success_callback, auto failure_callback) {});
   drain_io_context();
 
   rpc::RegisterActorRequest register_request =
@@ -2620,6 +2630,22 @@ TEST_F(GcsActorManagerTest, TestInitializeRestoresLocalRayletAddressForAliveActo
   ASSERT_EQ(local_raylet_address->node_id(), node_id.Binary());
   ASSERT_EQ(local_raylet_address->ip_address(), "127.0.0.1");
   ASSERT_EQ(local_raylet_address->port(), 9999);
+}
+
+TEST_F(GcsActorManagerTest, TestReportActorRefDeletedOnUnknownActorReplies) {
+  rpc::ReportActorRefDeletedRequest request;
+  const JobID job_id = JobID::FromInt(9999);
+  request.set_actor_id(ActorID::Of(job_id, TaskID::ForDriverTask(job_id), 0).Binary());
+  rpc::ReportActorRefDeletedReply reply;
+  bool replied = false;
+  gcs_actor_manager_->HandleReportActorRefDeleted(
+      request,
+      &reply,
+      [&replied](auto status, auto success_callback, auto failure_callback) {
+        replied = true;
+      });
+  ASSERT_TRUE(replied) << "Reporting an unknown/already-dead actor should reply OK.";
+  ASSERT_EQ(reply.status().code(), static_cast<int>(StatusCode::OK));
 }
 
 }  // namespace gcs

@@ -123,6 +123,10 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   /// Submit an actor creation task to an actor via GCS.
   void SubmitActorCreationTask(TaskSpecification task_spec);
 
+  /// Arrange for the GCS to destroy the actor once all references to it
+  /// (including lineage refs) are deleted.
+  void NotifyGCSWhenActorRefDeleted(const ActorID &actor_id);
+
   /// Create connection to actor and send all pending tasks.
   ///
   /// \param[in] actor_id Actor ID.

@@ -62,6 +62,27 @@ void ActorTaskSubmitter::NotifyGCSWhenActorOutOfScope(
   }
 }
 
+void ActorTaskSubmitter::NotifyGCSWhenActorRefDeleted(const ActorID &actor_id) {
+  const auto actor_creation_return_id = ObjectID::ForActorHandle(actor_id);
+  auto actor_ref_deleted_callback = [this, actor_id](const ObjectID &object_id) {
+    actor_creator_.AsyncReportActorRefDeleted(actor_id, [actor_id](Status status) {
+      if (!status.ok()) {
+        // Retries absorb transport errors: only owner shutdown or a Ray bug
+        // reaches here.
+        RAY_LOG(ERROR).WithField(actor_id)
+            << "Failed to report actor ref deleted: " << status
+            << ". The actor will not be destroyed until its owner exits.";
+      }
+    });
+  };
+
+  if (!reference_counter_->AddObjectRefDeletedCallback(actor_creation_return_id,
+                                                       actor_ref_deleted_callback)) {
+    RAY_LOG(DEBUG).WithField(actor_id) << "Actor ref already deleted";
+    actor_ref_deleted_callback(actor_creation_return_id);
+  }
+}
+
 void ActorTaskSubmitter::AddActorQueueIfNotExists(const ActorID &actor_id,
                                                   int32_t max_pending_calls,
                                                   bool allow_out_of_order_execution,
@@ -94,6 +115,9 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
   RAY_CHECK(task_spec.IsActorCreationTask());
   RAY_LOG(DEBUG).WithField(task_spec.ActorCreationId()).WithField(task_spec.TaskId())
       << "Submitting actor creation task";
+  if (!task_spec.IsDetachedActor()) {
+    NotifyGCSWhenActorRefDeleted(task_spec.ActorCreationId());
+  }
   resolver_.ResolveDependencies(task_spec, [this, task_spec](Status status) mutable {
     // NOTE: task_spec here is capture copied (from a stack variable) and also
     // mutable. (Mutations to the variable are expected to be shared inside and

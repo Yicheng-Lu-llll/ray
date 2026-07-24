@@ -954,6 +954,8 @@ TEST_F(CoreWorkerTest, NamedActorRegisterFailureReleasesHandleReference) {
   ASSERT_TRUE(status.IsTimedOut()) << status;
   EXPECT_FALSE(reference_counter_->HasReference(ObjectID::ForActorHandle(actor_id)));
   EXPECT_EQ(task_manager_->NumPendingTasks(), 0);
+  ASSERT_EQ(mock_gcs_client_->mock_actor_accessor->reported_ref_deleted_actor_ids_,
+            std::vector<ActorID>{actor_id});
 
   mock_gcs_client_->mock_actor_accessor->sync_register_actor_status_ = Status::OK();
   ActorID ok_actor_id;
@@ -966,6 +968,8 @@ TEST_F(CoreWorkerTest, NamedActorRegisterFailureReleasesHandleReference) {
   ASSERT_TRUE(status.ok()) << status;
   EXPECT_TRUE(reference_counter_->HasReference(ObjectID::ForActorHandle(ok_actor_id)));
   EXPECT_EQ(task_manager_->NumPendingTasks(), 1);
+  EXPECT_EQ(mock_gcs_client_->mock_actor_accessor->reported_ref_deleted_actor_ids_,
+            std::vector<ActorID>{actor_id});
 }
 
 TEST_F(CoreWorkerTest, HandlePubsubCommandBatchInvalidChannelType) {

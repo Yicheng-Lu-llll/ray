@@ -2260,6 +2260,10 @@ Status CoreWorker::CreateActor(const RayFunction &function,
                   << "Failed to register actor. Error message: " << status;
               task_manager_->FailPendingTask(
                   task_spec.TaskId(), rpc::ErrorType::ACTOR_CREATION_FAILED, &status);
+              if (!task_spec.IsDetachedActor()) {
+                actor_task_submitter_->NotifyGCSWhenActorRefDeleted(
+                    task_spec.ActorCreationId());
+              }
             } else {
               actor_task_submitter_->SubmitActorCreationTask(task_spec);
             }
@@ -2276,6 +2280,7 @@ Status CoreWorker::CreateActor(const RayFunction &function,
           task_spec.TaskId(), rpc::ErrorType::ACTOR_CREATION_FAILED, &status);
       // Detached actor doesn't need ref counting.
       if (!is_detached) {
+        actor_task_submitter_->NotifyGCSWhenActorRefDeleted(actor_id);
         RemoveActorHandleReference(actor_id);
       }
       return status;

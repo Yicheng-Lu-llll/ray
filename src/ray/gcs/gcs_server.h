@@ -279,9 +279,11 @@ class GcsServer {
   std::unique_ptr<GcsNodeManager> gcs_node_manager_;
   std::shared_ptr<GcsHealthCheckManager> gcs_healthcheck_manager_;
   std::unique_ptr<GcsPlacementGroupManager> gcs_placement_group_manager_;
-  std::shared_ptr<GcsActorManager> gcs_actor_manager_;
-  /// gcs_placement_group_scheduler_ depends on raylet_client_pool_.
+  /// gcs_placement_group_scheduler_ depends on raylet_client_pool_. It is declared
+  /// before gcs_actor_manager_ so that it is destroyed after it: the actor scheduler
+  /// gcs_actor_manager_ owns holds a reference to its committed bundle locations.
   std::unique_ptr<GcsPlacementGroupScheduler> gcs_placement_group_scheduler_;
+  std::shared_ptr<GcsActorManager> gcs_actor_manager_;
   std::unique_ptr<GCSFunctionManager> function_manager_;
   /// Stores references to URIs stored by the GCS for runtime envs.
   std::unique_ptr<ray::RuntimeEnvManager> runtime_env_manager_;

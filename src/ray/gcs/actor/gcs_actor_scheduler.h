@@ -26,6 +26,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "ray/asio/instrumented_io_context.h"
 #include "ray/common/id.h"
+#include "ray/common/bundle_location_index.h"
 #include "ray/common/status.h"
 #include "ray/core_worker_rpc_client/core_worker_client_pool.h"
 #include "ray/gcs/actor/gcs_actor.h"
@@ -51,8 +52,11 @@ using GcsActorSchedulerSuccessCallback =
 
 class GcsActorSchedulerInterface {
  public:
-  /// Forward the actor to a Raylet for scheduling. The target Raylet is the same node for
-  /// the actor's owner, or selected randomly.
+  /// Forward the actor to a Raylet for scheduling. The target Raylet is the node the
+  /// actor is pinned to (through a node-id label selector or a
+  /// NodeAffinitySchedulingStrategy), a node holding one of its placement group's
+  /// bundles, the actor owner's node, or a random alive node -- in that order, falling
+  /// through whenever there is no such live node.
   ///
   /// \param actor The actor to be scheduled.
   virtual void Schedule(std::shared_ptr<GcsActor> actor) = 0;
@@ -117,6 +121,8 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
   /// \param worker_client_pool Pool to manage connections to core worker clients.
   /// \param scheduler_placement_time_ms_histogram Histogram of the time it took to
   /// schedule an Actor Creation Task on a worker.
+  /// \param committed_bundle_location_index Where the placement groups' committed
+  /// bundles are, used to forward an actor's lease to a node holding one of them.
   explicit GcsActorScheduler(
       instrumented_io_context &io_context,
       GcsActorTable &gcs_actor_table,
@@ -126,7 +132,8 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
       rpc::RayletClientPool &raylet_client_pool,
       rpc::CoreWorkerClientPool &worker_client_pool,
       ray::observability::MetricInterface &scheduler_placement_time_ms_histogram,
-      ClockInterface &clock);
+      ClockInterface &clock,
+      const BundleLocationIndex &committed_bundle_location_index);
 
   ~GcsActorScheduler() override = default;
 
@@ -249,6 +256,18 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
                                       const Status &status,
                                       const rpc::RequestWorkerLeaseReply &reply);
 
+  /// Select a node holding a committed bundle of the actor's placement group to forward
+  /// its lease request to.
+  ///
+  /// \param bundle_id The bundle the actor is scheduled into. A bundle index of -1
+  /// means any bundle of the placement group.
+  /// \param required_placement_resources What the actor needs, so that bundles too
+  /// small for it (a CPU bundle for a GPU actor, say) are not picked.
+  /// \return The node to forward to, or Nil if no live node holds a committed bundle
+  /// that fits, in which case the caller falls back to the default logic.
+  NodeID SelectCommittedBundleNode(const BundleID &bundle_id,
+                                   const ResourceSet &required_placement_resources);
+
   /// Retry leasing a worker from the specified node for the specified actor.
   /// Make it a virtual method so that the io_context_ could be mocked out.
   ///
@@ -348,6 +367,11 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
       node_to_workers_when_creating_;
   /// Reference of GcsNodeManager.
   const GcsNodeManager &gcs_node_manager_;
+  /// Where the placement groups' committed bundles are.
+  const BundleLocationIndex &committed_bundle_location_index_;
+  /// Which bundle of a placement group the next actor of it is forwarded to. Entries
+  /// are dropped once the group has no committed bundles left.
+  absl::flat_hash_map<PlacementGroupID, size_t> next_bundle_of_placement_group_;
   /// The handler to handle the scheduling failures.
   GcsActorSchedulerFailureCallback schedule_failure_handler_;
   /// The handler to handle the successful scheduling.
@@ -385,6 +409,11 @@ class GcsActorScheduler : public GcsActorSchedulerInterface {
   FRIEND_TEST(GcsActorSchedulerTest, TestReleaseUnusedActorWorkers);
   FRIEND_TEST(GcsActorSchedulerTest, TestSelectForwardingNodeForHardNodeAffinity);
   FRIEND_TEST(GcsActorSchedulerTest, TestSelectForwardingNodeForNodeAffinityStrategy);
+  FRIEND_TEST(GcsActorSchedulerTest, TestSelectForwardingNodeForPinnedBundle);
+  FRIEND_TEST(GcsActorSchedulerTest, TestSelectForwardingNodeForUnpinnedBundle);
+  FRIEND_TEST(GcsActorSchedulerTest,
+              TestSelectForwardingNodeSkipsBundlesTheActorDoesNotFitIn);
+  FRIEND_TEST(GcsActorSchedulerTest, TestSelectForwardingNodeFallsBackToTheOwnerNode);
 
   friend class GcsActorSchedulerMockTest;
   FRIEND_TEST(GcsActorSchedulerMockTest, KillWorkerLeak1);

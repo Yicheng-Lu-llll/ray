@@ -149,10 +149,50 @@ class GcsActorSchedulerTest : public ::testing::Test {
         *raylet_client_pool_,
         *worker_client_pool_,
         fake_scheduler_placement_time_ms_histogram_,
-        clock_);
+        clock_,
+        committed_bundle_location_index_);
   }
 
   void TearDown() override { io_context_->Stop(); }
+
+  // Registers `nodes` as holding one committed bundle each of a new placement group.
+  PlacementGroupID CommitBundlesOnNodes(const std::vector<NodeID> &nodes,
+                                        const std::vector<double> &cpu_per_bundle = {}) {
+    auto placement_group_id = PlacementGroupID::Of(JobID::FromInt(1));
+    for (size_t i = 0; i < nodes.size(); i++) {
+      rpc::Bundle bundle;
+      bundle.mutable_bundle_id()->set_placement_group_id(placement_group_id.Binary());
+      bundle.mutable_bundle_id()->set_bundle_index(i);
+      (*bundle.mutable_unit_resources())["CPU"] =
+          cpu_per_bundle.empty() ? 4.0 : cpu_per_bundle[i];
+      committed_bundle_location_index_.AddOrUpdateBundleLocation(
+          std::make_pair(placement_group_id, i),
+          nodes[i],
+          std::make_shared<const BundleSpecification>(std::move(bundle)));
+    }
+    return placement_group_id;
+  }
+
+  // Builds an actor in a placement group, with its resources formatted the way
+  // AddPlacementGroupConstraint formats them before the actor is submitted.
+  std::shared_ptr<gcs::GcsActor> NewActorInPlacementGroup(
+      const PlacementGroupID &placement_group_id,
+      int64_t bundle_index,
+      const NodeID &owner_node_id,
+      const std::string &resource = "CPU") {
+    std::unordered_map<std::string, double> resources{
+        {FormatPlacementGroupResource(resource, placement_group_id, bundle_index), 1.0}};
+    if (bundle_index >= 0) {
+      resources[FormatPlacementGroupResource(resource, placement_group_id, -1)] = 1.0;
+    }
+    auto msg = MakeActorTaskSpec(resources, owner_node_id);
+    auto *strategy =
+        msg.mutable_scheduling_strategy()->mutable_placement_group_scheduling_strategy();
+    strategy->set_placement_group_id(placement_group_id.Binary());
+    strategy->set_placement_group_bundle_index(bundle_index);
+    return MakeGcsActor(msg);
+  }
+
 
   std::shared_ptr<gcs::GcsActor> NewGcsActor(
       const std::unordered_map<std::string, double> &required_placement_resources) {
@@ -185,9 +225,10 @@ class GcsActorSchedulerTest : public ::testing::Test {
   // Builds the actor-creation task message for an actor with the given resource
   // requirement (used by the hard-pin helpers below).
   rpc::TaskSpec MakeActorTaskSpec(
-      const std::unordered_map<std::string, double> &resources) {
+      const std::unordered_map<std::string, double> &resources,
+      const NodeID &owner_node_id = NodeID::FromRandom()) {
     rpc::Address owner_address;
-    owner_address.set_node_id(NodeID::FromRandom().Binary());
+    owner_address.set_node_id(owner_node_id.Binary());
     owner_address.set_ip_address("127.0.0.1");
     owner_address.set_port(5678);
     owner_address.set_worker_id(WorkerID::FromRandom().Binary());
@@ -272,6 +313,7 @@ class GcsActorSchedulerTest : public ::testing::Test {
       counter;
   std::vector<std::shared_ptr<gcs::GcsActor>> failure_actors_;
   std::vector<std::shared_ptr<gcs::GcsActor>> success_actors_;
+  BundleLocationIndex committed_bundle_location_index_;
   std::shared_ptr<pubsub::GcsPublisher> gcs_publisher_;
   std::shared_ptr<pubsub::ObservabilityPublisher> observability_publisher_;
   std::shared_ptr<gcs::GcsTableStorage> gcs_table_storage_;
@@ -839,6 +881,107 @@ TEST_F(GcsActorSchedulerTest, TestSelectForwardingNodeForNodeAffinityStrategy) {
     auto affinity_dead = NewGcsActorWithNodeAffinity(NodeID::FromRandom(), soft);
     auto fallback = gcs_actor_scheduler_->SelectForwardingNode(affinity_dead);
     ASSERT_TRUE(fallback == node_a_id || fallback == node_b_id);
+  }
+}
+
+TEST_F(GcsActorSchedulerTest, TestSelectForwardingNodeForPinnedBundle) {
+  auto owner_node_id = NodeID::FromBinary(AddNewNode({{"CPU", 8.0}})->node_id());
+  std::vector<NodeID> bundle_nodes;
+  for (int i = 0; i < 3; i++) {
+    bundle_nodes.push_back(NodeID::FromBinary(AddNewNode({{"CPU", 8.0}})->node_id()));
+  }
+  auto placement_group_id = CommitBundlesOnNodes(bundle_nodes);
+
+  // Only the node holding bundle `i` has the resources carrying that bundle's index, so
+  // an actor pinned to it must be forwarded there rather than to its owner. A lease sent
+  // anywhere else is parked as infeasible without any warning, since infeasible warnings
+  // are suppressed for placement group leases.
+  for (size_t i = 0; i < bundle_nodes.size(); i++) {
+    auto actor = NewActorInPlacementGroup(placement_group_id, i, owner_node_id);
+    ASSERT_EQ(bundle_nodes[i], gcs_actor_scheduler_->SelectForwardingNode(actor));
+  }
+}
+
+TEST_F(GcsActorSchedulerTest, TestSelectForwardingNodeForUnpinnedBundle) {
+  auto owner_node_id = NodeID::FromBinary(AddNewNode({{"CPU", 8.0}})->node_id());
+  std::vector<NodeID> bundle_nodes;
+  for (int i = 0; i < 4; i++) {
+    bundle_nodes.push_back(NodeID::FromBinary(AddNewNode({{"CPU", 8.0}})->node_id()));
+  }
+  auto placement_group_id = CommitBundlesOnNodes(bundle_nodes);
+
+  // An actor that does not pin a bundle can run on any node of the group, and the
+  // group's bundles are handed out in turn: sending actors to bundles at random makes
+  // them collide on some bundles while others stay empty, and the bundle nodes then
+  // have to reject and reschedule what does not fit.
+  absl::flat_hash_map<NodeID, int> per_node;
+  for (int i = 0; i < 40; i++) {
+    auto actor =
+        NewActorInPlacementGroup(placement_group_id, /*bundle_index=*/-1, owner_node_id);
+    per_node[gcs_actor_scheduler_->SelectForwardingNode(actor)]++;
+  }
+  ASSERT_EQ(bundle_nodes.size(), per_node.size());
+  for (const auto &node_id : bundle_nodes) {
+    ASSERT_EQ(40 / bundle_nodes.size(), per_node[node_id]);
+  }
+
+  // A dead bundle node is skipped rather than sending the actor back to the owner's
+  // node, which is the slow path this forwarding exists to avoid.
+  gcs_node_manager_->RemoveNode(bundle_nodes[0],
+                                rpc::NodeDeathInfo(),
+                                rpc::GcsNodeInfo::DEAD,
+                                /*update_time=*/0);
+  for (int i = 0; i < 20; i++) {
+    auto actor =
+        NewActorInPlacementGroup(placement_group_id, /*bundle_index=*/-1, owner_node_id);
+    auto node_id = gcs_actor_scheduler_->SelectForwardingNode(actor);
+    ASSERT_NE(bundle_nodes[0], node_id);
+    ASSERT_TRUE(std::find(bundle_nodes.begin(), bundle_nodes.end(), node_id) !=
+                bundle_nodes.end());
+  }
+}
+
+TEST_F(GcsActorSchedulerTest, TestSelectForwardingNodeSkipsBundlesTheActorDoesNotFitIn) {
+  auto owner_node_id = NodeID::FromBinary(AddNewNode({{"CPU", 8.0}})->node_id());
+  auto small_bundle_node_id = NodeID::FromBinary(AddNewNode({{"CPU", 8.0}})->node_id());
+  auto large_bundle_node_id = NodeID::FromBinary(AddNewNode({{"CPU", 8.0}})->node_id());
+  auto placement_group_id = CommitBundlesOnNodes(
+      {small_bundle_node_id, large_bundle_node_id}, /*cpu_per_bundle=*/{0.5, 4.0});
+
+  // Bundles of a group can differ, and a node only has the resources of the bundles it
+  // holds. Forwarding an actor to a bundle it does not fit in parks it as infeasible
+  // there until the syncer tells that node about the rest of the group.
+  for (int i = 0; i < 20; i++) {
+    auto actor =
+        NewActorInPlacementGroup(placement_group_id, /*bundle_index=*/-1, owner_node_id);
+    ASSERT_EQ(large_bundle_node_id, gcs_actor_scheduler_->SelectForwardingNode(actor));
+  }
+}
+
+TEST_F(GcsActorSchedulerTest, TestSelectForwardingNodeFallsBackToTheOwnerNode) {
+  auto owner_node_id = NodeID::FromBinary(AddNewNode({{"CPU", 8.0}})->node_id());
+
+  // The placement group has no committed bundles yet, so there is no bundle node to
+  // forward to and the actor goes to the owner's node as it did before.
+  auto uncommitted_group_id = PlacementGroupID::Of(JobID::FromInt(1));
+  auto actor = NewActorInPlacementGroup(uncommitted_group_id,
+                                        /*bundle_index=*/0,
+                                        owner_node_id);
+  ASSERT_EQ(owner_node_id, gcs_actor_scheduler_->SelectForwardingNode(actor));
+
+  // Same once every node holding one of the group's bundles has died and the group has
+  // not been rescheduled yet.
+  auto dead_node_id = NodeID::FromBinary(AddNewNode({{"CPU", 8.0}})->node_id());
+  auto placement_group_id = CommitBundlesOnNodes({dead_node_id});
+  gcs_node_manager_->RemoveNode(dead_node_id,
+                                rpc::NodeDeathInfo(),
+                                rpc::GcsNodeInfo::DEAD,
+                                /*update_time=*/0);
+  for (int64_t bundle_index : {int64_t{0}, int64_t{-1}}) {
+    auto actor_on_dead_node =
+        NewActorInPlacementGroup(placement_group_id, bundle_index, owner_node_id);
+    ASSERT_EQ(owner_node_id,
+              gcs_actor_scheduler_->SelectForwardingNode(actor_on_dead_node));
   }
 }
 

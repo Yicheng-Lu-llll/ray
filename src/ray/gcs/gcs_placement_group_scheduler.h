@@ -295,6 +295,12 @@ class GcsPlacementGroupScheduler : public GcsPlacementGroupSchedulerInterface {
 
   virtual ~GcsPlacementGroupScheduler() = default;
 
+  /// Index of committed bundle locations, used by the actor scheduler to forward a
+  /// placement group actor's lease directly to a node holding one of its bundles.
+  const BundleLocationIndex &GetCommittedBundleLocationIndex() const {
+    return committed_bundle_location_index_;
+  }
+
   /// Schedule unplaced bundles of the specified placement group.
   /// If there is no available nodes then the `schedule_failed_handler` will be
   /// triggered, otherwise the bundle in placement_group will be added into a queue and

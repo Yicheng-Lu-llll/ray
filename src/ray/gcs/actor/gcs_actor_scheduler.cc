@@ -36,10 +36,12 @@ GcsActorScheduler::GcsActorScheduler(
     rpc::RayletClientPool &raylet_client_pool,
     rpc::CoreWorkerClientPool &worker_client_pool,
     ray::observability::MetricInterface &scheduler_placement_time_ms_histogram,
-    ClockInterface &clock)
+    ClockInterface &clock,
+    const BundleLocationIndex &committed_bundle_location_index)
     : io_context_(io_context),
       gcs_actor_table_(gcs_actor_table),
       gcs_node_manager_(gcs_node_manager),
+      committed_bundle_location_index_(committed_bundle_location_index),
       schedule_failure_handler_(std::move(schedule_failure_handler)),
       schedule_success_handler_(std::move(schedule_success_handler)),
       raylet_client_pool_(raylet_client_pool),
@@ -120,6 +122,20 @@ NodeID GcsActorScheduler::SelectForwardingNode(std::shared_ptr<GcsActor> actor) 
     }
   }
 
+  // An actor in a placement group can only run on a node holding one of the group's
+  // bundles, so forward the lease straight to one of them instead of to the owner's
+  // node. The bundle nodes have the bundle resources locally, while the owner's node
+  // only learns about them once they propagate through the syncer, which at large scale
+  // takes minutes -- until then the lease sits in the owner's node infeasible queue.
+  if (const auto bundle_id = lease_spec.PlacementGroupBundleId();
+      !bundle_id.first.IsNil()) {
+    const auto node_id = SelectCommittedBundleNode(
+        bundle_id, lease_spec.GetRequiredPlacementResources());
+    if (!node_id.IsNil()) {
+      return node_id;
+    }
+  }
+
   // If an actor has resource requirements, we will try to schedule it on the same node as
   // the owner if possible.
   if (!lease_spec.GetRequiredResources().IsEmpty()) {
@@ -131,6 +147,70 @@ NodeID GcsActorScheduler::SelectForwardingNode(std::shared_ptr<GcsActor> actor) 
   }
 
   return node ? NodeID::FromBinary(node->node_id()) : NodeID::Nil();
+}
+
+namespace {
+
+// Whether a bundle has enough of every resource the actor asks for. Both sides name
+// resources the same way here: an actor in a placement group has its resources rewritten
+// with the group's suffix before it is submitted (`AddPlacementGroupConstraint`), which
+// is how a bundle labels the resources it contributes to its node.
+bool BundleFits(const BundleSpecification &bundle,
+                const ResourceSet &required_placement_resources) {
+  const auto &bundle_resources = bundle.GetFormattedResources();
+  for (const auto &[name, amount] : required_placement_resources.GetResourceMap()) {
+    auto it = bundle_resources.find(name);
+    if (it == bundle_resources.end() || it->second < amount) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+NodeID GcsActorScheduler::SelectCommittedBundleNode(
+    const BundleID &bundle_id, const ResourceSet &required_placement_resources) {
+  if (bundle_id.second >= 0) {
+    // The actor is pinned to a bundle, and only that bundle's node has the resources
+    // that carry its index.
+    const auto node_id = committed_bundle_location_index_.GetBundleLocation(bundle_id);
+    if (node_id.has_value() && gcs_node_manager_.GetAliveNode(*node_id).has_value()) {
+      return *node_id;
+    }
+    return NodeID::Nil();
+  }
+
+  const auto bundle_locations =
+      committed_bundle_location_index_.GetBundleLocations(bundle_id.first);
+  if (!bundle_locations.has_value()) {
+    next_bundle_of_placement_group_.erase(bundle_id.first);
+    return NodeID::Nil();
+  }
+
+  // Any bundle the actor fits in works, so hand them out round-robin. Picking at random
+  // instead makes a group's actors collide on the same bundles while others stay empty:
+  // at 2k nodes that cost 2.2 lease requests per actor (versus one) as the bundle nodes
+  // rejected what did not fit and the actors had to be scheduled again.
+  const auto &locations = **bundle_locations;
+  size_t &next_bundle = next_bundle_of_placement_group_[bundle_id.first];
+  for (size_t i = 0; i < locations.size(); i++) {
+    auto it = locations.find(
+        std::make_pair(bundle_id.first, static_cast<int64_t>(next_bundle % locations.size())));
+    next_bundle++;
+    if (it == locations.end()) {
+      // The bundle indexes are not contiguous, which happens while the group is being
+      // rescheduled after a node died.
+      continue;
+    }
+    const auto &node_id = it->second.first;
+    if (it->second.second != nullptr &&
+        gcs_node_manager_.GetAliveNode(node_id).has_value() &&
+        BundleFits(*it->second.second, required_placement_resources)) {
+      return node_id;
+    }
+  }
+  return NodeID::Nil();
 }
 
 void GcsActorScheduler::Reschedule(std::shared_ptr<GcsActor> actor) {

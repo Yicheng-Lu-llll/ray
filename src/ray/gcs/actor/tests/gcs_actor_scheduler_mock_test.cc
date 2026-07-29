@@ -89,7 +89,8 @@ class GcsActorSchedulerMockTest : public Test {
         *client_pool,
         *worker_client_pool_,
         fake_scheduler_placement_time_ms_histogram_,
-        clock_);
+        clock_,
+        committed_bundle_location_index_);
     auto node_info = std::make_shared<rpc::GcsNodeInfo>();
     node_info->set_state(rpc::GcsNodeInfo::ALIVE);
     node_id = NodeID::FromRandom();
@@ -119,6 +120,7 @@ class GcsActorSchedulerMockTest : public Test {
   NodeID node_id;
   WorkerID worker_id;
   NodeID local_node_id;
+  BundleLocationIndex committed_bundle_location_index_;
 };
 
 TEST_F(GcsActorSchedulerMockTest, KillWorkerLeak1) {

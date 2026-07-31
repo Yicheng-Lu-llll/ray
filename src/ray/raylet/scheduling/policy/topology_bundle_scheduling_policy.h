@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/random/random.h"
 #include "ray/raylet/scheduling/cluster_resource_manager.h"
 #include "ray/raylet/scheduling/policy/scheduling_policy.h"
 
@@ -94,6 +95,10 @@ class TopologyStrictPackSchedulingPolicy : public TopologySchedulingPolicyInterf
       const SchedulingOptions &options,
       absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
       NodeScheduleFn node_schedule_fn) override;
+
+ private:
+  /// Random number generator used to visit topology groups in random order.
+  absl::BitGen bitgen_;
 };
 
 }  // namespace raylet_scheduling_policy

@@ -225,6 +225,7 @@ ray_cc_library(
     deps = [
         ":cluster_resource_manager",
         ":scheduling_policy",
+        "@com_google_absl//absl/random",
     ],
 )
 

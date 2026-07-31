@@ -14,6 +14,11 @@
 
 #include "ray/raylet/scheduling/policy/topology_bundle_scheduling_policy.h"
 
+#include <algorithm>
+#include <string>
+#include <utility>
+#include <vector>
+
 namespace ray {
 namespace raylet_scheduling_policy {
 
@@ -107,16 +112,30 @@ SchedulingResult TopologyStrictPackSchedulingPolicy::Schedule(
     return SchedulingResult::Infeasible();
   }
 
-  // Try each feasible group: call node-level scheduling and return on first success.
+  // On a retry, visit the groups in random order. A group can look free in a
+  // stale resource view and then fail bundle prepare on the raylets; replaying
+  // the same visiting order on the next scheduling attempt would keep picking
+  // that same group until the (slow) syncer refreshes the view, instead of
+  // reaching another genuinely free group. The first attempt keeps the stable
+  // order so that consecutive placement groups pack into the same groups.
+  std::vector<decltype(topology_groups)::value_type *> groups;
+  groups.reserve(topology_groups.size());
+  for (auto &group : topology_groups) {
+    groups.push_back(&group);
+  }
+  if (options.pg_scheduling_retry_) {
+    std::shuffle(groups.begin(), groups.end(), bitgen_);
+  }
+
   bool all_infeasible = true;
-  for (auto &[topology_value, topology_nodes] : topology_groups) {
-    if (!IsRequestFeasible(resource_request_list, topology_nodes)) {
+  for (auto *group : groups) {
+    if (!IsRequestFeasible(resource_request_list, group->second)) {
       continue;
     }
     SchedulingResult result =
-        node_schedule_fn(resource_request_list, options, std::move(topology_nodes));
+        node_schedule_fn(resource_request_list, options, std::move(group->second));
     if (result.status.IsSuccess()) {
-      result.selected_topology_assignment = std::make_pair(label_key, topology_value);
+      result.selected_topology_assignment = std::make_pair(label_key, group->first);
       return result;
     }
     if (!result.status.IsInfeasible()) {

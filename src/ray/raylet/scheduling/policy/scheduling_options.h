@@ -203,6 +203,10 @@ struct SchedulingOptions {
   // second: if set, constrains scheduling to this topology value
   //   (bundle rescheduling). If nullopt, a new group is selected.
   std::pair<std::string, std::optional<std::string>> target_topology_assignment_;
+  // Whether this placement group is being scheduled again after a failed
+  // attempt. Topology strategy scheduling visits groups in random order on a
+  // retry, since the previous choice may have been based on a stale view.
+  bool pg_scheduling_retry_ = false;
   // ID of the target node where bundles should be placed
   // iff the target node has enough available resources.
   // Otherwise, the bundles can be placed elsewhere.

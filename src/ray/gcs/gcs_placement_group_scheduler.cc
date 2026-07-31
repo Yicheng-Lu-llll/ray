@@ -79,6 +79,8 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
   }
 
   auto scheduling_options = CreateSchedulingOptions(*placement_group, strategy);
+  scheduling_options.pg_scheduling_retry_ =
+      placement_group->GetStats().scheduling_attempt() > 1;
   auto scheduling_result = cluster_resource_scheduler_.SchedulePlacementGroup(
       resource_request_list, scheduling_options);
 

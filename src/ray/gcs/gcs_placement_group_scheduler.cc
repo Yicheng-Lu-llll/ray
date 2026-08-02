@@ -758,24 +758,53 @@ bool GcsPlacementGroupScheduler::IsPlacementGroupWildcardResource(
   return resource_name_view.substr(idx, pattern.size()) == pattern;
 }
 
+FixedPoint GcsPlacementGroupScheduler::WildcardCapacityAlreadyCommitted(
+    const scheduling::NodeID &node_id,
+    const scheduling::ResourceID &resource_id,
+    const absl::flat_hash_set<BundleID, pair_hash> &bundles_being_committed) const {
+  FixedPoint total = 0;
+  const auto &locations =
+      committed_bundle_location_index_.GetBundleLocationsOnNode(NodeID::FromBinary(
+          node_id.Binary()));
+  if (!locations.has_value()) {
+    return total;
+  }
+  for (const auto &[bundle_id, location] : *locations.value()) {
+    if (bundles_being_committed.contains(bundle_id)) {
+      continue;
+    }
+    const auto &formatted = location.second->GetFormattedResources();
+    auto it = formatted.find(resource_id.Binary());
+    if (it != formatted.end()) {
+      total += FixedPoint(it->second);
+    }
+  }
+  return total;
+}
+
 void GcsPlacementGroupScheduler::CommitBundleResources(
     const std::shared_ptr<BundleLocations> &bundle_locations) {
   // Acquire bundle resources from gcs resources manager.
   auto &cluster_resource_manager =
       cluster_resource_scheduler_.GetClusterResourceManager();
   auto node_bundle_resources_map = ToNodeBundleResourcesMap(bundle_locations);
+  absl::flat_hash_set<BundleID, pair_hash> bundle_ids;
+  for (const auto &[bundle_id, _] : *bundle_locations) {
+    bundle_ids.insert(bundle_id);
+  }
   for (const auto &[node_id, node_bundle_resources] : node_bundle_resources_map) {
     for (const auto &resource_id : node_bundle_resources.ResourceIds()) {
-      // A placement group's wildcard resource has to be the sum of all related bundles.
-      // Even though `ToNodeBundleResourcesMap` has already considered this,
-      // it misses the scenario in which single (or subset of) bundle is rescheduled.
-      // When commiting this single bundle, its wildcard resource would wrongly overwrite
-      // the existing value, unless using the following additive operation.
       auto capacity = node_bundle_resources.Get(resource_id);
       if (IsPlacementGroupWildcardResource(resource_id.Binary())) {
+        // A wildcard resource is the sum of the group's bundles on this node, so the
+        // bundles being committed here have to be added to the ones already there.
+        // Take those from the committed-bundle index rather than from the resource
+        // view: reading the view back would count these bundles twice whenever the
+        // same commit is replayed, which is what GCS does for a placement group it
+        // left in PREPARED. The raylet skips a duplicate commit silently, so nothing
+        // would walk the doubled capacity back.
         auto new_capacity =
-            capacity +
-            cluster_resource_manager.GetNodeResources(node_id).total.Get(resource_id);
+            capacity + WildcardCapacityAlreadyCommitted(node_id, resource_id, bundle_ids);
         cluster_resource_manager.UpdateResourceCapacity(
             node_id, resource_id, new_capacity.Double());
       } else {

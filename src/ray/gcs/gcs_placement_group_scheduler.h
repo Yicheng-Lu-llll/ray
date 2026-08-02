@@ -449,6 +449,13 @@ class GcsPlacementGroupScheduler : public GcsPlacementGroupSchedulerInterface {
   /// Commit the bundle resources to the cluster resources.
   void CommitBundleResources(const std::shared_ptr<BundleLocations> &bundle_locations);
 
+  /// How much of a placement group's wildcard resource the bundles already committed on
+  /// this node account for, ignoring the ones being committed right now.
+  FixedPoint WildcardCapacityAlreadyCommitted(
+      const scheduling::NodeID &node_id,
+      const scheduling::ResourceID &resource_id,
+      const absl::flat_hash_set<BundleID, pair_hash> &bundles_being_committed) const;
+
   /// Create scheduling context.
   std::unique_ptr<BundleSchedulingContext> CreateSchedulingContext(
       const PlacementGroupID &placement_group_id);

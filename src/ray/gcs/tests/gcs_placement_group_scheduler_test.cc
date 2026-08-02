@@ -1526,5 +1526,54 @@ TEST_F(GcsPlacementGroupSchedulerTest,
   WaitPlacementGroupPendingDone(2, GcsPlacementGroupStatus::SUCCESS);
 }
 
+// A placement group's wildcard resource is the sum of its bundles on a node, so
+// committing one bundle has to add to whatever the node already holds for that group.
+// Reading that base out of the resource view makes the commit non-idempotent: when GCS
+// restarts and recommits a placement group the raylet had already committed, the raylet
+// skips the duplicate and broadcasts nothing, so nothing walks the doubled capacity back.
+TEST_F(GcsPlacementGroupSchedulerTest, RecommitAfterRestartDoesNotDoubleWildcardCapacity) {
+  auto node = GenNodeInfo(0);
+  AddNode(node, /*cpu_num=*/8);
+  const NodeID node_id = NodeID::FromBinary(node->node_id());
+
+  auto placement_group = MakeStrictPackPlacementGroup(/*bundles_count=*/1,
+                                                      /*cpu_per_bundle=*/4);
+  placement_group->GetMutableBundle(0)->set_node_id(node->node_id());
+  const auto wildcard = "CPU_group_" + placement_group->GetPlacementGroupID().Hex();
+
+  // The raylet committed this bundle before GCS died, so its next ResourceView
+  // reports the group resource. GCS applies it while the recommit is in flight.
+  {
+    rpc::syncer::ResourceViewSyncMessage msg;
+    (*msg.mutable_resources_total())["CPU"] = 8;
+    (*msg.mutable_resources_available())["CPU"] = 4;
+    (*msg.mutable_resources_total())[wildcard] = 4;
+    (*msg.mutable_resources_available())[wildcard] = 4;
+    gcs_resource_manager_->UpdateFromResourceView(node_id, msg);
+  }
+
+  // GCS restarts and recommits the placement group it left in PREPARED.
+  scheduler_->Initialize(/*committed_bundles=*/{},
+                         {SchedulePgRequest{
+                             placement_group,
+                             [](std::shared_ptr<GcsPlacementGroup>, bool) {},
+                             [](std::shared_ptr<GcsPlacementGroup>) {}}});
+  WaitPendingDone(raylet_clients_[0]->commit_callbacks, 1);
+  ASSERT_TRUE(raylet_clients_[0]->GrantCommitBundleResources());
+
+  auto total_for = [this, node_id](const std::string &name) {
+    auto resources = cluster_resource_scheduler_->GetClusterResourceManager()
+                         .GetNodeResources(scheduling::NodeID(node_id.Binary()))
+                         .total.GetResourceMap();
+    auto it = resources.find(name);
+    return it != resources.end() ? it->second : 0.0;
+  };
+  ASSERT_TRUE(WaitForCondition([&]() { return total_for(wildcard) != 0; }, 3000));
+  ASSERT_EQ(total_for(wildcard), 4)
+      << "recommitting a bundle the raylet already holds added its group capacity a "
+         "second time; the raylet skips duplicate commits silently, so nothing corrects "
+         "this";
+}
+
 }  // namespace gcs
 }  // namespace ray

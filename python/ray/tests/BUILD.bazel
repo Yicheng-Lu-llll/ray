@@ -945,6 +945,7 @@ py_test_module_list(
     files = [
         "test_actor_advanced.py",
         "test_gcs_fault_tolerance.py",
+        "test_pg_wildcard_e2e.py",
     ],
     tags = [
         "exclusive",

@@ -92,9 +92,20 @@ void ActorCreationSubmitter::RequestLease(const ActorID &actor_id,
           // leases never expire, so the lease must not be abandoned: retry
           // with the same lease id, which the raylet answers idempotently.
           const rpc::Address retry_address = e.current_raylet_address;
-          RetryAfterBackoff([this, actor_id, retry_address, is_spillback]() {
-            RequestLease(actor_id, retry_address, is_spillback, /*reuse_lease_id=*/true);
-          });
+          RetryAfterBackoff(
+              [this, actor_id, retry_address, is_spillback, issued_lease_id]() {
+                // Reuse only if this is still the same lease generation: the
+                // entry may have been cancelled and resubmitted while the
+                // retry was pending, and replaying a new generation's lease
+                // id at the old raylet would double-grant it.
+                auto retry_it = creations_.find(actor_id);
+                if (retry_it == creations_.end() ||
+                    retry_it->second.lease_id != issued_lease_id) {
+                  return;
+                }
+                RequestLease(
+                    actor_id, retry_address, is_spillback, /*reuse_lease_id=*/true);
+              });
           return;
         }
         if (reply.canceled()) {
@@ -138,9 +149,20 @@ void ActorCreationSubmitter::RequestLease(const ActorID &actor_id,
           const rpc::Address retry_address = e.current_raylet_address;
           RAY_LOG(WARNING).WithField(actor_id)
               << "Lease reply carried no actionable outcome; retrying.";
-          RetryAfterBackoff([this, actor_id, retry_address, is_spillback]() {
-            RequestLease(actor_id, retry_address, is_spillback, /*reuse_lease_id=*/true);
-          });
+          RetryAfterBackoff(
+              [this, actor_id, retry_address, is_spillback, issued_lease_id]() {
+                // Reuse only if this is still the same lease generation: the
+                // entry may have been cancelled and resubmitted while the
+                // retry was pending, and replaying a new generation's lease
+                // id at the old raylet would double-grant it.
+                auto retry_it = creations_.find(actor_id);
+                if (retry_it == creations_.end() ||
+                    retry_it->second.lease_id != issued_lease_id) {
+                  return;
+                }
+                RequestLease(
+                    actor_id, retry_address, is_spillback, /*reuse_lease_id=*/true);
+              });
           return;
         }
         // Granted. The lease is held for the actor's lifetime: it is never

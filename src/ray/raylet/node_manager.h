@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -344,6 +345,29 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   void HandleFreeLocalObjects(rpc::FreeLocalObjectsRequest request,
                               rpc::FreeLocalObjectsReply *reply,
                               rpc::SendReplyCallback send_reply_callback) override;
+
+  /// What caused a client disconnect. Grades the dead-worker tombstone: a
+  /// disconnect triggered by connection EOF means the process has already
+  /// exited (exit-grade); any disconnect of a still-running process (raylet-
+  /// or worker-initiated) records pending-exit until the exit is observed.
+  enum class DisconnectTrigger {
+    kConnectionEof,
+    kRayletInitiated,
+    kWorkerInitiated,
+  };
+
+  /// Record a tombstone for a disconnecting worker/driver. Exit-grade when the
+  /// disconnect was triggered by connection EOF (the process already exited),
+  /// pending-exit otherwise.
+  void RecordWorkerTombstone(const WorkerID &worker_id, DisconnectTrigger trigger);
+
+  /// Upgrade a pending-exit tombstone to exit-grade once the worker process
+  /// is observed to have exited. Safe to call for unknown ids.
+  void MarkWorkerExitObserved(const WorkerID &worker_id);
+
+  void HandleGetWorkerLiveness(rpc::GetWorkerLivenessRequest request,
+                               rpc::GetWorkerLivenessReply *reply,
+                               rpc::SendReplyCallback send_reply_callback) override;
 
   void HandleIsLocalWorkerDead(rpc::IsLocalWorkerDeadRequest request,
                                rpc::IsLocalWorkerDeadReply *reply,
@@ -756,6 +780,7 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// \param disconnect_detail Disconnection information in details.
   /// \param client_error_message Extra error messages about this disconnection
   void DisconnectClient(const std::shared_ptr<ClientConnection> &client,
+                        DisconnectTrigger trigger,
                         bool graceful,
                         rpc::WorkerExitType disconnect_type,
                         const std::string &disconnect_detail,
@@ -922,6 +947,19 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
 
   /// Map of leased workers to their lease ids.
   absl::flat_hash_map<LeaseID, std::shared_ptr<WorkerInterface>> &leased_workers_;
+
+  /// Dead-worker tombstones: the local authority for "this worker was
+  /// registered here and died". Written on every disconnect; grade depends on
+  /// the disconnect trigger. Pending records are non-evictable until the exit
+  /// is observed (or, TODO(ownership): the kill deadline fires -> deadline-
+  /// grade); exit-grade records are evicted FIFO beyond the cap.
+  struct WorkerTombstone {
+    bool exit_observed = false;
+  };
+  absl::flat_hash_map<WorkerID, WorkerTombstone> worker_tombstones_;
+  /// FIFO of tombstoned ids for eviction (skips entries still pending).
+  std::deque<WorkerID> worker_tombstone_fifo_;
+  static constexpr size_t kWorkerTombstoneCapacity = 10000;
 
   /// Optional extra information about why the worker failed.
   absl::flat_hash_map<LeaseID, ray::TaskFailureEntry> worker_failure_reasons_;

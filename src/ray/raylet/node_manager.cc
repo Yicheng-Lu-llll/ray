@@ -141,10 +141,14 @@ void SchedulePostExitProcessGroupCleanup(
     std::shared_ptr<boost::asio::deadline_timer> timer,
     pid_t worker_pid,
     pid_t pgid,
-    WorkerID wid) {
+    WorkerID wid,
+    std::function<void()> on_exit_observed) {
   // If the worker process has exited, sweep its (now leaderless) process group
   // to reap any orphaned descendants it left behind, then stop.
   if (kill(worker_pid, 0) == -1 && errno == ESRCH) {
+    if (on_exit_observed) {
+      on_exit_observed();
+    }
     auto probe = KillProcessGroup(pgid, 0);
     const bool group_absent = (probe && probe->value() == ESRCH);
     if (!group_absent) {
@@ -159,11 +163,14 @@ void SchedulePostExitProcessGroupCleanup(
   // 100ms poll is negligible overhead in that case (and stops when the raylet's
   // io_context shuts down and cancels the timer).
   timer->expires_from_now(boost::posix_time::milliseconds(kGracefulPgCleanupPollMs));
-  timer->async_wait([timer, worker_pid, pgid, wid](const boost::system::error_code &ec) {
-    if (!ec) {
-      SchedulePostExitProcessGroupCleanup(timer, worker_pid, pgid, wid);
-    }
-  });
+  timer->async_wait(
+      [timer, worker_pid, pgid, wid, on_exit_observed = std::move(on_exit_observed)](
+          const boost::system::error_code &ec) mutable {
+        if (!ec) {
+          SchedulePostExitProcessGroupCleanup(
+              timer, worker_pid, pgid, wid, std::move(on_exit_observed));
+        }
+      });
 }
 #endif
 
@@ -573,8 +580,11 @@ void NodeManager::DestroyWorker(std::shared_ptr<WorkerInterface> worker,
   // We should disconnect the client first. Otherwise, we'll remove bundle resources
   // before actual resources are returned. Subsequent disconnect request that comes
   // due to worker dead will be ignored.
-  DisconnectClient(
-      worker->Connection(), /*graceful=*/false, disconnect_type, disconnect_detail);
+  DisconnectClient(worker->Connection(),
+                   DisconnectTrigger::kRayletInitiated,
+                   /*graceful=*/false,
+                   disconnect_type,
+                   disconnect_detail);
   worker->KillAsync(io_service_, force);
   if (disconnect_type == rpc::WorkerExitType::SYSTEM_ERROR) {
     number_workers_killed_++;
@@ -1172,8 +1182,11 @@ void NodeManager::HandleClientConnectionError(
   }
 
   // Disconnect the client and don't process more messages.
-  DisconnectClient(
-      client, /*graceful=*/false, ray::rpc::WorkerExitType::SYSTEM_ERROR, err_msg);
+  DisconnectClient(client,
+                   DisconnectTrigger::kConnectionEof,
+                   /*graceful=*/false,
+                   ray::rpc::WorkerExitType::SYSTEM_ERROR,
+                   err_msg);
 }
 
 void NodeManager::ProcessClientMessage(const std::shared_ptr<ClientConnection> &client,
@@ -1309,6 +1322,7 @@ Status NodeManager::ProcessRegisterClientRequestMessageImpl(
         [this, client](const ray::Status &write_msg_status) {
           if (!write_msg_status.ok()) {
             DisconnectClient(client,
+                             DisconnectTrigger::kRayletInitiated,
                              /*graceful=*/false,
                              rpc::WorkerExitType::SYSTEM_ERROR,
                              "Worker is failed because the raylet couldn't reply the "
@@ -1420,6 +1434,7 @@ void NodeManager::SendPortAnnouncementResponse(
       [this, client](const ray::Status &write_msg_status) {
         if (!write_msg_status.ok()) {
           DisconnectClient(client,
+                           DisconnectTrigger::kRayletInitiated,
                            /*graceful=*/false,
                            rpc::WorkerExitType::SYSTEM_ERROR,
                            "Failed to send AnnounceWorkerPortReply to client: " +
@@ -1481,6 +1496,7 @@ void SendDisconnectClientReply(const WorkerID &worker_id,
 }  // namespace
 
 void NodeManager::DisconnectClient(const std::shared_ptr<ClientConnection> &client,
+                                   DisconnectTrigger trigger,
                                    bool graceful,
                                    rpc::WorkerExitType disconnect_type,
                                    const std::string &disconnect_detail,
@@ -1505,6 +1521,10 @@ void NodeManager::DisconnectClient(const std::shared_ptr<ClientConnection> &clie
   }
 
   RAY_CHECK(is_worker != is_driver) << "Client must be a registered worker or driver.";
+
+  // Tombstone the worker before it leaves the registry: "seen-and-died" must
+  // stay distinguishable from "never seen".
+  RecordWorkerTombstone(worker->WorkerId(), trigger);
 
   // Clean up any open ray.get or ray.wait calls that the worker made.
   lease_dependency_manager_.CancelGetRequest(worker->WorkerId());
@@ -1639,7 +1659,10 @@ void NodeManager::DisconnectClient(const std::shared_ptr<ClientConnection> &clie
           // Poll for the worker process to exit, then sweep its process group.
           const pid_t worker_pid = worker->GetProcess().GetId();
           auto timer = std::make_shared<boost::asio::deadline_timer>(io_service_);
-          SchedulePostExitProcessGroupCleanup(std::move(timer), worker_pid, pgid, wid);
+          SchedulePostExitProcessGroupCleanup(
+              std::move(timer), worker_pid, pgid, wid, [this, wid]() {
+                MarkWorkerExitObserved(wid);
+              });
         }
       }
     }
@@ -1706,6 +1729,7 @@ void NodeManager::ProcessDisconnectClientMessage(
         reinterpret_cast<const char *>(exception_pb->data()), exception_pb->size()));
   }
   DisconnectClient(client,
+                   DisconnectTrigger::kWorkerInitiated,
                    /*graceful=*/true,
                    disconnect_type,
                    disconnect_detail,
@@ -1760,8 +1784,11 @@ void NodeManager::ProcessWaitRequestMessage(
       // We failed to write to the client, so disconnect the client.
       std::ostringstream stream;
       stream << "Failed to write WaitReply to the client. Status " << status;
-      DisconnectClient(
-          client, /*graceful=*/false, rpc::WorkerExitType::SYSTEM_ERROR, stream.str());
+      DisconnectClient(client,
+                       DisconnectTrigger::kRayletInitiated,
+                       /*graceful=*/false,
+                       rpc::WorkerExitType::SYSTEM_ERROR,
+                       stream.str());
     }
     return;
   }
@@ -1790,6 +1817,7 @@ void NodeManager::ProcessWaitRequestMessage(
           std::ostringstream stream;
           stream << "Failed to write WaitReply to the client. Status " << status;
           DisconnectClient(client,
+                           DisconnectTrigger::kRayletInitiated,
                            /*graceful=*/false,
                            rpc::WorkerExitType::SYSTEM_ERROR,
                            stream.str());
@@ -2208,6 +2236,7 @@ void NodeManager::HandleReturnWorkerLease(rpc::ReturnWorkerLeaseRequest request,
     // The worker should be destroyed.
     DisconnectClient(
         worker->Connection(),
+        DisconnectTrigger::kRayletInitiated,
         /*graceful=*/false,
         rpc::WorkerExitType::SYSTEM_ERROR,
         absl::StrCat("The leased worker has unrecoverable failure. Worker is requested "
@@ -2228,6 +2257,59 @@ void NodeManager::HandleReturnWorkerLease(rpc::ReturnWorkerLeaseRequest request,
   }
 
   send_reply_callback(Status::OK(), nullptr, nullptr);
+}
+
+void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
+                                        DisconnectTrigger trigger) {
+  WorkerTombstone tombstone;
+  tombstone.exit_observed = (trigger == DisconnectTrigger::kConnectionEof);
+  worker_tombstones_[worker_id] = tombstone;
+  worker_tombstone_fifo_.push_back(worker_id);
+  // Evict oldest non-pending records beyond the cap. Pending records are
+  // non-evictable until their exit is observed, so a pending record at the
+  // head blocks eviction (bounded in practice by pending convergence;
+  // TODO(ownership): deadline-grade upgrade removes the unbounded case).
+  while (worker_tombstones_.size() > kWorkerTombstoneCapacity &&
+         !worker_tombstone_fifo_.empty()) {
+    const WorkerID victim = worker_tombstone_fifo_.front();
+    auto it = worker_tombstones_.find(victim);
+    if (it != worker_tombstones_.end() && !it->second.exit_observed) {
+      break;
+    }
+    worker_tombstone_fifo_.pop_front();
+    if (it != worker_tombstones_.end()) {
+      worker_tombstones_.erase(it);
+    }
+  }
+}
+
+void NodeManager::MarkWorkerExitObserved(const WorkerID &worker_id) {
+  auto it = worker_tombstones_.find(worker_id);
+  if (it != worker_tombstones_.end()) {
+    it->second.exit_observed = true;
+  }
+}
+
+void NodeManager::HandleGetWorkerLiveness(rpc::GetWorkerLivenessRequest request,
+                                          rpc::GetWorkerLivenessReply *reply,
+                                          rpc::SendReplyCallback send_reply_callback) {
+  const auto worker_id = WorkerID::FromBinary(request.worker_id());
+  reply->set_node_id(self_node_id_.Binary());
+  if (worker_pool_.GetRegisteredWorker(worker_id) != nullptr ||
+      worker_pool_.GetRegisteredDriver(worker_id) != nullptr) {
+    reply->set_status(rpc::GetWorkerLivenessReply::ALIVE);
+  } else if (auto it = worker_tombstones_.find(worker_id);
+             it != worker_tombstones_.end()) {
+    if (it->second.exit_observed) {
+      reply->set_status(rpc::GetWorkerLivenessReply::DEAD);
+      reply->set_exit_grade(true);
+    } else {
+      reply->set_status(rpc::GetWorkerLivenessReply::PENDING);
+    }
+  } else {
+    reply->set_status(rpc::GetWorkerLivenessReply::UNKNOWN);
+  }
+  send_reply_callback(Status::OK(), /*success=*/nullptr, /*failure=*/nullptr);
 }
 
 void NodeManager::HandleIsLocalWorkerDead(rpc::IsLocalWorkerDeadRequest request,

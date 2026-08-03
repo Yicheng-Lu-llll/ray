@@ -406,6 +406,33 @@ message IsLocalWorkerDeadReply {
   bool is_dead = 1;
 }
 
+message GetWorkerLivenessRequest {
+  // Binary worker id of the target worker (worker or driver).
+  bytes worker_id = 1;
+}
+
+message GetWorkerLivenessReply {
+  enum Status {
+    // This raylet has no record of the worker (never registered here, or the
+    // tombstone has been evicted). Not a death verdict by itself; the caller
+    // must combine it with the routing check (node_id below).
+    UNKNOWN = 0;
+    // Currently registered (worker or driver).
+    ALIVE = 1;
+    // Disconnected, process exit not yet observed (graceful-kill window).
+    PENDING = 2;
+    // Tombstoned: exit observed (exit_grade=true) or the kill deadline fired
+    // after SIGKILL (exit_grade=false).
+    DEAD = 3;
+  }
+  Status status = 1;
+  // Only meaningful when status == DEAD.
+  bool exit_grade = 2;
+  // NodeID of the answering raylet so the caller can verify it reached the
+  // node recorded in the actor/worker handle.
+  bytes node_id = 3;
+}
+
 message GetWorkerPIDsRequest {}
 
 message GetWorkerPIDsReply {
@@ -578,6 +605,9 @@ service NodeManagerService {
   // Failure: Is currently only used when grpc channel is unavailable for retryable core
   // worker clients. The unavailable callback will eventually be retried so if this fails.
   rpc IsLocalWorkerDead(IsLocalWorkerDeadRequest) returns (IsLocalWorkerDeadReply);
+  // Four-state liveness of a worker/driver this raylet may have hosted, backed
+  // by the dead-worker tombstone ledger.
+  rpc GetWorkerLiveness(GetWorkerLivenessRequest) returns (GetWorkerLivenessReply);
   // Get the PIDs of all workers currently alive that are managed by the local Raylet.
   // This includes connected driver processes but excludes system drivers (with namespace
   // prefix "_ray_internal_")

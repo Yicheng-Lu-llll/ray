@@ -84,10 +84,11 @@ class ActorCreationSubmitter {
                       CreationCallback callback);
 
   /// Cancel a creation that has not been granted yet, looping the cancel
-  /// until it converges: a cancel racing ahead of the lease request is
-  /// retried, and a grant that wins the race flips the answer to false so
-  /// the caller can take the kill path instead. The callback receives true
-  /// iff no worker was (or will be) granted for this creation.
+  /// until it converges. When a creation ends cancelled, cancel callbacks
+  /// fire before the creation callback. Convergence: a cancel racing ahead of the lease
+  /// request is retried, and a grant that wins the race flips the answer to false so the
+  /// caller can take the kill path instead. The callback receives true iff no worker was
+  /// (or will be) granted for this creation.
   void CancelCreation(const ActorID &actor_id,
                       std::function<void(bool cancelled)> callback);
 
@@ -103,7 +104,6 @@ class ActorCreationSubmitter {
     kPendingLease,
     kPushing,
     kAlive,
-    kCancelled,
   };
 
   struct CreationEntry {

@@ -201,13 +201,12 @@ void ActorCreationSubmitter::PushCreationTask(const ActorID &actor_id) {
           callback(result);
           return;
         }
+        // No cancel callbacks can exist here: they are only registered in
+        // kPendingLease and are detached at grant time.
+        RAY_CHECK(e.cancel_callbacks.empty());
         auto callback = std::move(e.callback);
-        auto cancel_callbacks = std::move(e.cancel_callbacks);
         creations_.erase(entry_it);
         callback(result);
-        for (auto &cancel_callback : cancel_callbacks) {
-          cancel_callback(/*cancelled=*/true);
-        }
       });
 }
 
@@ -215,7 +214,7 @@ void ActorCreationSubmitter::CancelCreation(const ActorID &actor_id,
                                             std::function<void(bool)> callback) {
   RAY_CHECK(thread_checker_.IsOnSameThread());
   auto it = creations_.find(actor_id);
-  if (it == creations_.end() || it->second.state == CreationState::kCancelled) {
+  if (it == creations_.end()) {
     // No live creation: no worker exists or will exist under this entry.
     callback(/*cancelled=*/true);
     return;
@@ -320,9 +319,9 @@ void ActorCreationSubmitter::RetryAfterBackoff(std::function<void()> fn) {
 
 std::optional<LeaseID> ActorCreationSubmitter::GetGrantedLease(
     const ActorID &actor_id) const {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
   auto it = creations_.find(actor_id);
-  if (it == creations_.end() || it->second.state == CreationState::kPendingLease ||
-      it->second.state == CreationState::kCancelled) {
+  if (it == creations_.end() || it->second.state == CreationState::kPendingLease) {
     return std::nullopt;
   }
   return it->second.lease_id;

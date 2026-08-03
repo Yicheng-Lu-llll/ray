@@ -779,8 +779,9 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// process has exited: a single timer regardless of the number of pending
   /// records. TODO(ownership): zombies (unreaped drivers) and pid reuse both
   /// fool kill(pid,0) — needs start-time identity and the deadline-grade
-  /// escalation; on Windows the probe treats processes as alive, so pending
-  /// records only converge via explicit MarkWorkerExitObserved.
+  /// escalation. On Windows there is no exit observation: records stay
+  /// pending (never reported DEAD from a tombstone) and are made evictable
+  /// at record time so the ledger stays bounded.
   void ScanPendingTombstones();
 
   /// Evict oldest evictable tombstones beyond the cap.

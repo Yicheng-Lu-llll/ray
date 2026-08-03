@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "ray/raylet/node_manager.h"
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -46,6 +48,7 @@
 #include "ray/pubsub/fake_subscriber.h"
 #include "ray/raylet/fake_worker.h"
 #include "ray/raylet/local_object_manager_interface.h"
+#include "ray/raylet/node_manager.h"
 #include "ray/raylet/scheduling/cluster_lease_manager.h"
 #include "ray/raylet/tests/util.h"
 #include "ray/raylet_rpc_client/fake_raylet_client.h"
@@ -547,6 +550,7 @@ TEST_F(NodeManagerTest, HandleGetWorkerLivenessRegisteredWorkerIsAlive) {
   EXPECT_EQ(reply.status(), rpc::GetWorkerLivenessReply::ALIVE);
 }
 
+#ifndef _WIN32
 TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingThenExitObserved) {
   // A raylet-initiated disconnect records a pending tombstone; observing the
   // exit upgrades it to exit-grade DEAD.
@@ -581,6 +585,7 @@ TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingThenExitObserved) {
   EXPECT_EQ(dead_reply.status(), rpc::GetWorkerLivenessReply::DEAD);
   EXPECT_EQ(dead_reply.grade(), rpc::GetWorkerLivenessReply::EXIT);
 }
+#endif  // !_WIN32
 
 TEST_F(NodeManagerTest, HandleGetWorkerLivenessEofDisconnectIsDead) {
   // Without a live process to verify against, a connection-EOF disconnect is
@@ -606,6 +611,7 @@ TEST_F(NodeManagerTest, HandleGetWorkerLivenessEofDisconnectIsDead) {
   EXPECT_EQ(reply.grade(), rpc::GetWorkerLivenessReply::EXIT);
 }
 
+#ifndef _WIN32
 TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingIsRetainedNotBlocking) {
   // A pending record is retained under eviction pressure and does not block
   // eviction of exit-grade records recorded after it.
@@ -622,11 +628,13 @@ TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingIsRetainedNotBlocking) {
   EXPECT_TRUE(node_manager_->worker_tombstones_.contains(pending_id));
   EXPECT_FALSE(node_manager_->worker_tombstones_.at(pending_id).exit_observed);
 }
+#endif  // !_WIN32
 
 TEST_F(NodeManagerTest, MarkWorkerExitObservedUnknownIdIsSafe) {
   node_manager_->MarkWorkerExitObserved(WorkerID::FromRandom());
 }
 
+#ifndef _WIN32
 TEST_F(NodeManagerTest, ScanPendingTombstonesUpgradesExitedPids) {
   // A pending record whose process still runs stays pending across scans; a
   // pending record whose pid does not exist is upgraded to exit-grade.
@@ -642,6 +650,7 @@ TEST_F(NodeManagerTest, ScanPendingTombstonesUpgradesExitedPids) {
   EXPECT_FALSE(node_manager_->worker_tombstones_.at(live_id).exit_observed);
   EXPECT_TRUE(node_manager_->worker_tombstones_.at(dead_id).exit_observed);
 }
+#endif  // !_WIN32
 
 TEST_F(NodeManagerTest, HandleIsLocalWorkerDeadUnknownWorker) {
   WorkerID worker_id = WorkerID::FromRandom();

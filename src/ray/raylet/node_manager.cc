@@ -2265,20 +2265,22 @@ void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
     exited = false;
   }
 #endif
-#ifdef _WIN32
-  // No exit-observation primitive on Windows: record disconnect-grade as
-  // observed so the ledger stays bounded. This matches the pre-existing
-  // IsLocalWorkerDead semantics on that platform.
-  exited = true;
-#endif
   WorkerTombstone tombstone;
   tombstone.exit_observed = exited;
   tombstone.pid = pid;
   worker_tombstones_[worker_id] = tombstone;
+#ifdef _WIN32
+  // No exit-observation primitive on Windows: pending records stay pending
+  // (DEAD is never reported from a tombstone there) but are made evictable so
+  // the ledger stays bounded.
+  worker_tombstone_fifo_.push_back(worker_id);
+  EvictWorkerTombstones();
+#else
   if (exited) {
     worker_tombstone_fifo_.push_back(worker_id);
     EvictWorkerTombstones();
   }
+#endif
 }
 
 void NodeManager::ScanPendingTombstones() {
@@ -2309,8 +2311,12 @@ void NodeManager::MarkWorkerExitObserved(const WorkerID &worker_id) {
   auto it = worker_tombstones_.find(worker_id);
   if (it != worker_tombstones_.end() && !it->second.exit_observed) {
     it->second.exit_observed = true;
+#ifndef _WIN32
+    // On Windows the record is already in the eviction FIFO (see
+    // RecordWorkerTombstone).
     worker_tombstone_fifo_.push_back(worker_id);
     EvictWorkerTombstones();
+#endif
   }
 }
 

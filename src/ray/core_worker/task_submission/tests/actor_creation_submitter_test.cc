@@ -76,7 +76,19 @@ class ActorCreationSubmitterTest : public ::testing::Test {
             [this](const rpc::Address &) { return raylet_client_; })),
         core_worker_client_pool_(std::make_shared<rpc::CoreWorkerClientPool>(
             [this](const rpc::Address &) { return worker_client_; })),
-        submitter_(OwnerAddress(), raylet_client_pool_, core_worker_client_pool_) {}
+        submitter_(OwnerAddress(),
+                   raylet_client_pool_,
+                   core_worker_client_pool_,
+                   io_service_,
+                   /*retry_backoff_ms=*/0) {}
+
+  /// Run deferred backoff retries to completion.
+  void PumpBackoff() {
+    for (int i = 0; i < 10; i++) {
+      io_service_.restart();
+      io_service_.poll();
+    }
+  }
 
   static rpc::Address OwnerAddress() {
     rpc::Address address;
@@ -89,6 +101,7 @@ class ActorCreationSubmitterTest : public ::testing::Test {
   std::shared_ptr<PushRecordingWorkerClient> worker_client_;
   std::shared_ptr<rpc::RayletClientPool> raylet_client_pool_;
   std::shared_ptr<rpc::CoreWorkerClientPool> core_worker_client_pool_;
+  instrumented_io_context io_service_;
   ActorCreationSubmitter submitter_;
 };
 
@@ -155,8 +168,10 @@ TEST_F(ActorCreationSubmitterTest, CancelBeforeGrantConverges) {
     cancelled = c;
   });
   EXPECT_EQ(raylet_client_->num_leases_canceled, 1);
-  // First cancel raced ahead of the lease: not yet queued -> retried.
+  // First cancel raced ahead of the lease: not yet queued -> retried after
+  // the (zero) backoff.
   ASSERT_TRUE(raylet_client_->ReplyCancelWorkerLease(/*success=*/false));
+  PumpBackoff();
   EXPECT_EQ(raylet_client_->num_leases_canceled, 2);
   ASSERT_TRUE(raylet_client_->ReplyCancelWorkerLease(/*success=*/true));
   EXPECT_TRUE(cancel_done);
@@ -182,6 +197,85 @@ TEST_F(ActorCreationSubmitterTest, GrantWinningTheCancelRaceFlipsTheAnswer) {
       "1.2.3.4", 1234, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
   EXPECT_TRUE(cancel_done);
   EXPECT_FALSE(cancelled);
+}
+
+TEST_F(ActorCreationSubmitterTest, RejectedSpillbackRetriesAtFirstHop) {
+  const ActorID actor_id =
+      ActorID::Of(JobID::FromInt(5), TaskID::Nil(), /*parent_task_counter=*/1);
+  submitter_.SubmitCreation(BuildCreationTaskSpec(actor_id),
+                            RayletAddress(NodeID::FromRandom()),
+                            [](const ActorCreationSubmitter::CreationResult &) {});
+  // Spill to a target, which then rejects; the retry goes back through the
+  // first hop (request #3).
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "5.6.7.8", 5678, WorkerID::Nil(), NodeID::Nil(), NodeID::FromRandom()));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease("5.6.7.8",
+                                               5678,
+                                               WorkerID::FromRandom(),
+                                               NodeID::FromRandom(),
+                                               NodeID::Nil(),
+                                               Status::OK(),
+                                               /*rejected=*/true));
+  EXPECT_EQ(raylet_client_->num_workers_requested, 3);
+}
+
+TEST_F(ActorCreationSubmitterTest, LeaseTransportFailureRetriesSameLease) {
+  const ActorID actor_id =
+      ActorID::Of(JobID::FromInt(6), TaskID::Nil(), /*parent_task_counter=*/1);
+  bool done = false;
+  submitter_.SubmitCreation(
+      BuildCreationTaskSpec(actor_id),
+      RayletAddress(NodeID::FromRandom()),
+      [&](const ActorCreationSubmitter::CreationResult &) { done = true; });
+  // A transport failure must not abandon the (never-expiring) lease.
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease("",
+                                               0,
+                                               WorkerID::Nil(),
+                                               NodeID::Nil(),
+                                               NodeID::Nil(),
+                                               Status::IOError("lost reply")));
+  EXPECT_FALSE(done);
+  PumpBackoff();
+  EXPECT_EQ(raylet_client_->num_workers_requested, 2);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "1.2.3.4", 1234, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  EXPECT_TRUE(done);
+}
+
+TEST_F(ActorCreationSubmitterTest, DoubleCancelBothCallbacksFire) {
+  const ActorID actor_id =
+      ActorID::Of(JobID::FromInt(7), TaskID::Nil(), /*parent_task_counter=*/1);
+  submitter_.SubmitCreation(BuildCreationTaskSpec(actor_id),
+                            RayletAddress(NodeID::FromRandom()),
+                            [](const ActorCreationSubmitter::CreationResult &) {});
+  int cancel_replies = 0;
+  submitter_.CancelCreation(actor_id, [&](bool c) { cancel_replies += c ? 1 : 0; });
+  submitter_.CancelCreation(actor_id, [&](bool c) { cancel_replies += c ? 1 : 0; });
+  // Only one cancel RPC is in flight for both callers.
+  EXPECT_EQ(raylet_client_->num_leases_canceled, 1);
+  ASSERT_TRUE(raylet_client_->ReplyCancelWorkerLease(/*success=*/true));
+  EXPECT_EQ(cancel_replies, 2);
+}
+
+TEST_F(ActorCreationSubmitterTest, TerminatedActorCanBeResubmitted) {
+  const ActorID actor_id =
+      ActorID::Of(JobID::FromInt(8), TaskID::Nil(), /*parent_task_counter=*/1);
+  submitter_.SubmitCreation(BuildCreationTaskSpec(actor_id),
+                            RayletAddress(NodeID::FromRandom()),
+                            [](const ActorCreationSubmitter::CreationResult &) {});
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "1.2.3.4", 1234, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_TRUE(submitter_.GetGrantedLease(actor_id).has_value());
+
+  submitter_.OnActorTerminated(actor_id);
+  EXPECT_FALSE(submitter_.GetGrantedLease(actor_id).has_value());
+  // Resurrection re-runs the full creation path with a fresh lease.
+  submitter_.SubmitCreation(BuildCreationTaskSpec(actor_id),
+                            RayletAddress(NodeID::FromRandom()),
+                            [](const ActorCreationSubmitter::CreationResult &) {});
+  EXPECT_EQ(raylet_client_->num_workers_requested, 2);
 }
 
 }  // namespace

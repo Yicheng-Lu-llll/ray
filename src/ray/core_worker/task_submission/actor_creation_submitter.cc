@@ -14,6 +14,8 @@
 
 #include "ray/core_worker/task_submission/actor_creation_submitter.h"
 
+#include <atomic>
+#include <boost/asio/deadline_timer.hpp>
 #include <memory>
 #include <string>
 #include <utility>
@@ -22,31 +24,46 @@
 namespace ray {
 namespace core {
 
+namespace {
+// Lease ids issued by this submitter share the (worker id, counter) namespace
+// with NormalTaskSubmitter's own static counter. Partition the space by
+// starting in the upper half so the two submitters on one owner can never
+// mint the same LeaseID.
+std::atomic<uint32_t> lease_id_counter{1u << 31};
+}  // namespace
+
 void ActorCreationSubmitter::SubmitCreation(const TaskSpecification &creation_spec,
                                             const rpc::Address &start_raylet_address,
                                             CreationCallback callback) {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
   RAY_CHECK(creation_spec.IsActorCreationTask());
   const ActorID actor_id = creation_spec.ActorCreationId();
   RAY_CHECK(!creations_.contains(actor_id))
-      << "Duplicate creation submission for actor " << actor_id;
+      << "Duplicate creation submission for actor " << actor_id
+      << "; terminated actors must be forgotten via OnActorTerminated first.";
   CreationEntry entry;
   entry.spec = creation_spec;
+  entry.first_raylet_address = start_raylet_address;
   entry.callback = std::move(callback);
   creations_[actor_id] = std::move(entry);
-  RequestLease(actor_id, start_raylet_address, /*is_spillback=*/false);
+  RequestLease(
+      actor_id, start_raylet_address, /*is_spillback=*/false, /*reuse_lease_id=*/false);
 }
 
 void ActorCreationSubmitter::RequestLease(const ActorID &actor_id,
                                           const rpc::Address &raylet_address,
-                                          bool is_spillback) {
+                                          bool is_spillback,
+                                          bool reuse_lease_id) {
   auto it = creations_.find(actor_id);
-  if (it == creations_.end() || it->second.state == CreationState::kCancelled) {
+  if (it == creations_.end() || it->second.state != CreationState::kPendingLease) {
     return;
   }
   CreationEntry &entry = it->second;
-  // Every attempt (first hop or spillback hop) gets a fresh lease id so a
-  // cancel can never hit a lease the raylet has merged with a previous one.
-  entry.lease_id = LeaseID::FromWorker(owner_worker_id_, ++lease_id_counter_);
+  if (!reuse_lease_id) {
+    // Every attempt (first hop or spillback hop) gets a fresh lease id so a
+    // cancel can never hit a lease the raylet has merged with a previous one.
+    entry.lease_id = LeaseID::FromWorker(owner_worker_id_, ++lease_id_counter);
+  }
   entry.current_raylet_address = raylet_address;
 
   rpc::RequestWorkerLeaseRequest request;
@@ -58,67 +75,93 @@ void ActorCreationSubmitter::RequestLease(const ActorID &actor_id,
   request.set_grant_or_reject(is_spillback);
 
   auto raylet_client = raylet_client_pool_->GetOrConnectByAddress(raylet_address);
+  const LeaseID issued_lease_id = entry.lease_id;
   raylet_client->RequestWorkerLease(
       std::move(request),
-      [this, actor_id](const Status &status, rpc::RequestWorkerLeaseReply &&reply) {
+      [this, actor_id, issued_lease_id, is_spillback](
+          const Status &status, rpc::RequestWorkerLeaseReply &&reply) {
         auto entry_it = creations_.find(actor_id);
         if (entry_it == creations_.end() ||
-            entry_it->second.state == CreationState::kCancelled) {
+            entry_it->second.state != CreationState::kPendingLease ||
+            entry_it->second.lease_id != issued_lease_id) {
           return;
         }
         CreationEntry &e = entry_it->second;
         if (!status.ok()) {
-          CreationResult result;
-          result.status = status;
-          auto cb = std::move(e.callback);
-          creations_.erase(entry_it);
-          cb(result);
+          // The raylet may have granted even though the reply was lost, and
+          // leases never expire, so the lease must not be abandoned: retry
+          // with the same lease id, which the raylet answers idempotently.
+          const rpc::Address retry_address = e.current_raylet_address;
+          RetryAfterBackoff([this, actor_id, retry_address, is_spillback]() {
+            RequestLease(actor_id, retry_address, is_spillback, /*reuse_lease_id=*/true);
+          });
           return;
         }
-        if (e.cancel_requested && !reply.canceled() &&
-            reply.worker_address().worker_id().empty() && !reply.rejected() &&
-            reply.retry_at_raylet_address().node_id().empty()) {
-          // Nothing actionable in the reply; fall through to normal handling.
-        }
         if (reply.canceled()) {
-          e.state = CreationState::kCancelled;
-          if (e.cancel_callback) {
-            e.cancel_callback(/*cancelled=*/true);
-          }
-          CreationResult result;
-          result.status = Status::SchedulingCancelled("Actor creation cancelled.");
-          auto cb = std::move(e.callback);
-          creations_.erase(entry_it);
-          cb(result);
+          CompleteCancelled(
+              actor_id, reply.failure_type(), reply.scheduling_failure_message());
           return;
         }
         if (!reply.retry_at_raylet_address().node_id().empty()) {
-          // Spillback: follow to the suggested raylet.
-          RequestLease(actor_id, reply.retry_at_raylet_address(), /*is_spillback=*/true);
+          if (e.cancel_requested) {
+            // The reply consumed the previous request and nothing is queued
+            // anywhere: converging the cancel here avoids racing a fresh
+            // lease request against it.
+            CompleteCancelled(actor_id,
+                              rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED,
+                              "Actor creation cancelled by the owner.");
+            return;
+          }
+          RequestLease(actor_id,
+                       reply.retry_at_raylet_address(),
+                       /*is_spillback=*/true,
+                       /*reuse_lease_id=*/false);
           return;
         }
         if (reply.rejected()) {
-          // The spillback target could not host us after all; retry from the
-          // node it reported so its fresher view routes the next attempt.
-          RequestLease(actor_id, e.current_raylet_address, /*is_spillback=*/false);
+          if (e.cancel_requested) {
+            CompleteCancelled(actor_id,
+                              rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED,
+                              "Actor creation cancelled by the owner.");
+            return;
+          }
+          // The spillback target could not host us: retry from the first
+          // hop, whose refreshed view routes the next attempt.
+          const rpc::Address first_hop = e.first_raylet_address;
+          RequestLease(
+              actor_id, first_hop, /*is_spillback=*/false, /*reuse_lease_id=*/false);
           return;
         }
-        RAY_CHECK(!reply.worker_address().worker_id().empty())
-            << "Lease reply with neither worker, spillback, rejection, nor "
-               "cancellation.";
+        if (reply.worker_address().worker_id().empty()) {
+          // A reply with neither worker, spillback, rejection, nor
+          // cancellation is malformed remote input; retry rather than crash.
+          const rpc::Address retry_address = e.current_raylet_address;
+          RAY_LOG(WARNING).WithField(actor_id)
+              << "Lease reply carried no actionable outcome; retrying.";
+          RetryAfterBackoff([this, actor_id, retry_address, is_spillback]() {
+            RequestLease(actor_id, retry_address, is_spillback, /*reuse_lease_id=*/true);
+          });
+          return;
+        }
         // Granted. The lease is held for the actor's lifetime: it is never
         // returned, never expires, and its worker is never reused.
         e.actor_address = reply.worker_address();
+        e.resource_mapping.assign(reply.resource_mapping().begin(),
+                                  reply.resource_mapping().end());
+        e.state = CreationState::kPushing;
         if (e.cancel_requested) {
           // Cancel lost the race to the grant: the caller must use the kill
-          // path against a live incarnation.
+          // path against a live incarnation. Detach the callbacks before
+          // invoking anything (callbacks may re-enter this submitter).
           e.cancel_requested = false;
-          if (e.cancel_callback) {
-            auto ccb = std::move(e.cancel_callback);
-            ccb(/*cancelled=*/false);
+          auto cancel_callbacks = std::move(e.cancel_callbacks);
+          e.cancel_callbacks.clear();
+          PushCreationTask(actor_id);
+          for (auto &cancel_callback : cancel_callbacks) {
+            cancel_callback(/*cancelled=*/false);
           }
+          return;
         }
-        e.state = CreationState::kPushing;
         PushCreationTask(actor_id);
       });
 }
@@ -132,12 +175,16 @@ void ActorCreationSubmitter::PushCreationTask(const ActorID &actor_id) {
   auto request = std::make_unique<rpc::PushTaskRequest>();
   request->mutable_task_spec()->CopyFrom(entry.spec.GetMessage());
   request->set_intended_worker_id(entry.actor_address.worker_id());
+  for (const auto &mapping : entry.resource_mapping) {
+    request->add_resource_mapping()->CopyFrom(mapping);
+  }
   auto worker_client = core_worker_client_pool_->GetOrConnect(entry.actor_address);
   worker_client->PushNormalTask(
       std::move(request),
       [this, actor_id](const Status &status, rpc::PushTaskReply &&reply) {
         auto entry_it = creations_.find(actor_id);
-        if (entry_it == creations_.end()) {
+        if (entry_it == creations_.end() ||
+            entry_it->second.state != CreationState::kPushing) {
           return;
         }
         CreationEntry &e = entry_it->second;
@@ -148,20 +195,28 @@ void ActorCreationSubmitter::PushCreationTask(const ActorID &actor_id) {
           e.state = CreationState::kAlive;
           result.actor_address = e.actor_address;
           // The entry is retained: it records the permanently held lease.
-          e.callback(result);
+          // Detach the callback before invoking it (it may re-enter).
+          auto callback = std::move(e.callback);
           e.callback = nullptr;
+          callback(result);
           return;
         }
-        auto cb = std::move(e.callback);
+        auto callback = std::move(e.callback);
+        auto cancel_callbacks = std::move(e.cancel_callbacks);
         creations_.erase(entry_it);
-        cb(result);
+        callback(result);
+        for (auto &cancel_callback : cancel_callbacks) {
+          cancel_callback(/*cancelled=*/true);
+        }
       });
 }
 
 void ActorCreationSubmitter::CancelCreation(const ActorID &actor_id,
                                             std::function<void(bool)> callback) {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
   auto it = creations_.find(actor_id);
   if (it == creations_.end() || it->second.state == CreationState::kCancelled) {
+    // No live creation: no worker exists or will exist under this entry.
     callback(/*cancelled=*/true);
     return;
   }
@@ -171,48 +226,96 @@ void ActorCreationSubmitter::CancelCreation(const ActorID &actor_id,
     callback(/*cancelled=*/false);
     return;
   }
+  entry.cancel_callbacks.push_back(std::move(callback));
+  if (entry.cancel_requested) {
+    return;
+  }
   entry.cancel_requested = true;
-  entry.cancel_callback = std::move(callback);
   IssueCancel(actor_id);
 }
 
 void ActorCreationSubmitter::IssueCancel(const ActorID &actor_id) {
   auto it = creations_.find(actor_id);
-  if (it == creations_.end() || !it->second.cancel_requested) {
+  if (it == creations_.end() || !it->second.cancel_requested ||
+      it->second.state != CreationState::kPendingLease) {
     return;
   }
   CreationEntry &entry = it->second;
+  const LeaseID issued_lease_id = entry.lease_id;
   auto raylet_client =
       raylet_client_pool_->GetOrConnectByAddress(entry.current_raylet_address);
   raylet_client->CancelWorkerLease(
       entry.lease_id,
-      [this, actor_id](const Status &status, rpc::CancelWorkerLeaseReply &&reply) {
+      [this, actor_id, issued_lease_id](const Status &status,
+                                        rpc::CancelWorkerLeaseReply &&reply) {
         auto entry_it = creations_.find(actor_id);
-        if (entry_it == creations_.end() || !entry_it->second.cancel_requested) {
-          // Grant won the race and already answered the cancel callback, or
-          // the creation completed/failed.
+        if (entry_it == creations_.end() || !entry_it->second.cancel_requested ||
+            entry_it->second.state != CreationState::kPendingLease) {
+          // Grant won the race and already answered, or the creation
+          // completed/failed.
           return;
         }
-        CreationEntry &e = entry_it->second;
+        if (entry_it->second.lease_id != issued_lease_id) {
+          // The lease moved (spillback) while this cancel was in flight;
+          // re-aim at the current lease.
+          IssueCancel(actor_id);
+          return;
+        }
         if (status.ok() && reply.success()) {
-          e.state = CreationState::kCancelled;
-          e.cancel_requested = false;
-          auto ccb = std::move(e.cancel_callback);
-          if (ccb) {
-            ccb(/*cancelled=*/true);
-          }
-          CreationResult result;
-          result.status = Status::SchedulingCancelled("Actor creation cancelled.");
-          auto cb = std::move(e.callback);
-          creations_.erase(entry_it);
-          cb(result);
+          CompleteCancelled(actor_id,
+                            rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED,
+                            "Actor creation cancelled by the owner.");
           return;
         }
-        // The cancel raced ahead of the lease request (or a stale reply):
-        // loop until it converges. A grant arriving meanwhile flips the
-        // answer through the grant handler.
-        IssueCancel(actor_id);
+        // The cancel raced ahead of the lease request, the reply was lost, or
+        // the raylet is unreachable: back off and loop until it converges. A
+        // grant arriving meanwhile answers through the grant handler.
+        RetryAfterBackoff([this, actor_id]() { IssueCancel(actor_id); });
       });
+}
+
+void ActorCreationSubmitter::CompleteCancelled(
+    const ActorID &actor_id,
+    rpc::RequestWorkerLeaseReply::SchedulingFailureType failure_type,
+    const std::string &failure_message) {
+  auto it = creations_.find(actor_id);
+  if (it == creations_.end()) {
+    return;
+  }
+  CreationEntry &e = it->second;
+  CreationResult result;
+  result.status = Status::SchedulingCancelled(failure_message);
+  result.failure_type = failure_type;
+  result.scheduling_failure_message = failure_message;
+  auto callback = std::move(e.callback);
+  auto cancel_callbacks = std::move(e.cancel_callbacks);
+  creations_.erase(it);
+  for (auto &cancel_callback : cancel_callbacks) {
+    cancel_callback(/*cancelled=*/true);
+  }
+  callback(result);
+}
+
+void ActorCreationSubmitter::OnActorTerminated(const ActorID &actor_id) {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
+  auto it = creations_.find(actor_id);
+  if (it == creations_.end()) {
+    return;
+  }
+  RAY_CHECK(it->second.state == CreationState::kAlive)
+      << "Only alive actors can be forgotten; pending creations must be "
+         "cancelled first.";
+  creations_.erase(it);
+}
+
+void ActorCreationSubmitter::RetryAfterBackoff(std::function<void()> fn) {
+  auto timer = std::make_shared<boost::asio::deadline_timer>(io_service_);
+  timer->expires_from_now(boost::posix_time::milliseconds(retry_backoff_ms_));
+  timer->async_wait([timer, fn = std::move(fn)](const boost::system::error_code &ec) {
+    if (!ec) {
+      fn();
+    }
+  });
 }
 
 std::optional<LeaseID> ActorCreationSubmitter::GetGrantedLease(

@@ -779,9 +779,9 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// process has exited: a single timer regardless of the number of pending
   /// records. TODO(ownership): zombies (unreaped drivers) and pid reuse both
   /// fool kill(pid,0) — needs start-time identity and the deadline-grade
-  /// escalation. On Windows there is no exit observation: records stay
-  /// pending (never reported DEAD from a tombstone) and are made evictable
-  /// at record time so the ledger stays bounded.
+  /// escalation. On Windows there is no exit observation: raylet/worker-
+  /// initiated records stay pending forever (EOF records remain exit-grade,
+  /// unverifiable) and every record is evictable so the ledger stays bounded.
   void ScanPendingTombstones();
 
   /// Evict oldest evictable tombstones beyond the cap.
@@ -974,16 +974,18 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
 
   /// Dead-worker tombstones: the local authority for "this worker was
   /// registered here and died". Written on every disconnect; grade depends on
-  /// the disconnect trigger. Pending records are non-evictable until the exit
-  /// is observed (or, TODO(ownership): the kill deadline fires -> deadline-
-  /// grade); exit-grade records are evicted FIFO beyond the cap.
+  /// the disconnect trigger. On POSIX, pending records are non-evictable
+  /// until the exit is observed (or, TODO(ownership): the kill deadline
+  /// fires -> deadline-grade) and exit-grade records are evicted FIFO beyond
+  /// the cap; on Windows every record is evictable (no exit observation).
   struct WorkerTombstone {
     bool exit_observed = false;
     pid_t pid = -1;
   };
   absl::flat_hash_map<WorkerID, WorkerTombstone> worker_tombstones_;
-  /// FIFO of evictable (exit-observed) tombstone ids, oldest first; pending
-  /// records join on exit observation.
+  /// FIFO of evictable tombstone ids, oldest first. On POSIX only
+  /// exit-observed records are listed (pending records join on exit
+  /// observation); on Windows every record is listed at record time.
   std::deque<WorkerID> worker_tombstone_fifo_;
   static constexpr size_t kWorkerTombstoneCapacity = 10000;
 

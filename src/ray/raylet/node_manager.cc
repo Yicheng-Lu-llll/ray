@@ -2270,9 +2270,9 @@ void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
   tombstone.pid = pid;
   worker_tombstones_[worker_id] = tombstone;
 #ifdef _WIN32
-  // No exit-observation primitive on Windows: pending records stay pending
-  // (DEAD is never reported from a tombstone there) but are made evictable so
-  // the ledger stays bounded.
+  // No exit-observation primitive on Windows: raylet/worker-initiated records
+  // stay pending forever (EOF records are still exit-grade, just unverifiable)
+  // and every record is made evictable so the ledger stays bounded.
   worker_tombstone_fifo_.push_back(worker_id);
   EvictWorkerTombstones();
 #else

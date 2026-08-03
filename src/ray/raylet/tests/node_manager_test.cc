@@ -627,6 +627,22 @@ TEST_F(NodeManagerTest, MarkWorkerExitObservedUnknownIdIsSafe) {
   node_manager_->MarkWorkerExitObserved(WorkerID::FromRandom());
 }
 
+TEST_F(NodeManagerTest, ScanPendingTombstonesUpgradesExitedPids) {
+  // A pending record whose process still runs stays pending across scans; a
+  // pending record whose pid does not exist is upgraded to exit-grade.
+  WorkerID live_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(
+      live_id, NodeManager::DisconnectTrigger::kRayletInitiated, getpid());
+  WorkerID dead_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(
+      dead_id, NodeManager::DisconnectTrigger::kRayletInitiated, /*pid=*/1 << 30);
+
+  node_manager_->ScanPendingTombstones();
+
+  EXPECT_FALSE(node_manager_->worker_tombstones_.at(live_id).exit_observed);
+  EXPECT_TRUE(node_manager_->worker_tombstones_.at(dead_id).exit_observed);
+}
+
 TEST_F(NodeManagerTest, HandleIsLocalWorkerDeadUnknownWorker) {
   WorkerID worker_id = WorkerID::FromRandom();
   EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(worker_id))

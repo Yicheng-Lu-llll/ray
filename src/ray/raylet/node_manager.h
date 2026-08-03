@@ -750,19 +750,6 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// fields used.
   void FillResourceUsage(rpc::ResourcesData &data);
 
-  /// Disconnect a client.
-  ///
-  /// \param client The client that sent the message.
-  /// \param graceful Indicates if this was a graceful disconnect initiated by the
-  ///        worker or a non-graceful disconnect initiated by the raylet. On graceful
-  ///        disconnect, a DisconnectClientReply will be sent to the worker prior to
-  ///        closing the connection.
-  /// \param trigger What caused the disconnect (grades the tombstone).
-  /// \param disconnect_type The reason to disconnect the specified client.
-  /// \param disconnect_detail Disconnection information in details.
-  ///
-  /// (Declaration below, after the tombstone helpers.)
-  ///
   /// What caused a client disconnect. Grades the dead-worker tombstone: a
   /// disconnect triggered by connection EOF means the process has already
   /// exited (exit-grade); any disconnect of a still-running process (raylet-
@@ -803,7 +790,18 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessEofDisconnectIsDead);
   FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessPendingIsRetainedNotBlocking);
   FRIEND_TEST(NodeManagerTest, MarkWorkerExitObservedUnknownIdIsSafe);
+  FRIEND_TEST(NodeManagerTest, ScanPendingTombstonesUpgradesExitedPids);
 
+  /// Disconnect a client.
+  ///
+  /// \param client The client that sent the message.
+  /// \param graceful Indicates if this was a graceful disconnect initiated by the
+  ///        worker or a non-graceful disconnect initiated by the raylet. On graceful
+  ///        disconnect, a DisconnectClientReply will be sent to the worker prior to
+  ///        closing the connection.
+  /// \param trigger What caused the disconnect (grades the tombstone).
+  /// \param disconnect_type The reason to disconnect the specified client.
+  /// \param disconnect_detail Disconnection information in details.
   void DisconnectClient(const std::shared_ptr<ClientConnection> &client,
                         DisconnectTrigger trigger,
                         bool graceful,

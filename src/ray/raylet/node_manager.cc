@@ -2265,6 +2265,12 @@ void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
     exited = false;
   }
 #endif
+#ifdef _WIN32
+  // No exit-observation primitive on Windows: record disconnect-grade as
+  // observed so the ledger stays bounded. This matches the pre-existing
+  // IsLocalWorkerDead semantics on that platform.
+  exited = true;
+#endif
   WorkerTombstone tombstone;
   tombstone.exit_observed = exited;
   tombstone.pid = pid;

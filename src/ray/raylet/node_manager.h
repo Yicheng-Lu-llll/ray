@@ -757,9 +757,12 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   ///        worker or a non-graceful disconnect initiated by the raylet. On graceful
   ///        disconnect, a DisconnectClientReply will be sent to the worker prior to
   ///        closing the connection.
+  /// \param trigger What caused the disconnect (grades the tombstone).
   /// \param disconnect_type The reason to disconnect the specified client.
   /// \param disconnect_detail Disconnection information in details.
-  /// \param client_error_message Extra error messages about this disconnection
+  ///
+  /// (Declaration below, after the tombstone helpers.)
+  ///
   /// What caused a client disconnect. Grades the dead-worker tombstone: a
   /// disconnect triggered by connection EOF means the process has already
   /// exited (exit-grade); any disconnect of a still-running process (raylet-
@@ -773,26 +776,32 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
     kWorkerInitiated,
   };
 
-  /// Record a tombstone for a disconnecting worker/driver and, for pending
-  /// records with a known pid, arm the exit poll so every pending record can
-  /// converge. Exit-grade when the disconnect was triggered by connection EOF
-  /// (verified against the process when possible), pending-exit otherwise.
+  /// Record a tombstone for a disconnecting worker/driver; pending records
+  /// converge via the periodic exit scan. Exit-grade when the disconnect was
+  /// triggered by connection EOF (verified against the process when
+  /// possible), pending-exit otherwise.
   void RecordWorkerTombstone(const WorkerID &worker_id,
                              DisconnectTrigger trigger,
                              pid_t pid);
 
   /// Upgrade a pending-exit tombstone to exit-grade once the worker process
-  /// is observed to have exited. Safe to call for unknown ids.
+  /// is observed to have exited, making it evictable. Safe for unknown ids.
   void MarkWorkerExitObserved(const WorkerID &worker_id);
 
-  /// Poll for the exit of a pending-tombstoned process and upgrade the record.
-  /// TODO(ownership): use pid start-time identity (bare kill(pid,0) can be
-  /// fooled by pid reuse) and add the deadline-grade escalation.
-  void ScheduleTombstoneExitPoll(const WorkerID &worker_id, pid_t pid);
+  /// One periodic pass over all pending tombstones, upgrading those whose
+  /// process has exited: a single timer regardless of the number of pending
+  /// records. TODO(ownership): zombies (unreaped drivers) and pid reuse both
+  /// fool kill(pid,0) — needs start-time identity and the deadline-grade
+  /// escalation; on Windows the probe treats processes as alive, so pending
+  /// records only converge via explicit MarkWorkerExitObserved.
+  void ScanPendingTombstones();
+
+  /// Evict oldest evictable tombstones beyond the cap.
+  void EvictWorkerTombstones();
 
   FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessPendingThenExitObserved);
   FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessEofDisconnectIsDead);
-  FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessPendingBlocksEviction);
+  FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessPendingIsRetainedNotBlocking);
   FRIEND_TEST(NodeManagerTest, MarkWorkerExitObservedUnknownIdIsSafe);
 
   void DisconnectClient(const std::shared_ptr<ClientConnection> &client,
@@ -971,9 +980,11 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// grade); exit-grade records are evicted FIFO beyond the cap.
   struct WorkerTombstone {
     bool exit_observed = false;
+    pid_t pid = -1;
   };
   absl::flat_hash_map<WorkerID, WorkerTombstone> worker_tombstones_;
-  /// FIFO of tombstoned ids for eviction (skips entries still pending).
+  /// FIFO of evictable (exit-observed) tombstone ids, oldest first; pending
+  /// records join on exit observation.
   std::deque<WorkerID> worker_tombstone_fifo_;
   static constexpr size_t kWorkerTombstoneCapacity = 10000;
 

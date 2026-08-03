@@ -141,14 +141,10 @@ void SchedulePostExitProcessGroupCleanup(
     std::shared_ptr<boost::asio::deadline_timer> timer,
     pid_t worker_pid,
     pid_t pgid,
-    WorkerID wid,
-    std::function<void()> on_exit_observed) {
+    WorkerID wid) {
   // If the worker process has exited, sweep its (now leaderless) process group
   // to reap any orphaned descendants it left behind, then stop.
   if (kill(worker_pid, 0) == -1 && errno == ESRCH) {
-    if (on_exit_observed) {
-      on_exit_observed();
-    }
     auto probe = KillProcessGroup(pgid, 0);
     const bool group_absent = (probe && probe->value() == ESRCH);
     if (!group_absent) {
@@ -163,14 +159,11 @@ void SchedulePostExitProcessGroupCleanup(
   // 100ms poll is negligible overhead in that case (and stops when the raylet's
   // io_context shuts down and cancels the timer).
   timer->expires_from_now(boost::posix_time::milliseconds(kGracefulPgCleanupPollMs));
-  timer->async_wait(
-      [timer, worker_pid, pgid, wid, on_exit_observed = std::move(on_exit_observed)](
-          const boost::system::error_code &ec) mutable {
-        if (!ec) {
-          SchedulePostExitProcessGroupCleanup(
-              timer, worker_pid, pgid, wid, std::move(on_exit_observed));
-        }
-      });
+  timer->async_wait([timer, worker_pid, pgid, wid](const boost::system::error_code &ec) {
+    if (!ec) {
+      SchedulePostExitProcessGroupCleanup(timer, worker_pid, pgid, wid);
+    }
+  });
 }
 #endif
 
@@ -308,6 +301,10 @@ NodeManager::NodeManager(
       [this]() { CheckForUnexpectedWorkerDisconnects(); },
       RayConfig::instance().raylet_check_for_unexpected_worker_disconnect_interval_ms(),
       "NodeManager.CheckForUnexpectedWorkerDisconnects");
+
+  periodical_runner_->RunFnPeriodically([this]() { ScanPendingTombstones(); },
+                                        /*period_ms=*/100,
+                                        "NodeManager.ScanPendingTombstones");
 
   RAY_CHECK_OK(store_client_->Connect(config.store_socket_name));
   // Run the node manager rpc server.
@@ -1659,10 +1656,7 @@ void NodeManager::DisconnectClient(const std::shared_ptr<ClientConnection> &clie
           // Poll for the worker process to exit, then sweep its process group.
           const pid_t worker_pid = worker->GetProcess().GetId();
           auto timer = std::make_shared<boost::asio::deadline_timer>(io_service_);
-          SchedulePostExitProcessGroupCleanup(
-              std::move(timer), worker_pid, pgid, wid, [this, wid]() {
-                MarkWorkerExitObserved(wid);
-              });
+          SchedulePostExitProcessGroupCleanup(std::move(timer), worker_pid, pgid, wid);
         }
       }
     }
@@ -2262,67 +2256,55 @@ void NodeManager::HandleReturnWorkerLease(rpc::ReturnWorkerLeaseRequest request,
 void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
                                         DisconnectTrigger trigger,
                                         pid_t pid) {
-  WorkerTombstone tombstone;
   bool exited = (trigger == DisconnectTrigger::kConnectionEof);
 #ifndef _WIN32
   // A connection EOF normally means the process already exited, but that is an
   // inference from the socket, not an observation of the process. Verify when
-  // we can; a still-running process is downgraded to pending and polled.
+  // we can; a still-running process is downgraded to pending and scanned.
   if (exited && pid > 0 && kill(pid, 0) == 0) {
     exited = false;
   }
 #endif
+  WorkerTombstone tombstone;
   tombstone.exit_observed = exited;
+  tombstone.pid = pid;
   worker_tombstones_[worker_id] = tombstone;
-  worker_tombstone_fifo_.push_back(worker_id);
-  if (!exited && pid > 0) {
-    ScheduleTombstoneExitPoll(worker_id, pid);
-  }
-  // Evict oldest non-pending records beyond the cap, skipping (and retaining)
-  // pending records: they are non-evictable until their exit is observed, and
-  // must not block eviction of newer exit-grade records behind them.
-  size_t scanned = 0;
-  const size_t max_scan = worker_tombstone_fifo_.size();
-  while (worker_tombstones_.size() > kWorkerTombstoneCapacity && scanned < max_scan &&
-         !worker_tombstone_fifo_.empty()) {
-    scanned++;
-    const WorkerID victim = worker_tombstone_fifo_.front();
-    worker_tombstone_fifo_.pop_front();
-    auto it = worker_tombstones_.find(victim);
-    if (it == worker_tombstones_.end()) {
-      continue;
-    }
-    if (!it->second.exit_observed) {
-      worker_tombstone_fifo_.push_back(victim);
-      continue;
-    }
-    worker_tombstones_.erase(it);
+  if (exited) {
+    worker_tombstone_fifo_.push_back(worker_id);
+    EvictWorkerTombstones();
   }
 }
 
-void NodeManager::ScheduleTombstoneExitPoll(const WorkerID &worker_id, pid_t pid) {
+void NodeManager::ScanPendingTombstones() {
 #ifndef _WIN32
-  auto timer = std::make_shared<boost::asio::deadline_timer>(io_service_);
-  timer->expires_from_now(boost::posix_time::milliseconds(100));
-  // Capturing `this` is safe: the timer runs on io_service_, which is stopped
-  // and destroyed after the NodeManager in both the raylet main and tests.
-  timer->async_wait([this, timer, worker_id, pid](const boost::system::error_code &ec) {
-    if (ec) {
-      return;
+  std::vector<WorkerID> exited;
+  for (const auto &[worker_id, tombstone] : worker_tombstones_) {
+    if (!tombstone.exit_observed && tombstone.pid > 0 && kill(tombstone.pid, 0) == -1 &&
+        errno == ESRCH) {
+      exited.push_back(worker_id);
     }
-    if (kill(pid, 0) == -1 && errno == ESRCH) {
-      MarkWorkerExitObserved(worker_id);
-      return;
-    }
-    ScheduleTombstoneExitPoll(worker_id, pid);
-  });
+  }
+  for (const auto &worker_id : exited) {
+    MarkWorkerExitObserved(worker_id);
+  }
 #endif
+}
+
+void NodeManager::EvictWorkerTombstones() {
+  while (worker_tombstones_.size() > kWorkerTombstoneCapacity &&
+         !worker_tombstone_fifo_.empty()) {
+    const WorkerID victim = worker_tombstone_fifo_.front();
+    worker_tombstone_fifo_.pop_front();
+    worker_tombstones_.erase(victim);
+  }
 }
 
 void NodeManager::MarkWorkerExitObserved(const WorkerID &worker_id) {
   auto it = worker_tombstones_.find(worker_id);
-  if (it != worker_tombstones_.end()) {
+  if (it != worker_tombstones_.end() && !it->second.exit_observed) {
     it->second.exit_observed = true;
+    worker_tombstone_fifo_.push_back(worker_id);
+    EvictWorkerTombstones();
   }
 }
 

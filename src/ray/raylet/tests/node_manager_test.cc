@@ -606,9 +606,9 @@ TEST_F(NodeManagerTest, HandleGetWorkerLivenessEofDisconnectIsDead) {
   EXPECT_EQ(reply.grade(), rpc::GetWorkerLivenessReply::EXIT);
 }
 
-TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingBlocksEviction) {
-  // A pending record is retained under eviction pressure (skipped, not
-  // blocking), while exit-grade records beyond the cap are evicted.
+TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingIsRetainedNotBlocking) {
+  // A pending record is retained under eviction pressure and does not block
+  // eviction of exit-grade records recorded after it.
   WorkerID pending_id = WorkerID::FromRandom();
   node_manager_->RecordWorkerTombstone(
       pending_id, NodeManager::DisconnectTrigger::kRayletInitiated, /*pid=*/-1);
@@ -617,8 +617,8 @@ TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingBlocksEviction) {
                                          NodeManager::DisconnectTrigger::kConnectionEof,
                                          /*pid=*/-1);
   }
-  EXPECT_LE(node_manager_->worker_tombstones_.size(),
-            NodeManager::kWorkerTombstoneCapacity + 1);
+  EXPECT_EQ(node_manager_->worker_tombstones_.size(),
+            NodeManager::kWorkerTombstoneCapacity);
   EXPECT_TRUE(node_manager_->worker_tombstones_.contains(pending_id));
   EXPECT_FALSE(node_manager_->worker_tombstones_.at(pending_id).exit_observed);
 }

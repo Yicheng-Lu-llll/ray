@@ -346,25 +346,6 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
                               rpc::FreeLocalObjectsReply *reply,
                               rpc::SendReplyCallback send_reply_callback) override;
 
-  /// What caused a client disconnect. Grades the dead-worker tombstone: a
-  /// disconnect triggered by connection EOF means the process has already
-  /// exited (exit-grade); any disconnect of a still-running process (raylet-
-  /// or worker-initiated) records pending-exit until the exit is observed.
-  enum class DisconnectTrigger {
-    kConnectionEof,
-    kRayletInitiated,
-    kWorkerInitiated,
-  };
-
-  /// Record a tombstone for a disconnecting worker/driver. Exit-grade when the
-  /// disconnect was triggered by connection EOF (the process already exited),
-  /// pending-exit otherwise.
-  void RecordWorkerTombstone(const WorkerID &worker_id, DisconnectTrigger trigger);
-
-  /// Upgrade a pending-exit tombstone to exit-grade once the worker process
-  /// is observed to have exited. Safe to call for unknown ids.
-  void MarkWorkerExitObserved(const WorkerID &worker_id);
-
   void HandleGetWorkerLiveness(rpc::GetWorkerLivenessRequest request,
                                rpc::GetWorkerLivenessReply *reply,
                                rpc::SendReplyCallback send_reply_callback) override;
@@ -779,6 +760,41 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// \param disconnect_type The reason to disconnect the specified client.
   /// \param disconnect_detail Disconnection information in details.
   /// \param client_error_message Extra error messages about this disconnection
+  /// What caused a client disconnect. Grades the dead-worker tombstone: a
+  /// disconnect triggered by connection EOF means the process has already
+  /// exited (exit-grade); any disconnect of a still-running process (raylet-
+  /// or worker-initiated) records pending-exit until the exit is observed.
+  /// kRayletInitiated and kWorkerInitiated grade identically today; they are
+  /// kept distinct because the worker-initiated pending deadline must be
+  /// longer (it races the worker's own graceful teardown budget).
+  enum class DisconnectTrigger {
+    kConnectionEof,
+    kRayletInitiated,
+    kWorkerInitiated,
+  };
+
+  /// Record a tombstone for a disconnecting worker/driver and, for pending
+  /// records with a known pid, arm the exit poll so every pending record can
+  /// converge. Exit-grade when the disconnect was triggered by connection EOF
+  /// (verified against the process when possible), pending-exit otherwise.
+  void RecordWorkerTombstone(const WorkerID &worker_id,
+                             DisconnectTrigger trigger,
+                             pid_t pid);
+
+  /// Upgrade a pending-exit tombstone to exit-grade once the worker process
+  /// is observed to have exited. Safe to call for unknown ids.
+  void MarkWorkerExitObserved(const WorkerID &worker_id);
+
+  /// Poll for the exit of a pending-tombstoned process and upgrade the record.
+  /// TODO(ownership): use pid start-time identity (bare kill(pid,0) can be
+  /// fooled by pid reuse) and add the deadline-grade escalation.
+  void ScheduleTombstoneExitPoll(const WorkerID &worker_id, pid_t pid);
+
+  FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessPendingThenExitObserved);
+  FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessEofDisconnectIsDead);
+  FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessPendingBlocksEviction);
+  FRIEND_TEST(NodeManagerTest, MarkWorkerExitObservedUnknownIdIsSafe);
+
   void DisconnectClient(const std::shared_ptr<ClientConnection> &client,
                         DisconnectTrigger trigger,
                         bool graceful,

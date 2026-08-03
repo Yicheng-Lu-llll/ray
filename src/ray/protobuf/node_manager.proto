@@ -421,13 +421,20 @@ message GetWorkerLivenessReply {
     ALIVE = 1;
     // Disconnected, process exit not yet observed (graceful-kill window).
     PENDING = 2;
-    // Tombstoned: exit observed (exit_grade=true) or the kill deadline fired
-    // after SIGKILL (exit_grade=false).
+    // Tombstoned; see grade for exit- vs deadline-grade.
     DEAD = 3;
+  }
+  enum Grade {
+    GRADE_UNSPECIFIED = 0;
+    // The exit of the process was observed.
+    EXIT = 1;
+    // The kill deadline fired after SIGKILL without an observed exit
+    // (e.g. a process wedged in kernel I/O).
+    DEADLINE = 2;
   }
   Status status = 1;
   // Only meaningful when status == DEAD.
-  bool exit_grade = 2;
+  Grade grade = 2;
   // NodeID of the answering raylet so the caller can verify it reached the
   // node recorded in the actor/worker handle.
   bytes node_id = 3;

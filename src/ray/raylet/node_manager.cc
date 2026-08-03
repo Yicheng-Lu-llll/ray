@@ -1524,7 +1524,7 @@ void NodeManager::DisconnectClient(const std::shared_ptr<ClientConnection> &clie
 
   // Tombstone the worker before it leaves the registry: "seen-and-died" must
   // stay distinguishable from "never seen".
-  RecordWorkerTombstone(worker->WorkerId(), trigger);
+  RecordWorkerTombstone(worker->WorkerId(), trigger, worker->GetProcess().GetId());
 
   // Clean up any open ray.get or ray.wait calls that the worker made.
   lease_dependency_manager_.CancelGetRequest(worker->WorkerId());
@@ -2260,27 +2260,63 @@ void NodeManager::HandleReturnWorkerLease(rpc::ReturnWorkerLeaseRequest request,
 }
 
 void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
-                                        DisconnectTrigger trigger) {
+                                        DisconnectTrigger trigger,
+                                        pid_t pid) {
   WorkerTombstone tombstone;
-  tombstone.exit_observed = (trigger == DisconnectTrigger::kConnectionEof);
+  bool exited = (trigger == DisconnectTrigger::kConnectionEof);
+#ifndef _WIN32
+  // A connection EOF normally means the process already exited, but that is an
+  // inference from the socket, not an observation of the process. Verify when
+  // we can; a still-running process is downgraded to pending and polled.
+  if (exited && pid > 0 && kill(pid, 0) == 0) {
+    exited = false;
+  }
+#endif
+  tombstone.exit_observed = exited;
   worker_tombstones_[worker_id] = tombstone;
   worker_tombstone_fifo_.push_back(worker_id);
-  // Evict oldest non-pending records beyond the cap. Pending records are
-  // non-evictable until their exit is observed, so a pending record at the
-  // head blocks eviction (bounded in practice by pending convergence;
-  // TODO(ownership): deadline-grade upgrade removes the unbounded case).
-  while (worker_tombstones_.size() > kWorkerTombstoneCapacity &&
-         !worker_tombstone_fifo_.empty()) {
-    const WorkerID victim = worker_tombstone_fifo_.front();
-    auto it = worker_tombstones_.find(victim);
-    if (it != worker_tombstones_.end() && !it->second.exit_observed) {
-      break;
-    }
-    worker_tombstone_fifo_.pop_front();
-    if (it != worker_tombstones_.end()) {
-      worker_tombstones_.erase(it);
-    }
+  if (!exited && pid > 0) {
+    ScheduleTombstoneExitPoll(worker_id, pid);
   }
+  // Evict oldest non-pending records beyond the cap, skipping (and retaining)
+  // pending records: they are non-evictable until their exit is observed, and
+  // must not block eviction of newer exit-grade records behind them.
+  size_t scanned = 0;
+  const size_t max_scan = worker_tombstone_fifo_.size();
+  while (worker_tombstones_.size() > kWorkerTombstoneCapacity && scanned < max_scan &&
+         !worker_tombstone_fifo_.empty()) {
+    scanned++;
+    const WorkerID victim = worker_tombstone_fifo_.front();
+    worker_tombstone_fifo_.pop_front();
+    auto it = worker_tombstones_.find(victim);
+    if (it == worker_tombstones_.end()) {
+      continue;
+    }
+    if (!it->second.exit_observed) {
+      worker_tombstone_fifo_.push_back(victim);
+      continue;
+    }
+    worker_tombstones_.erase(it);
+  }
+}
+
+void NodeManager::ScheduleTombstoneExitPoll(const WorkerID &worker_id, pid_t pid) {
+#ifndef _WIN32
+  auto timer = std::make_shared<boost::asio::deadline_timer>(io_service_);
+  timer->expires_from_now(boost::posix_time::milliseconds(100));
+  // Capturing `this` is safe: the timer runs on io_service_, which is stopped
+  // and destroyed after the NodeManager in both the raylet main and tests.
+  timer->async_wait([this, timer, worker_id, pid](const boost::system::error_code &ec) {
+    if (ec) {
+      return;
+    }
+    if (kill(pid, 0) == -1 && errno == ESRCH) {
+      MarkWorkerExitObserved(worker_id);
+      return;
+    }
+    ScheduleTombstoneExitPoll(worker_id, pid);
+  });
+#endif
 }
 
 void NodeManager::MarkWorkerExitObserved(const WorkerID &worker_id) {
@@ -2302,14 +2338,14 @@ void NodeManager::HandleGetWorkerLiveness(rpc::GetWorkerLivenessRequest request,
              it != worker_tombstones_.end()) {
     if (it->second.exit_observed) {
       reply->set_status(rpc::GetWorkerLivenessReply::DEAD);
-      reply->set_exit_grade(true);
+      reply->set_grade(rpc::GetWorkerLivenessReply::EXIT);
     } else {
       reply->set_status(rpc::GetWorkerLivenessReply::PENDING);
     }
   } else {
     reply->set_status(rpc::GetWorkerLivenessReply::UNKNOWN);
   }
-  send_reply_callback(Status::OK(), /*success=*/nullptr, /*failure=*/nullptr);
+  send_reply_callback(Status::OK(), nullptr, nullptr);
 }
 
 void NodeManager::HandleIsLocalWorkerDead(rpc::IsLocalWorkerDeadRequest request,

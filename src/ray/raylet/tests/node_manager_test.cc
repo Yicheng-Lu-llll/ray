@@ -512,61 +512,82 @@ class NodeManagerTest : public ::testing::Test {
       fake_node_manager_unexpected_worker_failure_total_count_;
 };
 
-TEST_F(NodeManagerTest, GetWorkerLivenessFourStates) {
-  // Unknown worker: no registration, no tombstone.
-  WorkerID unknown_id = WorkerID::FromRandom();
-  EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(unknown_id))
+TEST_F(NodeManagerTest, HandleGetWorkerLivenessUnknownWorker) {
+  WorkerID worker_id = WorkerID::FromRandom();
+  EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(worker_id))
       .WillOnce(Return(nullptr));
-  EXPECT_CALL(mock_worker_pool_, GetRegisteredDriver(unknown_id))
+  EXPECT_CALL(mock_worker_pool_, GetRegisteredDriver(worker_id))
       .WillOnce(Return(nullptr));
   rpc::GetWorkerLivenessRequest request;
-  request.set_worker_id(unknown_id.Binary());
+  request.set_worker_id(worker_id.Binary());
   rpc::GetWorkerLivenessReply reply;
+  bool replied = false;
   node_manager_->HandleGetWorkerLiveness(
-      request, &reply, [](Status, std::function<void()>, std::function<void()>) {});
+      request, &reply, [&](Status, std::function<void()>, std::function<void()>) {
+        replied = true;
+      });
+  EXPECT_TRUE(replied);
   EXPECT_EQ(reply.status(), rpc::GetWorkerLivenessReply::UNKNOWN);
   EXPECT_FALSE(reply.node_id().empty());
+}
 
-  // Registered worker: ALIVE.
-  WorkerID alive_id = WorkerID::FromRandom();
-  auto alive_worker = std::make_shared<MockWorker>(alive_id, 10, clock_);
-  EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(alive_id))
-      .WillOnce(Return(alive_worker));
-  request.set_worker_id(alive_id.Binary());
+TEST_F(NodeManagerTest, HandleGetWorkerLivenessRegisteredWorkerIsAlive) {
+  WorkerID worker_id = WorkerID::FromRandom();
+  auto worker = std::make_shared<MockWorker>(worker_id, 10, clock_);
+  EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(worker_id)).WillOnce(Return(worker));
+  rpc::GetWorkerLivenessRequest request;
+  request.set_worker_id(worker_id.Binary());
+  rpc::GetWorkerLivenessReply reply;
+  bool replied = false;
   node_manager_->HandleGetWorkerLiveness(
-      request, &reply, [](Status, std::function<void()>, std::function<void()>) {});
+      request, &reply, [&](Status, std::function<void()>, std::function<void()>) {
+        replied = true;
+      });
+  EXPECT_TRUE(replied);
   EXPECT_EQ(reply.status(), rpc::GetWorkerLivenessReply::ALIVE);
 }
 
-TEST_F(NodeManagerTest, GetWorkerLivenessPendingThenExitObserved) {
+TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingThenExitObserved) {
   // A raylet-initiated disconnect records a pending tombstone; observing the
   // exit upgrades it to exit-grade DEAD.
   WorkerID worker_id = WorkerID::FromRandom();
-  node_manager_->RecordWorkerTombstone(worker_id,
-                                       NodeManager::DisconnectTrigger::kRayletInitiated);
+  node_manager_->RecordWorkerTombstone(
+      worker_id, NodeManager::DisconnectTrigger::kRayletInitiated, /*pid=*/-1);
 
   rpc::GetWorkerLivenessRequest request;
   request.set_worker_id(worker_id.Binary());
-  rpc::GetWorkerLivenessReply reply;
   EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(worker_id))
       .WillRepeatedly(Return(nullptr));
   EXPECT_CALL(mock_worker_pool_, GetRegisteredDriver(worker_id))
       .WillRepeatedly(Return(nullptr));
+  rpc::GetWorkerLivenessReply pending_reply;
+  bool replied = false;
   node_manager_->HandleGetWorkerLiveness(
-      request, &reply, [](Status, std::function<void()>, std::function<void()>) {});
-  EXPECT_EQ(reply.status(), rpc::GetWorkerLivenessReply::PENDING);
+      request, &pending_reply, [&](Status, std::function<void()>, std::function<void()>) {
+        replied = true;
+      });
+  EXPECT_TRUE(replied);
+  EXPECT_EQ(pending_reply.status(), rpc::GetWorkerLivenessReply::PENDING);
+  EXPECT_EQ(pending_reply.grade(), rpc::GetWorkerLivenessReply::GRADE_UNSPECIFIED);
 
   node_manager_->MarkWorkerExitObserved(worker_id);
+  rpc::GetWorkerLivenessReply dead_reply;
+  replied = false;
   node_manager_->HandleGetWorkerLiveness(
-      request, &reply, [](Status, std::function<void()>, std::function<void()>) {});
-  EXPECT_EQ(reply.status(), rpc::GetWorkerLivenessReply::DEAD);
-  EXPECT_TRUE(reply.exit_grade());
+      request, &dead_reply, [&](Status, std::function<void()>, std::function<void()>) {
+        replied = true;
+      });
+  EXPECT_TRUE(replied);
+  EXPECT_EQ(dead_reply.status(), rpc::GetWorkerLivenessReply::DEAD);
+  EXPECT_EQ(dead_reply.grade(), rpc::GetWorkerLivenessReply::EXIT);
 }
 
-TEST_F(NodeManagerTest, GetWorkerLivenessEofDisconnectIsExitGradeDead) {
+TEST_F(NodeManagerTest, HandleGetWorkerLivenessEofDisconnectIsDead) {
+  // Without a live process to verify against, a connection-EOF disconnect is
+  // recorded exit-grade immediately.
   WorkerID worker_id = WorkerID::FromRandom();
-  node_manager_->RecordWorkerTombstone(worker_id,
-                                       NodeManager::DisconnectTrigger::kConnectionEof);
+  node_manager_->RecordWorkerTombstone(
+      worker_id, NodeManager::DisconnectTrigger::kConnectionEof, /*pid=*/-1);
 
   rpc::GetWorkerLivenessRequest request;
   request.set_worker_id(worker_id.Binary());
@@ -575,10 +596,35 @@ TEST_F(NodeManagerTest, GetWorkerLivenessEofDisconnectIsExitGradeDead) {
       .WillOnce(Return(nullptr));
   EXPECT_CALL(mock_worker_pool_, GetRegisteredDriver(worker_id))
       .WillOnce(Return(nullptr));
+  bool replied = false;
   node_manager_->HandleGetWorkerLiveness(
-      request, &reply, [](Status, std::function<void()>, std::function<void()>) {});
+      request, &reply, [&](Status, std::function<void()>, std::function<void()>) {
+        replied = true;
+      });
+  EXPECT_TRUE(replied);
   EXPECT_EQ(reply.status(), rpc::GetWorkerLivenessReply::DEAD);
-  EXPECT_TRUE(reply.exit_grade());
+  EXPECT_EQ(reply.grade(), rpc::GetWorkerLivenessReply::EXIT);
+}
+
+TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingBlocksEviction) {
+  // A pending record is retained under eviction pressure (skipped, not
+  // blocking), while exit-grade records beyond the cap are evicted.
+  WorkerID pending_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(
+      pending_id, NodeManager::DisconnectTrigger::kRayletInitiated, /*pid=*/-1);
+  for (size_t i = 0; i < NodeManager::kWorkerTombstoneCapacity + 5; i++) {
+    node_manager_->RecordWorkerTombstone(WorkerID::FromRandom(),
+                                         NodeManager::DisconnectTrigger::kConnectionEof,
+                                         /*pid=*/-1);
+  }
+  EXPECT_LE(node_manager_->worker_tombstones_.size(),
+            NodeManager::kWorkerTombstoneCapacity + 1);
+  EXPECT_TRUE(node_manager_->worker_tombstones_.contains(pending_id));
+  EXPECT_FALSE(node_manager_->worker_tombstones_.at(pending_id).exit_observed);
+}
+
+TEST_F(NodeManagerTest, MarkWorkerExitObservedUnknownIdIsSafe) {
+  node_manager_->MarkWorkerExitObserved(WorkerID::FromRandom());
 }
 
 TEST_F(NodeManagerTest, HandleIsLocalWorkerDeadUnknownWorker) {

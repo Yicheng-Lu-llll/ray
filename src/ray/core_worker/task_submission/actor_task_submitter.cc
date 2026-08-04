@@ -27,6 +27,22 @@
 namespace ray {
 namespace core {
 
+namespace {
+
+rpc::ActorTableData MakeOutOfScopeDeadState(const ActorID &actor_id) {
+  rpc::ActorTableData actor_data;
+  actor_data.set_actor_id(actor_id.Binary());
+  actor_data.set_state(rpc::ActorTableData::DEAD);
+  auto *died_context =
+      actor_data.mutable_death_cause()->mutable_actor_died_error_context();
+  died_context->set_reason(rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
+  died_context->set_actor_id(actor_id.Binary());
+  died_context->set_error_message("The actor went out of scope.");
+  return actor_data;
+}
+
+}  // namespace
+
 void ActorTaskSubmitter::NotifyGCSWhenActorOutOfScope(
     const ActorID &actor_id, uint64_t num_restarts_due_to_lineage_reconstruction) {
   const auto actor_creation_return_id = ObjectID::ForActorHandle(actor_id);
@@ -132,6 +148,7 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
           task_spec,
           [this, actor_id, task_id](
               const ActorCreationSubmitter::CreationResult &result) {
+            const bool terminate_requested = pending_terminations_.erase(actor_id) > 0;
             if (result.status.ok()) {
               const bool is_application_error =
                   result.push_task_reply.is_application_error();
@@ -149,6 +166,32 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
                                                 result.push_task_reply,
                                                 result.actor_address,
                                                 is_application_error);
+              if (is_application_error) {
+                // A failed __init__ exits the worker on its own; the owner
+                // authors DEAD so queued and future tasks fail with the
+                // creation error instead of waiting for ALIVE forever.
+                rpc::ActorTableData actor_data;
+                actor_data.set_actor_id(actor_id.Binary());
+                actor_data.set_state(rpc::ActorTableData::DEAD);
+                *actor_data.mutable_address() = result.actor_address;
+                auto *died_context =
+                    actor_data.mutable_death_cause()->mutable_actor_died_error_context();
+                died_context->set_reason(rpc::ActorDiedErrorContext::WORKER_DIED);
+                died_context->set_actor_id(actor_id.Binary());
+                died_context->set_error_message(
+                    result.push_task_reply.task_execution_error());
+                creation_submitter_->OnActorTerminated(actor_id);
+                {
+                  absl::MutexLock lock(&mu_);
+                  owner_managed_actors_.erase(actor_id);
+                }
+                owner_state_notifier_(actor_id, actor_data);
+              } else if (terminate_requested) {
+                // The handle went out of scope while the push was in flight;
+                // finish the deferred termination now that the entry is
+                // terminable.
+                TerminateOwnerManagedActor(actor_id);
+              }
               return;
             }
             rpc::RayErrorInfo ray_error_info;
@@ -162,6 +205,15 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
             }
             RAY_UNUSED(task_manager_.FailPendingTask(
                 task_id, rpc::ErrorType::ACTOR_CREATION_FAILED, &result.status, nullptr));
+            if (terminate_requested) {
+              // The entry is gone (the submitter erases it on failure);
+              // author the DEAD state so the queue converges.
+              {
+                absl::MutexLock lock(&mu_);
+                owner_managed_actors_.erase(actor_id);
+              }
+              owner_state_notifier_(actor_id, MakeOutOfScopeDeadState(actor_id));
+            }
           });
       // The owner kills its own actor when the handle goes out of scope (the
       // GCS never learns about owner-managed actors). Registered after
@@ -242,38 +294,66 @@ void ActorTaskSubmitter::TerminateOwnerManagedActor(const ActorID &actor_id) {
       }
     }
   }
+  if (creation_submitter_->IsCreationPushInFlight(actor_id)) {
+    // The creation task push has not completed: the push-completion is the
+    // convergence point, so record the intent and let the creation callback
+    // finish the termination (killing here would race the in-flight push and
+    // the entry is not terminable until the callback fires).
+    pending_terminations_.insert(actor_id);
+    return;
+  }
   creation_submitter_->CancelCreation(actor_id, [this, actor_id](bool cancelled) {
-    rpc::ActorTableData actor_data;
-    actor_data.set_actor_id(actor_id.Binary());
-    actor_data.set_state(rpc::ActorTableData::DEAD);
-    auto *died_context =
-        actor_data.mutable_death_cause()->mutable_actor_died_error_context();
-    died_context->set_reason(rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
-    died_context->set_actor_id(actor_id.Binary());
-    died_context->set_error_message("The actor went out of scope.");
+    auto actor_data = MakeOutOfScopeDeadState(actor_id);
     if (!cancelled) {
-      // A worker was granted: kill it directly. The raylet reaps the
-      // permanent lease when the worker disconnects.
+      // A worker was granted: kill it and drop the entry.
       auto address = creation_submitter_->GetActorAddress(actor_id);
       if (address.has_value()) {
         *actor_data.mutable_address() = *address;
-        auto client = core_worker_client_pool_.GetOrConnect(*address);
-        rpc::KillActorRequest request;
-        request.set_intended_actor_id(actor_id.Binary());
-        request.set_force_kill(false);
-        client->KillActor(request, [actor_id](Status status, rpc::KillActorReply &&) {
-          if (!status.ok()) {
-            // The worker is unreachable (already dead or dying): the raylet's
-            // owner-death and disconnect handling reap the process and lease.
-            RAY_LOG(INFO).WithField(actor_id)
-                << "Failed to deliver out-of-scope kill: " << status;
-          }
-        });
+        KillOwnerManagedActorWorker(actor_id, *address, /*attempts_left=*/5);
       }
       creation_submitter_->OnActorTerminated(actor_id);
     }
+    {
+      absl::MutexLock lock(&mu_);
+      owner_managed_actors_.erase(actor_id);
+    }
     owner_state_notifier_(actor_id, actor_data);
   });
+}
+
+void ActorTaskSubmitter::KillOwnerManagedActorWorker(const ActorID &actor_id,
+                                                     const rpc::Address &address,
+                                                     int attempts_left) {
+  auto client = core_worker_client_pool_.GetOrConnect(address);
+  rpc::KillActorRequest request;
+  request.set_intended_actor_id(actor_id.Binary());
+  request.set_force_kill(false);
+  client->KillActor(
+      request,
+      [this, actor_id, address, attempts_left](Status status, rpc::KillActorReply &&) {
+        if (status.ok()) {
+          return;
+        }
+        // An unreachable worker usually means it is already dead or dying (the
+        // raylet reaps the process and lease at disconnect), but a transient
+        // transport error would otherwise leak a live, unreferenced actor:
+        // retry a few times before trusting the unreachable=dead reading.
+        // TODO(actor-ownership): replace with the acked raylet kill from
+        // design doc §5.3, which discriminates dead from unreachable.
+        if (attempts_left <= 1) {
+          RAY_LOG(WARNING).WithField(actor_id)
+              << "Giving up delivering the out-of-scope kill; the worker is presumed "
+                 "dead: "
+              << status;
+          return;
+        }
+        execute_after(
+            io_service_,
+            [this, actor_id, address, attempts_left]() {
+              KillOwnerManagedActorWorker(actor_id, address, attempts_left - 1);
+            },
+            std::chrono::milliseconds(1000));
+      });
 }
 
 void ActorTaskSubmitter::SubmitTask(TaskSpecification task_spec) {

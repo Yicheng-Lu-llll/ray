@@ -1024,9 +1024,12 @@ class OwnerManagedWorkerClient : public rpc::FakeCoreWorkerClient {
   void KillActor(const rpc::KillActorRequest &request,
                  const rpc::ClientCallback<rpc::KillActorReply> &callback) override {
     kill_requests.push_back(request);
+    kill_callbacks.push_back(callback);
   }
 
-  bool ReplyPushTask(Status status = Status::OK(), bool is_application_error = false) {
+  bool ReplyPushTask(Status status = Status::OK(),
+                     bool is_application_error = false,
+                     const std::string &task_execution_error = "") {
     if (push_callbacks.empty()) {
       return false;
     }
@@ -1034,12 +1037,24 @@ class OwnerManagedWorkerClient : public rpc::FakeCoreWorkerClient {
     push_callbacks.pop_front();
     rpc::PushTaskReply reply;
     reply.set_is_application_error(is_application_error);
+    reply.set_task_execution_error(task_execution_error);
     callback(status, std::move(reply));
+    return true;
+  }
+
+  bool ReplyKillActor(Status status = Status::OK()) {
+    if (kill_callbacks.empty()) {
+      return false;
+    }
+    auto callback = kill_callbacks.front();
+    kill_callbacks.pop_front();
+    callback(status, rpc::KillActorReply());
     return true;
   }
 
   std::deque<rpc::ClientCallback<rpc::PushTaskReply>> push_callbacks;
   std::vector<rpc::KillActorRequest> kill_requests;
+  std::deque<rpc::ClientCallback<rpc::KillActorReply>> kill_callbacks;
 };
 
 class OwnerManagedActorTest : public ::testing::Test {
@@ -1194,6 +1209,77 @@ TEST_F(OwnerManagedActorTest, OutOfScopeKillsGrantedActorAndPublishesDead) {
   EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
   EXPECT_EQ(notified_states[1].second.death_cause().actor_died_error_context().reason(),
             rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
+}
+
+TEST_F(OwnerManagedActorTest, OutOfScopeDuringPushDefersTermination) {
+  // Out-of-scope while the creation push is in flight must not touch the
+  // entry (that used to abort the owner); the termination runs after the
+  // push completes.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(3), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  // Push in flight: drop the handle now.
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  EXPECT_TRUE(worker_client_->kill_requests.empty());
+
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
+  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[0].second.state(), rpc::ActorTableData::ALIVE);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
+}
+
+TEST_F(OwnerManagedActorTest, InitErrorAuthorsDeadWithCreationError) {
+  // A failed __init__ completes the creation as an application error and the
+  // owner authors DEAD carrying the error, so queued tasks fail instead of
+  // waiting for ALIVE forever.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(4), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, /*is_application_error=*/true))
+      .Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask(Status::OK(),
+                                            /*is_application_error=*/true,
+                                            "User exception: boom"));
+
+  ASSERT_EQ(notified_states.size(), 1u);
+  EXPECT_EQ(notified_states[0].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(
+      notified_states[0].second.death_cause().actor_died_error_context().error_message(),
+      "User exception: boom");
+  EXPECT_TRUE(worker_client_->kill_requests.empty());
+}
+
+TEST_F(OwnerManagedActorTest, OutOfScopeKillRetriesTransientFailure) {
+  // A transient transport failure of the kill must not leak a live actor:
+  // the kill is retried.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(5), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
+  ASSERT_TRUE(worker_client_->ReplyKillActor(Status::IOError("transient")));
+  // The retry is scheduled with a backoff timer; run the io context until it
+  // fires.
+  io_context.restart();
+  io_context.run_for(std::chrono::milliseconds(1500));
+  ASSERT_EQ(worker_client_->kill_requests.size(), 2u);
+  ASSERT_TRUE(worker_client_->ReplyKillActor(Status::OK()));
 }
 
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,

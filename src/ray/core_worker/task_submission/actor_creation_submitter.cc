@@ -98,9 +98,23 @@ void ActorCreationSubmitter::RequestLease(const ActorID &actor_id,
         }
         CreationEntry &e = entry_it->second;
         if (!status.ok()) {
-          // The raylet may have granted even though the reply was lost, and
-          // leases never expire, so the lease must not be abandoned: retry
-          // with the same lease id, which the raylet answers idempotently.
+          // A raylet that is confirmed dead can never answer, and its death
+          // killed the lease and any grant with it: safe to restart the
+          // creation from the first hop under a fresh lease id.
+          if (is_node_dead_ != nullptr &&
+              is_node_dead_(NodeID::FromBinary(e.current_raylet_address.node_id()))) {
+            const rpc::Address first_hop = e.first_raylet_address;
+            RequestLease(actor_id,
+                         first_hop,
+                         /*is_spillback=*/false,
+                         /*reuse_lease_id=*/false);
+            return;
+          }
+          // Otherwise the raylet may have granted even though the reply was
+          // lost, and leases never expire, so the lease must not be
+          // abandoned: retry with the same lease id, which the raylet
+          // answers idempotently (a node not yet marked dead keeps being
+          // retried until the GCS marks it dead).
           const rpc::Address retry_address = e.current_raylet_address;
           RetryAfterBackoff(
               [this, actor_id, retry_address, is_spillback, issued_lease_id]() {
@@ -336,6 +350,12 @@ std::optional<rpc::Address> ActorCreationSubmitter::GetActorAddress(
     return std::nullopt;
   }
   return it->second.actor_address;
+}
+
+bool ActorCreationSubmitter::IsCreationPushInFlight(const ActorID &actor_id) const {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
+  auto it = creations_.find(actor_id);
+  return it != creations_.end() && it->second.state == CreationState::kPushing;
 }
 
 void ActorCreationSubmitter::OnActorTerminated(const ActorID &actor_id) {

@@ -566,12 +566,16 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
                     *reference_counter, creation_node_addr_factory, raylet_address))
           : std::unique_ptr<LeasePolicyInterface>(
                 std::make_unique<LocalLeasePolicy>(raylet_address));
-  auto actor_creation_submitter =
-      std::make_unique<ActorCreationSubmitter>(rpc_address,
-                                               raylet_client_pool,
-                                               core_worker_client_pool,
-                                               io_service_,
-                                               std::move(creation_lease_policy));
+  auto actor_creation_submitter = std::make_unique<ActorCreationSubmitter>(
+      rpc_address,
+      raylet_client_pool,
+      core_worker_client_pool,
+      io_service_,
+      std::move(creation_lease_policy),
+      ActorCreationSubmitter::kDefaultRetryBackoffMs,
+      /*is_node_dead=*/[this](const NodeID &node_id) {
+        return GetCoreWorker()->gcs_client_->Nodes().IsNodeDead(node_id);
+      });
   // Owner-authored actor state enters the same dispatch as a GCS
   // notification: connect the submitter and republish for borrowers.
   auto owner_state_notifier = [this](const ActorID &actor_id,

@@ -139,7 +139,9 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   void SubmitActorCreationTask(TaskSpecification task_spec);
 
   /// Terminate an owner-managed actor: cancel an ungranted creation or kill
-  /// the granted worker, then dispatch the owner-authored DEAD state. Runs on
+  /// the granted worker, then dispatch the owner-authored DEAD state. While
+  /// the creation push is in flight the termination is deferred to the
+  /// creation callback (push completion is the convergence point). Runs on
   /// the io_service thread.
   void TerminateOwnerManagedActor(const ActorID &actor_id);
 
@@ -491,6 +493,15 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   /// creation_submitter_, no GCS involvement). Guarded by mu_ because the
   /// out-of-scope callback reads it from reference-counter threads.
   absl::flat_hash_set<ActorID> owner_managed_actors_ ABSL_GUARDED_BY(mu_);
+  /// Terminations deferred until the in-flight creation push completes.
+  /// io_service thread only.
+  absl::flat_hash_set<ActorID> pending_terminations_;
+
+  /// Deliver an out-of-scope kill to the granted worker, retrying transient
+  /// transport failures before trusting unreachable=dead.
+  void KillOwnerManagedActorWorker(const ActorID &actor_id,
+                                   const rpc::Address &address,
+                                   int attempts_left);
 };
 
 }  // namespace core

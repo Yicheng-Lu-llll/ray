@@ -71,14 +71,16 @@ class ActorCreationSubmitter {
       std::shared_ptr<rpc::CoreWorkerClientPool> core_worker_client_pool,
       instrumented_io_context &io_service,
       std::unique_ptr<LeasePolicyInterface> lease_policy = nullptr,
-      int64_t retry_backoff_ms = kDefaultRetryBackoffMs)
+      int64_t retry_backoff_ms = kDefaultRetryBackoffMs,
+      std::function<bool(const NodeID &)> is_node_dead = nullptr)
       : owner_address_(std::move(owner_address)),
         owner_worker_id_(WorkerID::FromBinary(owner_address_.worker_id())),
         raylet_client_pool_(std::move(raylet_client_pool)),
         core_worker_client_pool_(std::move(core_worker_client_pool)),
         io_service_(io_service),
         lease_policy_(std::move(lease_policy)),
-        retry_backoff_ms_(retry_backoff_ms) {}
+        retry_backoff_ms_(retry_backoff_ms),
+        is_node_dead_(std::move(is_node_dead)) {}
 
   static constexpr int64_t kDefaultRetryBackoffMs = 100;
 
@@ -111,6 +113,11 @@ class ActorCreationSubmitter {
 
   /// The granted actor worker's address, once a worker was granted.
   std::optional<rpc::Address> GetActorAddress(const ActorID &actor_id) const;
+
+  /// True while the creation task push has not completed yet: a worker was
+  /// granted but the creation callback has not fired, so termination must
+  /// wait for it (the push-completion is the cancel/kill convergence point).
+  bool IsCreationPushInFlight(const ActorID &actor_id) const;
 
  private:
   enum class CreationState {
@@ -156,6 +163,10 @@ class ActorCreationSubmitter {
   absl::flat_hash_map<ActorID, CreationEntry> creations_;
   ThreadChecker thread_checker_;
   const int64_t retry_backoff_ms_;
+  /// Terminal node-death oracle; a dead raylet's lease (and any grant) died
+  /// with it, so the creation restarts from the first hop. Nullptr disables
+  /// the check (transport failures then retry the same address forever).
+  std::function<bool(const NodeID &)> is_node_dead_;
 };
 
 }  // namespace core

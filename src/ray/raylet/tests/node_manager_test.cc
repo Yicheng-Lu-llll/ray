@@ -512,6 +512,36 @@ class NodeManagerTest : public ::testing::Test {
       fake_node_manager_unexpected_worker_failure_total_count_;
 };
 
+TEST_F(NodeManagerTest, DuplicateLeaseRequestRepliesWithResourceMapping) {
+  // A lease request retried after a lost reply must get back the same
+  // resource mapping the original grant carried; for an actor creation lease
+  // that mapping is the actor's lifetime resource assignment.
+  auto lease_spec = BuildLeaseSpec({{"GPU", 1}});
+  const LeaseID lease_id = LeaseID::FromRandom();
+  lease_spec.GetMutableMessage().set_lease_id(lease_id.Binary());
+  auto worker = std::make_shared<MockWorker>(WorkerID::FromRandom(), 10, clock_);
+  worker->GrantLease(RayLease(lease_spec));
+  auto instances = std::make_shared<TaskResourceInstances>();
+  instances->Set(ResourceID::GPU(), std::vector<FixedPoint>({FixedPoint(1)}));
+  worker->SetAllocatedInstances(instances);
+  leased_workers_[lease_id] = worker;
+
+  rpc::RequestWorkerLeaseRequest request;
+  request.mutable_lease_spec()->CopyFrom(lease_spec.GetMessage());
+  rpc::RequestWorkerLeaseReply reply;
+  bool replied = false;
+  node_manager_->HandleRequestWorkerLease(
+      request, &reply, [&](Status, std::function<void()>, std::function<void()>) {
+        replied = true;
+      });
+  EXPECT_TRUE(replied);
+  EXPECT_EQ(reply.worker_address().worker_id(), worker->WorkerId().Binary());
+  ASSERT_EQ(reply.resource_mapping_size(), 1);
+  EXPECT_EQ(reply.resource_mapping(0).name(), ResourceID::GPU().Binary());
+  ASSERT_EQ(reply.resource_mapping(0).resource_ids_size(), 1);
+  EXPECT_EQ(reply.resource_mapping(0).resource_ids(0).quantity(), 1.0);
+}
+
 TEST_F(NodeManagerTest, HandleIsLocalWorkerDeadUnknownWorker) {
   WorkerID worker_id = WorkerID::FromRandom();
   EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(worker_id))

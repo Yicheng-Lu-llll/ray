@@ -1902,6 +1902,30 @@ void NodeManager::HandleRequestWorkerLease(rpc::RequestWorkerLeaseRequest reques
     reply->mutable_worker_address()->set_port(worker->Port());
     reply->mutable_worker_address()->set_worker_id(worker->WorkerId().Binary());
     reply->mutable_worker_address()->set_node_id(self_node_id_.Binary());
+    // Replay the resource mapping too. For an actor creation lease it is the
+    // actor's lifetime resource assignment; a caller retrying a lost reply
+    // would otherwise silently lose its resource ids.
+    auto allocated_resources =
+        worker->GetGrantedLease().GetLeaseSpecification().IsActorCreationTask()
+            ? worker->GetLifetimeAllocatedInstances()
+            : worker->GetAllocatedInstances();
+    if (allocated_resources != nullptr) {
+      for (auto &resource_id : allocated_resources->ResourceIds()) {
+        auto instances = allocated_resources->Get(resource_id);
+        rpc::ResourceMapEntry *resource = nullptr;
+        for (size_t inst_idx = 0; inst_idx < instances.size(); inst_idx++) {
+          if (instances[inst_idx] > 0.) {
+            if (resource == nullptr) {
+              resource = reply->add_resource_mapping();
+              resource->set_name(resource_id.Binary());
+            }
+            auto *rid = resource->add_resource_ids();
+            rid->set_index(inst_idx);
+            rid->set_quantity(instances[inst_idx].Double());
+          }
+        }
+      }
+    }
     send_reply_callback(Status::OK(), nullptr, nullptr);
     return;
   }

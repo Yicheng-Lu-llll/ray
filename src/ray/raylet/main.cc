@@ -782,7 +782,8 @@ int main(int argc, char *argv[]) {
         [&](const ray::rpc::Address &address) {
           return worker_rpc_pool->GetOrConnect(address);
         },
-        &main_service);
+        &main_service,
+        /*publishers_are_workers=*/true);
 
     object_directory = std::make_unique<ray::OwnershipBasedObjectDirectory>(
         main_service,

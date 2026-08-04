@@ -228,6 +228,24 @@ void ActorManager::WaitForActorRefDeleted(
   }
 }
 
+rpc::PubMessage MakeOwnerActorStatePubMessage(const ActorID &actor_id,
+                                              const rpc::ActorTableData &actor_data) {
+  rpc::PubMessage pub_message;
+  pub_message.set_channel_type(rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL);
+  pub_message.set_key_id(actor_id.Binary());
+  auto *state_message = pub_message.mutable_worker_actor_state_message();
+  state_message->set_state(actor_data.state());
+  *state_message->mutable_address() = actor_data.address();
+  state_message->set_num_restarts_total(actor_data.num_restarts());
+  *state_message->mutable_death_cause() = actor_data.death_cause();
+  state_message->set_preempted(actor_data.preempted());
+  // Restartability is only defined for DEAD actors (gcs::IsActorRestartable
+  // asserts on any other state).
+  state_message->set_is_restartable(actor_data.state() == rpc::ActorTableData::DEAD &&
+                                    gcs::IsActorRestartable(actor_data));
+  return pub_message;
+}
+
 void ActorManager::HandleActorStateNotification(const ActorID &actor_id,
                                                 const rpc::ActorTableData &actor_data) {
   const auto &actor_state = rpc::ActorTableData::ActorState_Name(actor_data.state());

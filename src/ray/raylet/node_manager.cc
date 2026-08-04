@@ -2433,10 +2433,14 @@ void NodeManager::ScanPendingTombstones() {
     // The record overstayed its deadline: it becomes deadline-grade — dead
     // for every consumer, honest about the residue (a D-state process no
     // longer runs user code but may hold resources until the kernel reaps
-    // it). Only raylet- or self-initiated worker records are SIGKILLed:
-    // signalling a process we merely lost a socket to, a driver (which
-    // legitimately outlives its Ray connection), or an invalid pid is not
-    // part of today's contract.
+    // it). Only raylet- or self-initiated worker records are SIGKILLed here.
+    // EOF-degraded workers are already covered under the default config by
+    // the process-group cleanup in DisconnectClient (SIGTERM then SIGKILL
+    // within ~200ms); this module adds no signal of its own for them, nor
+    // for drivers (which legitimately outlive their Ray connection) or
+    // invalid pids. NOTE: an unsignalled deadline-grade record is therefore
+    // weaker than a signalled one — the process may still run user code; a
+    // future fence consumer must not treat the two identically.
     // TODO(actor-ownership): attach a death_info from the kill initiator so
     // DEAD(DEADLINE) replies carry a cause (design doc §5.3).
     const bool signal = it->second.pid > 0 && !it->second.is_driver &&

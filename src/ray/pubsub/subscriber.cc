@@ -302,12 +302,13 @@ void Subscriber::MakeLongPollingPubsubConnection(const rpc::Address &publisher_a
   long_polling_request.set_subscriber_id(subscriber_id_.Binary());
   auto [processed_it, inserted] = processed_sequences_.try_emplace(publisher_id);
   auto &[last_publisher_id, max_processed_sequence_id] = processed_it->second;
-  if (inserted && !publisher_id.IsNil()) {
+  if (inserted && publishers_are_workers_ && !publisher_id.IsNil()) {
     // A worker publisher's id is its worker id, which the subscriber already
     // knows from the address. Seeding it makes even the first poll carry the
     // intended publisher id, so a strict publisher at a recycled address
-    // fails the poll instead of parking it forever. GCS addresses carry no
-    // worker id, keeping the lenient adopt-and-reset first contact.
+    // fails the poll instead of parking it forever. Never seeded for the GCS
+    // (see the constructor comment): its address carries a fake random worker
+    // id, and failover relies on the lenient adopt-and-reset first contact.
     last_publisher_id = publisher_id;
   }
   long_polling_request.set_publisher_id(last_publisher_id.Binary());

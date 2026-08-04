@@ -214,16 +214,24 @@ class SubscriberChannel {
 ///
 class Subscriber : public SubscriberInterface {
  public:
+  /// \param publishers_are_workers True when this subscriber talks to worker
+  /// publishers, whose publisher id is the worker id in their address: the
+  /// first long poll then already names the intended publisher (closing the
+  /// pre-first-reply window against recycled addresses). False for the GCS,
+  /// whose subscription address carries a fake random worker id and relies on
+  /// the lenient adopt-and-reset first contact for failover.
   Subscriber(
       const UniqueID subscriber_id,
       const std::vector<rpc::ChannelType> &channels,
       const int64_t max_command_batch_size,
       std::function<std::shared_ptr<SubscriberClientInterface>(const rpc::Address &)>
           get_client,
-      instrumented_io_context *callback_service)
+      instrumented_io_context *callback_service,
+      bool publishers_are_workers = false)
       : subscriber_id_(subscriber_id),
         max_command_batch_size_(max_command_batch_size),
-        get_client_(std::move(get_client)) {
+        get_client_(std::move(get_client)),
+        publishers_are_workers_(publishers_are_workers) {
     for (auto type : channels) {
       channels_.emplace(type,
                         std::make_unique<SubscriberChannel>(type, callback_service));
@@ -355,6 +363,9 @@ class Subscriber : public SubscriberInterface {
 
   /// Keeps track of last processed <publisher_id, sequence_id> by publisher.
   /// Note the publisher_id only change if gcs failover.
+  /// See the constructor comment; gates the first-poll publisher-id seed.
+  const bool publishers_are_workers_ = false;
+
   absl::flat_hash_map<UniqueID, std::pair<UniqueID, int64_t>> processed_sequences_
       ABSL_GUARDED_BY(mutex_);
 };

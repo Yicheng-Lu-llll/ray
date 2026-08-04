@@ -59,6 +59,14 @@ TEST(ParseProcStatTest, TruncatedLineFails) {
   EXPECT_FALSE(ParseProcStat(full.substr(0, full.size() - 12), &state, &ticks));
 }
 
+TEST(ParseProcStatTest, TruncatedMidNumberFails) {
+  char state = 0;
+  uint64_t ticks = 0;
+  // Cut inside field 22's digits: a partial start time must not be reported.
+  const std::string full = StatLine("raylet", 'R', 456789);
+  EXPECT_FALSE(ParseProcStat(full.substr(0, full.size() - 10), &state, &ticks));
+}
+
 TEST(ParseProcStatTest, NoCommFails) {
   char state = 0;
   uint64_t ticks = 0;

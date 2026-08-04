@@ -39,7 +39,9 @@ bool ParseProcStat(std::string_view content, char *state, uint64_t *start_time_t
   }
   uint64_t ticks = 0;
   rest >> ticks;
-  if (rest.fail()) {
+  // A complete stat line always has fields after start time; hitting EOF here
+  // means the line was truncated, possibly mid-number.
+  if (rest.fail() || rest.eof()) {
     return false;
   }
   *start_time_ticks = ticks;

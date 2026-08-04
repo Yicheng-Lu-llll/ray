@@ -24,7 +24,6 @@
 #include "absl/cleanup/cleanup.h"
 #include "absl/strings/str_format.h"
 #include "ray/asio/periodical_runner.h"
-#include "ray/common/protobuf_utils.h"
 #include "ray/common/ray_config.h"
 #include "ray/core_worker/core_worker.h"
 #include "ray/core_worker/core_worker_rpc_proxy.h"
@@ -352,7 +351,8 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
         auto core_worker = GetCoreWorker();
         return core_worker->core_worker_client_pool_->GetOrConnect(address);
       },
-      /*callback_service*/ &io_service_);
+      /*callback_service*/ &io_service_,
+      /*publishers_are_workers=*/true);
 
   auto reference_counter = std::make_shared<ReferenceCounter>(
       rpc_address,
@@ -630,17 +630,7 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
   auto publish_owned_actor_state = [publisher = object_info_publisher.get()](
                                        const ActorID &actor_id,
                                        const rpc::ActorTableData &actor_data) {
-    rpc::PubMessage pub_message;
-    pub_message.set_channel_type(rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL);
-    pub_message.set_key_id(actor_id.Binary());
-    auto *state_message = pub_message.mutable_worker_actor_state_message();
-    state_message->set_state(actor_data.state());
-    *state_message->mutable_address() = actor_data.address();
-    state_message->set_num_restarts_total(actor_data.num_restarts());
-    *state_message->mutable_death_cause() = actor_data.death_cause();
-    state_message->set_preempted(actor_data.preempted());
-    state_message->set_is_restartable(gcs::IsActorRestartable(actor_data));
-    publisher->Publish(std::move(pub_message));
+    publisher->Publish(MakeOwnerActorStatePubMessage(actor_id, actor_data));
   };
   auto actor_manager =
       std::make_unique<ActorManager>(gcs_client,

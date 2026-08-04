@@ -344,6 +344,32 @@ TEST_F(ActorManagerTest, TestOwnedActorStateNotificationRepublished) {
   EXPECT_EQ(published[0].second.num_restarts(), 3u);
 }
 
+TEST_F(ActorManagerTest, TestMakeOwnerActorStatePubMessage) {
+  // The production hook publishes exactly this message; it must not touch
+  // gcs::IsActorRestartable (which asserts state == DEAD) for live actors.
+  JobID job_id = JobID::FromInt(3);
+  ActorID actor_id = ActorID::Of(job_id, TaskID::ForDriverTask(job_id), 1);
+  rpc::ActorTableData actor_data;
+  actor_data.set_state(rpc::ActorTableData::ALIVE);
+  actor_data.set_num_restarts(2);
+  actor_data.mutable_address()->set_port(1234);
+  rpc::PubMessage alive = MakeOwnerActorStatePubMessage(actor_id, actor_data);
+  EXPECT_EQ(alive.channel_type(), rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL);
+  EXPECT_EQ(alive.key_id(), actor_id.Binary());
+  EXPECT_EQ(alive.worker_actor_state_message().state(), rpc::ActorTableData::ALIVE);
+  EXPECT_EQ(alive.worker_actor_state_message().num_restarts_total(), 2u);
+  EXPECT_EQ(alive.worker_actor_state_message().address().port(), 1234);
+  EXPECT_FALSE(alive.worker_actor_state_message().is_restartable());
+
+  actor_data.set_state(rpc::ActorTableData::DEAD);
+  actor_data.set_max_restarts(-1);
+  actor_data.mutable_death_cause()->mutable_actor_died_error_context()->set_reason(
+      rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
+  rpc::PubMessage dead = MakeOwnerActorStatePubMessage(actor_id, actor_data);
+  EXPECT_EQ(dead.worker_actor_state_message().state(), rpc::ActorTableData::DEAD);
+  EXPECT_TRUE(dead.worker_actor_state_message().is_restartable());
+}
+
 TEST_F(ActorManagerTest, TestBorrowedActorStateNotificationNotRepublished) {
   // Only the owner republishes: a borrowed handle's notifications must not
   // fan out from this worker.

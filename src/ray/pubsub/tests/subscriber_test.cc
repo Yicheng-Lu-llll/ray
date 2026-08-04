@@ -155,7 +155,8 @@ class SubscriberTest : public ::testing::Test {
                                       rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL},
         /*max_command_batch_size*/ 3,
         client_pool,
-        &callback_service_);
+        &callback_service_,
+        /*publishers_are_workers=*/true);
   }
 
   const rpc::Address GenerateOwnerAddress(
@@ -281,6 +282,30 @@ TEST_F(SubscriberTest, FirstLongPollCarriesIntendedPublisherId) {
                          EMPTY_FAILURE_CALLBACK);
   ASSERT_TRUE(owner_client->ReplyCommandBatch());
   ASSERT_EQ(owner_client->publisher_id_, owner_addr.worker_id());
+}
+
+TEST_F(SubscriberTest, FirstLongPollNotSeededForNonWorkerPublishers) {
+  // A GCS-facing subscriber (publishers_are_workers=false) must keep the
+  // lenient first contact: the GCS subscription address carries a fake random
+  // worker id, and seeding it would defeat the adopt-and-reset failover path.
+  auto gcs_facing_subscriber =
+      std::make_shared<Subscriber>(self_node_id_,
+                                   std::vector<rpc::ChannelType>{channel},
+                                   /*max_command_batch_size*/ 3,
+                                   client_pool,
+                                   &callback_service_);
+  auto subscription_callback = [](const rpc::PubMessage &) {};
+  const auto owner_addr = GenerateOwnerAddress();
+  const auto object_id = ObjectID::FromRandom();
+  gcs_facing_subscriber->Subscribe(GenerateSubMessage(object_id),
+                                   channel,
+                                   owner_addr,
+                                   object_id.Binary(),
+                                   /*subscribe_done_callback=*/nullptr,
+                                   subscription_callback,
+                                   EMPTY_FAILURE_CALLBACK);
+  ASSERT_TRUE(owner_client->ReplyCommandBatch());
+  ASSERT_EQ(owner_client->publisher_id_, UniqueID::Nil().Binary());
 }
 
 TEST_F(SubscriberTest, TestIgnoreOutofOrderMessage) {

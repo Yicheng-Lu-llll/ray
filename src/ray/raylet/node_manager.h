@@ -813,6 +813,7 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   FRIEND_TEST(NodeManagerTest, ConnectionErrorRecordsEofGradeTombstone);
   FRIEND_TEST(NodeManagerTest, WorkerInitiatedDisconnectRecordsTombstone);
   FRIEND_TEST(NodeManagerTest, DriverDisconnectRecordsDriverTombstone);
+  FRIEND_TEST(NodeManagerTest, DestroyWorkerRecordsRayletInitiatedTombstone);
 
   /// Disconnect a client.
   ///

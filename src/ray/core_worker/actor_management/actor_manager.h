@@ -27,6 +27,7 @@
 #include "ray/core_worker/reference_counter_interface.h"
 #include "ray/core_worker/task_submission/actor_task_submitter.h"
 #include "ray/gcs_rpc_client/gcs_client.h"
+#include "src/ray/protobuf/pubsub.pb.h"
 namespace ray {
 namespace core {
 
@@ -34,6 +35,12 @@ namespace core {
 /// Currently this class is only used to publish actor DEAD event
 /// for actor creation task failures. All other cases are managed
 /// by raylet.
+/// Build the owner's WORKER_ACTOR_STATE_CHANNEL message for one of its
+/// actors' state notifications (design doc §5.2 payload). is_restartable is
+/// only defined for DEAD actors and is false otherwise.
+rpc::PubMessage MakeOwnerActorStatePubMessage(const ActorID &actor_id,
+                                              const rpc::ActorTableData &actor_data);
+
 class ActorManager {
  public:
   /// \param owner_state_publish_hook Called with every actor state

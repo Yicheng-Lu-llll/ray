@@ -870,6 +870,35 @@ TEST_F(NodeManagerTest, DriverDisconnectRecordsDriverTombstone) {
   EXPECT_TRUE(tombstone.is_driver);
 }
 
+TEST_F(NodeManagerTest, DestroyWorkerRecordsRayletInitiatedTombstone) {
+  // The raylet-kill path must record a raylet-initiated tombstone: the
+  // SIGKILL-escalation scoping keys off this trigger, so a call site passing
+  // the wrong one would silently change kill behavior.
+  local_stream_socket socket(io_service_);
+  auto conn = ClientConnection::Create(
+      [](std::shared_ptr<ClientConnection>, int64_t, const std::vector<uint8_t> &) {},
+      [](std::shared_ptr<ClientConnection>, const boost::system::error_code &) {},
+      std::move(socket),
+      "test",
+      {});
+  auto worker = std::make_shared<MockWorker>(WorkerID::FromRandom(), 10, clock_);
+  worker->SetConnection(conn);
+  EXPECT_CALL(
+      mock_worker_pool_,
+      GetRegisteredWorker(testing::A<const std::shared_ptr<ClientConnection> &>()))
+      .WillOnce(Return(worker));
+  node_manager_->DestroyWorker(worker,
+                               rpc::WorkerExitType::INTENDED_SYSTEM_EXIT,
+                               "idle worker cleanup",
+                               /*force=*/false);
+
+  const auto &tombstone = node_manager_->worker_tombstones_.at(worker->WorkerId());
+  EXPECT_EQ(tombstone.trigger, NodeManager::DisconnectTrigger::kRayletInitiated);
+  EXPECT_EQ(tombstone.grade, ray::raylet::NodeManager::WorkerTombstone::Grade::kPending);
+  EXPECT_FALSE(tombstone.is_driver);
+  EXPECT_TRUE(worker->IsKilled());
+}
+
 #ifdef __linux__
 TEST_F(NodeManagerTest, EofZombieIsExitGradeImmediately) {
   // An exited-but-unreaped process (zombie) fools kill(pid, 0); the /proc

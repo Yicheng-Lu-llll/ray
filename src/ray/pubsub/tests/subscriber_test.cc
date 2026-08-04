@@ -264,6 +264,25 @@ TEST_F(SubscriberTest, TestBasicSubscription) {
   ASSERT_TRUE(subscriber_->CheckNoLeaks());
 }
 
+TEST_F(SubscriberTest, FirstLongPollCarriesIntendedPublisherId) {
+  // Worker publishers use their worker id as publisher id, and the subscriber
+  // knows that id from the address before any reply. The very first long poll
+  // must already name it, so a strict publisher at a recycled address can
+  // fail the poll instead of parking it forever.
+  auto subscription_callback = [](const rpc::PubMessage &) {};
+  const auto owner_addr = GenerateOwnerAddress();
+  const auto object_id = ObjectID::FromRandom();
+  subscriber_->Subscribe(GenerateSubMessage(object_id),
+                         channel,
+                         owner_addr,
+                         object_id.Binary(),
+                         /*subscribe_done_callback=*/nullptr,
+                         subscription_callback,
+                         EMPTY_FAILURE_CALLBACK);
+  ASSERT_TRUE(owner_client->ReplyCommandBatch());
+  ASSERT_EQ(owner_client->publisher_id_, owner_addr.worker_id());
+}
+
 TEST_F(SubscriberTest, TestIgnoreOutofOrderMessage) {
   auto subscription_callback = [this](const rpc::PubMessage &msg) {
     object_subscribed_[ObjectID::FromBinary(msg.key_id())]++;

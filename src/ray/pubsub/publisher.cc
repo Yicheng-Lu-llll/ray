@@ -372,7 +372,11 @@ void Publisher::ConnectToSubscriber(
   const auto subscriber_id = UniqueID::FromBinary(request.subscriber_id());
   RAY_LOG(DEBUG) << "Long polling connection initiated by " << subscriber_id.Hex()
                  << ", publisher_id " << publisher_id_.Hex();
+  // A first poll carries no observed publisher id yet: subscribers send an
+  // empty or Nil id until they have seen one reply. Only a real, different id
+  // is a mismatch.
   if (fail_on_publisher_id_mismatch_ && !request.publisher_id().empty() &&
+      !UniqueID::FromBinary(request.publisher_id()).IsNil() &&
       UniqueID::FromBinary(request.publisher_id()) != publisher_id_) {
     // The subscriber is polling a different publisher that used to live at
     // this address (the port was recycled). Answering normally would park the

@@ -133,6 +133,16 @@ TEST_F(PublisherTest, StrictPublisherRejectsMismatchedPublisherId) {
   // that names a different publisher with an error, so the subscriber can
   // treat the intended (dead, address-recycled) publisher as failed. The
   // lenient default keeps today's adopt-and-reset behavior for GCS failover.
+  // Declared before the publisher: a still-parked poll is force-replied from
+  // the publisher's destructor, which writes through these.
+  rpc::PubsubLongPollingRequest request;
+  request.set_subscriber_id(subscriber_id_.Binary());
+  request.set_publisher_id(UniqueID::FromRandom().Binary());
+  Status reply_status = Status::OK();
+  std::string publisher_id;
+  google::protobuf::RepeatedPtrField<rpc::PubMessage> pub_messages;
+  bool nil_replied = false;
+  bool replied = false;
   Publisher strict_publisher(
       /*channels=*/
       std::vector<rpc::ChannelType>{rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL},
@@ -142,12 +152,6 @@ TEST_F(PublisherTest, StrictPublisherRejectsMismatchedPublisherId) {
       /*publish_batch_size=*/100,
       kDefaultPublisherId,
       /*fail_on_publisher_id_mismatch=*/true);
-  rpc::PubsubLongPollingRequest request;
-  request.set_subscriber_id(subscriber_id_.Binary());
-  request.set_publisher_id(UniqueID::FromRandom().Binary());
-  Status reply_status = Status::OK();
-  std::string publisher_id;
-  google::protobuf::RepeatedPtrField<rpc::PubMessage> pub_messages;
   strict_publisher.ConnectToSubscriber(
       request,
       &publisher_id,
@@ -157,9 +161,20 @@ TEST_F(PublisherTest, StrictPublisherRejectsMismatchedPublisherId) {
       });
   EXPECT_TRUE(reply_status.IsInvalid());
 
+  // A subscriber's real first poll carries the default (Nil, 0xff-filled)
+  // publisher id: it must connect normally, not be rejected as a mismatch.
+  request.set_publisher_id(UniqueID::Nil().Binary());
+  strict_publisher.ConnectToSubscriber(
+      request,
+      &publisher_id,
+      &pub_messages,
+      [&](Status status, std::function<void()>, std::function<void()>) {
+        nil_replied = true;
+      });
+  EXPECT_FALSE(nil_replied);
+
   // A matching (or empty) publisher id connects normally.
   request.set_publisher_id(kDefaultPublisherId.Binary());
-  bool replied = false;
   strict_publisher.ConnectToSubscriber(
       request,
       &publisher_id,

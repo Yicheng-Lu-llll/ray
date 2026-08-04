@@ -28,6 +28,7 @@
 #include "ray/core_worker/actor_management/actor_creator.h"
 #include "ray/core_worker/reference_counter_interface.h"
 #include "ray/core_worker/store_provider/memory_store/memory_store.h"
+#include "ray/core_worker/task_submission/actor_creation_submitter.h"
 #include "ray/core_worker/task_submission/actor_submit_queue_interface.h"
 #include "ray/core_worker/task_submission/dependency_resolver.h"
 #include "ray/core_worker/task_submission/out_of_order_actor_submit_queue.h"
@@ -68,6 +69,12 @@ class ActorTaskSubmitterInterface {
 // This class is thread-safe.
 class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
  public:
+  /// \param creation_submitter Owner-side creation path: unnamed
+  /// non-detached actors lease and push directly from the owner instead of
+  /// going through the GCS. Nullptr routes every creation through the GCS.
+  /// \param owner_state_notifier Delivers owner-authored actor state (the
+  /// same dispatch as a GCS notification: connect + republish). Required
+  /// when creation_submitter is set.
   ActorTaskSubmitter(rpc::CoreWorkerClientPool &core_worker_client_pool,
                      rpc::RayletClientPool &raylet_client_pool,
                      std::shared_ptr<gcs::GcsClient> gcs_client,
@@ -79,7 +86,10 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
                          on_excess_queueing,
                      instrumented_io_context &io_service,
                      std::shared_ptr<ReferenceCounterInterface> reference_counter,
-                     ClockInterface &clock)
+                     ClockInterface &clock,
+                     std::unique_ptr<ActorCreationSubmitter> creation_submitter = nullptr,
+                     std::function<void(const ActorID &, const rpc::ActorTableData &)>
+                         owner_state_notifier = nullptr)
       : core_worker_client_pool_(core_worker_client_pool),
         raylet_client_pool_(raylet_client_pool),
         gcs_client_(std::move(gcs_client)),
@@ -91,7 +101,12 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
             ::RayConfig::instance().actor_excess_queueing_warn_threshold()),
         io_service_(io_service),
         reference_counter_(std::move(reference_counter)),
-        clock_(clock) {}
+        clock_(clock),
+        creation_submitter_(std::move(creation_submitter)),
+        owner_state_notifier_(std::move(owner_state_notifier)) {
+    RAY_CHECK(creation_submitter_ == nullptr || owner_state_notifier_ != nullptr)
+        << "owner_state_notifier is required with a creation submitter.";
+  }
 
   void SetPreempted(const ActorID &actor_id) override {
     absl::MutexLock lock(&mu_);
@@ -122,6 +137,11 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
 
   /// Submit an actor creation task to an actor via GCS.
   void SubmitActorCreationTask(TaskSpecification task_spec);
+
+  /// Terminate an owner-managed actor: cancel an ungranted creation or kill
+  /// the granted worker, then dispatch the owner-authored DEAD state. Runs on
+  /// the io_service thread.
+  void TerminateOwnerManagedActor(const ActorID &actor_id);
 
   /// Create connection to actor and send all pending tasks.
   ///
@@ -460,6 +480,17 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
 
   std::shared_ptr<ReferenceCounterInterface> reference_counter_;
   ClockInterface &clock_;
+
+  /// Owner-side creation path (leases and pushes from the owner, holding the
+  /// actor's permanent lease). Nullptr = every creation goes through the GCS.
+  std::unique_ptr<ActorCreationSubmitter> creation_submitter_;
+  /// Owner-authored actor state dispatch (connect + republish for
+  /// borrowers). Set iff creation_submitter_ is.
+  std::function<void(const ActorID &, const rpc::ActorTableData &)> owner_state_notifier_;
+  /// Actors whose lifecycle this owner manages (created through
+  /// creation_submitter_, no GCS involvement). Guarded by mu_ because the
+  /// out-of-scope callback reads it from reference-counter threads.
+  absl::flat_hash_set<ActorID> owner_managed_actors_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace core

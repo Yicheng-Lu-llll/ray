@@ -53,6 +53,9 @@ class ActorCreationSubmitter {
     Status status;
     /// The granted actor worker's address. Set on OK status.
     rpc::Address actor_address;
+    /// The creation task's reply from the actor worker (borrowed refs,
+    /// application error). Set when the push completed, OK or not.
+    rpc::PushTaskReply push_task_reply;
     /// The lease this actor holds for its lifetime.
     LeaseID lease_id;
     /// On cancellation by the raylet, why scheduling failed.
@@ -105,6 +108,9 @@ class ActorCreationSubmitter {
 
   /// The permanently held lease for an actor, if granted.
   std::optional<LeaseID> GetGrantedLease(const ActorID &actor_id) const;
+
+  /// The granted actor worker's address, once a worker was granted.
+  std::optional<rpc::Address> GetActorAddress(const ActorID &actor_id) const;
 
  private:
   enum class CreationState {

@@ -223,6 +223,7 @@ void ActorCreationSubmitter::PushCreationTask(const ActorID &actor_id) {
         CreationResult result;
         result.status = status;
         result.lease_id = e.lease_id;
+        result.push_task_reply = std::move(reply);
         if (status.ok()) {
           e.state = CreationState::kAlive;
           result.actor_address = e.actor_address;
@@ -325,6 +326,16 @@ void ActorCreationSubmitter::CompleteCancelled(
     cancel_callback(/*cancelled=*/true);
   }
   callback(result);
+}
+
+std::optional<rpc::Address> ActorCreationSubmitter::GetActorAddress(
+    const ActorID &actor_id) const {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
+  auto it = creations_.find(actor_id);
+  if (it == creations_.end() || it->second.state == CreationState::kPendingLease) {
+    return std::nullopt;
+  }
+  return it->second.actor_address;
 }
 
 void ActorCreationSubmitter::OnActorTerminated(const ActorID &actor_id) {

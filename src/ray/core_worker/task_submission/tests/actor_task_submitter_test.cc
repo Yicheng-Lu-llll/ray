@@ -14,6 +14,7 @@
 
 #include "ray/core_worker/task_submission/actor_task_submitter.h"
 
+#include <deque>
 #include <memory>
 #include <string>
 #include <utility>
@@ -24,12 +25,14 @@
 #include "mock/ray/gcs_client/gcs_client.h"
 #include "ray/common/test_utils.h"
 #include "ray/core_worker/actor_management/fake_actor_creator.h"
+#include "ray/core_worker/lease_policy.h"
 #include "ray/core_worker/reference_counter.h"
 #include "ray/core_worker/reference_counter_interface.h"
 #include "ray/core_worker_rpc_client/fake_core_worker_client.h"
 #include "ray/observability/fake_metric.h"
 #include "ray/pubsub/fake_publisher.h"
 #include "ray/pubsub/fake_subscriber.h"
+#include "ray/raylet_rpc_client/fake_raylet_client.h"
 #include "ray/raylet_rpc_client/raylet_client_pool.h"
 #include "ray/util/clock.h"
 
@@ -1009,6 +1012,188 @@ TEST_P(ActorTaskSubmitterTest, TestPerConcurrencyGroupSequencing) {
   }
 
   ASSERT_EQ(worker_client_->received_seq_nos.size(), 4);
+}
+
+class OwnerManagedWorkerClient : public rpc::FakeCoreWorkerClient {
+ public:
+  void PushNormalTask(std::unique_ptr<rpc::PushTaskRequest> request,
+                      const rpc::ClientCallback<rpc::PushTaskReply> &callback) override {
+    push_callbacks.push_back(callback);
+  }
+
+  void KillActor(const rpc::KillActorRequest &request,
+                 const rpc::ClientCallback<rpc::KillActorReply> &callback) override {
+    kill_requests.push_back(request);
+  }
+
+  bool ReplyPushTask(Status status = Status::OK(), bool is_application_error = false) {
+    if (push_callbacks.empty()) {
+      return false;
+    }
+    auto callback = push_callbacks.front();
+    push_callbacks.pop_front();
+    rpc::PushTaskReply reply;
+    reply.set_is_application_error(is_application_error);
+    callback(status, std::move(reply));
+    return true;
+  }
+
+  std::deque<rpc::ClientCallback<rpc::PushTaskReply>> push_callbacks;
+  std::vector<rpc::KillActorRequest> kill_requests;
+};
+
+class OwnerManagedActorTest : public ::testing::Test {
+ protected:
+  OwnerManagedActorTest()
+      : io_work(io_context.get_executor()),
+        raylet_client_(std::make_shared<rpc::FakeRayletClient>()),
+        worker_client_(std::make_shared<OwnerManagedWorkerClient>()),
+        client_pool_(std::make_shared<rpc::CoreWorkerClientPool>(
+            [this](const rpc::Address &) { return worker_client_; })),
+        raylet_client_pool_(std::make_shared<rpc::RayletClientPool>(
+            [this](const rpc::Address &) { return raylet_client_; })),
+        store_(std::make_shared<CoreWorkerMemoryStore>(io_context, clock_)),
+        task_manager_(std::make_shared<MockTaskManagerInterface>()),
+        mock_gcs_client_(std::make_shared<gcs::MockGcsClient>()),
+        publisher_(std::make_unique<pubsub::FakePublisher>()),
+        subscriber_(std::make_unique<pubsub::FakeSubscriber>()),
+        reference_counter_(std::make_shared<ReferenceCounter>(
+            rpc::Address(),
+            publisher_.get(),
+            subscriber_.get(),
+            /*is_node_dead=*/[](const NodeID &) { return false; },
+            /*free_object_on_nodes_async=*/
+            [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
+            fake_owned_object_count_gauge_,
+            fake_owned_object_size_gauge_,
+            /*lineage_pinning_enabled=*/false)),
+        submitter_(
+            *client_pool_,
+            *raylet_client_pool_,
+            mock_gcs_client_,
+            *store_,
+            *task_manager_,
+            actor_creator_,
+            [](const ObjectID &object_id) { return std::nullopt; },
+            [](const ActorID &, const std::string &, int64_t) {},
+            io_context,
+            reference_counter_,
+            clock_,
+            std::make_unique<ActorCreationSubmitter>(
+                rpc::Address(),
+                raylet_client_pool_,
+                client_pool_,
+                io_context,
+                std::make_unique<LocalLeasePolicy>(LocalRayletAddress()),
+                /*retry_backoff_ms=*/0),
+            [this](const ActorID &actor_id, const rpc::ActorTableData &actor_data) {
+              notified_states.emplace_back(actor_id, actor_data);
+            }) {}
+
+  void TearDown() override { io_context.stop(); }
+
+  static rpc::Address LocalRayletAddress() {
+    rpc::Address address;
+    address.set_node_id(NodeID::FromRandom().Binary());
+    address.set_ip_address("127.0.0.1");
+    address.set_port(7000);
+    return address;
+  }
+
+  TaskSpecification BuildCreationTaskSpec(const ActorID &actor_id) {
+    rpc::TaskSpec spec;
+    spec.set_type(rpc::TaskType::ACTOR_CREATION_TASK);
+    spec.set_task_id(TaskID::ForActorCreationTask(actor_id).Binary());
+    spec.set_job_id(actor_id.JobId().Binary());
+    spec.set_num_returns(1);
+    spec.mutable_actor_creation_task_spec()->set_actor_id(actor_id.Binary());
+    return TaskSpecification(std::move(spec));
+  }
+
+  /// Register the actor handle's return object like ActorManager does in
+  /// production before submission (the owner owns it with a local ref).
+  void OwnHandle(const ActorID &actor_id) {
+    reference_counter_->AddOwnedObject(ObjectID::ForActorHandle(actor_id),
+                                       /*contained_ids=*/{},
+                                       rpc::Address(),
+                                       "test",
+                                       /*object_size*/ -1,
+                                       LineageReconstructionEligibility::ELIGIBLE,
+                                       /*add_local_ref=*/true);
+  }
+
+  void Pump() {
+    for (int i = 0; i < 10; i++) {
+      io_context.restart();
+      io_context.poll();
+    }
+  }
+
+  Clock clock_;
+  instrumented_io_context io_context;
+  boost::asio::executor_work_guard<boost::asio::io_context::executor_type> io_work;
+  std::shared_ptr<rpc::FakeRayletClient> raylet_client_;
+  std::shared_ptr<OwnerManagedWorkerClient> worker_client_;
+  std::shared_ptr<rpc::CoreWorkerClientPool> client_pool_;
+  std::shared_ptr<rpc::RayletClientPool> raylet_client_pool_;
+  std::shared_ptr<CoreWorkerMemoryStore> store_;
+  std::shared_ptr<MockTaskManagerInterface> task_manager_;
+  std::shared_ptr<gcs::MockGcsClient> mock_gcs_client_;
+  std::unique_ptr<pubsub::FakePublisher> publisher_;
+  std::unique_ptr<pubsub::FakeSubscriber> subscriber_;
+  ray::observability::FakeGauge fake_owned_object_count_gauge_;
+  ray::observability::FakeGauge fake_owned_object_size_gauge_;
+  std::shared_ptr<ReferenceCounterInterface> reference_counter_;
+  FakeActorCreator actor_creator_;
+  std::vector<std::pair<ActorID, rpc::ActorTableData>> notified_states;
+  ActorTaskSubmitter submitter_;
+};
+
+TEST_F(OwnerManagedActorTest, CreationHappyPathPublishesAliveWithoutGCS) {
+  // An unnamed non-detached actor is created from the owner: lease, push,
+  // then the owner authors ALIVE. The GCS is never asked to create it.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(1), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_,
+              CompletePendingTask(_, _, _, /*is_application_error=*/false))
+      .Times(1);
+
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  ASSERT_EQ(notified_states.size(), 1u);
+  EXPECT_EQ(notified_states[0].first, actor_id);
+  EXPECT_EQ(notified_states[0].second.state(), rpc::ActorTableData::ALIVE);
+  EXPECT_EQ(notified_states[0].second.address().port(), 9998);
+  EXPECT_EQ(notified_states[0].second.num_restarts(), 0u);
+}
+
+TEST_F(OwnerManagedActorTest, OutOfScopeKillsGrantedActorAndPublishesDead) {
+  // When the handle goes out of scope the owner kills its actor directly and
+  // authors DEAD(OUT_OF_SCOPE); no GCS report is sent.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(2), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(notified_states.size(), 1u);
+
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+
+  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
+  EXPECT_EQ(worker_client_->kill_requests[0].intended_actor_id(), actor_id.Binary());
+  EXPECT_FALSE(worker_client_->kill_requests[0].force_kill());
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(notified_states[1].second.death_cause().actor_died_error_context().reason(),
+            rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,

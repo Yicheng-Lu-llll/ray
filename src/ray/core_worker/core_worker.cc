@@ -2251,7 +2251,16 @@ Status CoreWorker::CreateActor(const RayFunction &function,
       // Actor creation task retry happens on GCS not on core worker.
       /*max_retries=*/0);
 
-  if (actor_name.empty()) {
+  if (actor_name.empty() && !is_detached) {
+    // Owner-managed actor: the owner holds the reference-counting truth and
+    // the actor's permanent lease, so there is nothing to register with the
+    // GCS — creation goes straight to the submitter.
+    io_service_.post(
+        [this, task_spec = std::move(task_spec)]() {
+          actor_task_submitter_->SubmitActorCreationTask(task_spec);
+        },
+        "CoreWorker.SubmitActorCreationTask");
+  } else if (actor_name.empty()) {
     io_service_.post(
         [this, task_spec = std::move(task_spec)]() {
           actor_creator_->AsyncRegisterActor(task_spec, [this, task_spec](Status status) {

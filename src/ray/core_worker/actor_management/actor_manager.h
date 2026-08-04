@@ -159,6 +159,14 @@ class ActorManager {
   /// \param actor_id ID of the actor to be subscribed.
   void SubscribeActorState(const ActorID &actor_id);
 
+  /// Handle an actor state notification: from the GCS for GCS-managed
+  /// actors, or authored by this worker for actors it owns and manages.
+  ///
+  /// \param[in] actor_id The actor id of this notification.
+  /// \param[in] actor_data The actor data.
+  void HandleActorStateNotification(const ActorID &actor_id,
+                                    const rpc::ActorTableData &actor_data);
+
   /// Returns the actor handle if it exists, nullptr otherwise.
   std::shared_ptr<ActorHandle> GetActorHandleIfExists(const ActorID &actor_id);
 
@@ -192,13 +200,6 @@ class ActorManager {
   /// Check if named actor is cached locally.
   /// If it has been cached, core worker will not get actor id by name from GCS.
   ActorID GetCachedNamedActorID(const std::string &actor_name);
-
-  /// Handle actor state notification published from GCS.
-  ///
-  /// \param[in] actor_id The actor id of this notification.
-  /// \param[in] actor_data The GCS actor data.
-  void HandleActorStateNotification(const ActorID &actor_id,
-                                    const rpc::ActorTableData &actor_data);
 
   /// It should be invoked when the actor is killed or out of scope.
   /// After the actor is marked killed or out of scope, task submission to the actor will

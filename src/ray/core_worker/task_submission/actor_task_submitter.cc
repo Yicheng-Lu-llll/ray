@@ -36,6 +36,11 @@ void ActorTaskSubmitter::NotifyGCSWhenActorOutOfScope(
                                          const ObjectID &object_id) {
     {
       absl::MutexLock lock(&mu_);
+      if (owner_managed_actors_.contains(actor_id)) {
+        // Owner-managed: termination is handled by the callback registered at
+        // submission time; the GCS does not know this actor.
+        return;
+      }
       if (auto iter = client_queues_.find(actor_id); iter != client_queues_.end()) {
         if (iter->second.state_ != rpc::ActorTableData::DEAD) {
           iter->second.pending_out_of_scope_death_ = true;
@@ -110,6 +115,69 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
     }
     RAY_LOG(DEBUG).WithField(actor_id).WithField(task_id)
         << "Actor creation task dependencies resolved";
+    // Unnamed non-detached actors are owner-managed: the owner leases a
+    // worker and pushes the creation task itself, holding the actor's
+    // permanent lease; the GCS is not involved. Named actors still go
+    // through the GCS for name uniqueness; detached actors' lifetimes are
+    // not bound to the owner, so the GCS keeps managing them.
+    if (creation_submitter_ != nullptr && !task_spec.IsDetachedActor() &&
+        task_spec.GetName().empty()) {
+      RAY_LOG(DEBUG).WithField(actor_id).WithField(task_id)
+          << "Creating actor from the owner";
+      {
+        absl::MutexLock lock(&mu_);
+        owner_managed_actors_.insert(actor_id);
+      }
+      creation_submitter_->SubmitCreation(
+          task_spec,
+          [this, actor_id, task_id](
+              const ActorCreationSubmitter::CreationResult &result) {
+            if (result.status.ok()) {
+              const bool is_application_error =
+                  result.push_task_reply.is_application_error();
+              if (!is_application_error) {
+                // Owner-authored ALIVE: enters the same dispatch as a GCS
+                // notification (connect + republish for borrowers).
+                rpc::ActorTableData actor_data;
+                actor_data.set_actor_id(actor_id.Binary());
+                actor_data.set_state(rpc::ActorTableData::ALIVE);
+                *actor_data.mutable_address() = result.actor_address;
+                actor_data.set_num_restarts(0);
+                owner_state_notifier_(actor_id, actor_data);
+              }
+              task_manager_.CompletePendingTask(task_id,
+                                                result.push_task_reply,
+                                                result.actor_address,
+                                                is_application_error);
+              return;
+            }
+            rpc::RayErrorInfo ray_error_info;
+            if (result.status.IsSchedulingCancelled()) {
+              RAY_LOG(DEBUG).WithField(actor_id).WithField(task_id)
+                  << "Actor creation cancelled";
+              task_manager_.MarkTaskNoRetry(task_id);
+            } else {
+              RAY_LOG(INFO).WithField(actor_id).WithField(task_id)
+                  << "Failed to create actor with status: " << result.status;
+            }
+            RAY_UNUSED(task_manager_.FailPendingTask(
+                task_id, rpc::ErrorType::ACTOR_CREATION_FAILED, &result.status, nullptr));
+          });
+      // The owner kills its own actor when the handle goes out of scope (the
+      // GCS never learns about owner-managed actors). Registered after
+      // SubmitCreation so an already-out-of-scope handle cancels the entry
+      // just created.
+      auto terminate = [this, actor_id](const ObjectID &) {
+        io_service_.post([this, actor_id]() { TerminateOwnerManagedActor(actor_id); },
+                         "ActorTaskSubmitter.TerminateOwnerManagedActor");
+      };
+      const auto actor_creation_return_id = ObjectID::ForActorHandle(actor_id);
+      if (!reference_counter_->AddObjectOutOfScopeOrFreedCallback(
+              actor_creation_return_id, terminate)) {
+        terminate(actor_creation_return_id);
+      }
+      return;
+    }
     // The actor creation task will be sent to
     // gcs server directly after the in-memory dependent objects are resolved. For
     // more details please see the protocol of actor management based on gcs.
@@ -162,6 +230,49 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
                 ray_error_info.has_actor_died_error() ? &ray_error_info : nullptr));
           }
         });
+  });
+}
+
+void ActorTaskSubmitter::TerminateOwnerManagedActor(const ActorID &actor_id) {
+  {
+    absl::MutexLock lock(&mu_);
+    if (auto iter = client_queues_.find(actor_id); iter != client_queues_.end()) {
+      if (iter->second.state_ != rpc::ActorTableData::DEAD) {
+        iter->second.pending_out_of_scope_death_ = true;
+      }
+    }
+  }
+  creation_submitter_->CancelCreation(actor_id, [this, actor_id](bool cancelled) {
+    rpc::ActorTableData actor_data;
+    actor_data.set_actor_id(actor_id.Binary());
+    actor_data.set_state(rpc::ActorTableData::DEAD);
+    auto *died_context =
+        actor_data.mutable_death_cause()->mutable_actor_died_error_context();
+    died_context->set_reason(rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
+    died_context->set_actor_id(actor_id.Binary());
+    died_context->set_error_message("The actor went out of scope.");
+    if (!cancelled) {
+      // A worker was granted: kill it directly. The raylet reaps the
+      // permanent lease when the worker disconnects.
+      auto address = creation_submitter_->GetActorAddress(actor_id);
+      if (address.has_value()) {
+        *actor_data.mutable_address() = *address;
+        auto client = core_worker_client_pool_.GetOrConnect(*address);
+        rpc::KillActorRequest request;
+        request.set_intended_actor_id(actor_id.Binary());
+        request.set_force_kill(false);
+        client->KillActor(request, [actor_id](Status status, rpc::KillActorReply &&) {
+          if (!status.ok()) {
+            // The worker is unreachable (already dead or dying): the raylet's
+            // owner-death and disconnect handling reap the process and lease.
+            RAY_LOG(INFO).WithField(actor_id)
+                << "Failed to deliver out-of-scope kill: " << status;
+          }
+        });
+      }
+      creation_submitter_->OnActorTerminated(actor_id);
+    }
+    owner_state_notifier_(actor_id, actor_data);
   });
 }
 

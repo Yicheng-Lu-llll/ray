@@ -72,6 +72,7 @@ ray_cc_library(
         "//src/ray/core_worker:__subpackages__",
     ],
     deps = [
+        ":actor_creation_submitter",
         ":actor_submit_queue",
         ":dependency_resolver",
         ":out_of_order_actor_submit_queue",

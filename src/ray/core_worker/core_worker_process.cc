@@ -547,6 +547,39 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
 
   auto actor_creator = std::make_shared<ActorCreator>(gcs_client->Actors());
 
+  auto creation_node_addr_factory = [this](const NodeID &node_id) {
+    auto core_worker = GetCoreWorker();
+    std::optional<rpc::Address> address_opt;
+    if (auto node_info =
+            core_worker->gcs_client_->Nodes().GetNodeAddressAndLiveness(node_id)) {
+      auto &address = address_opt.emplace();
+      address.set_node_id(node_info->node_id());
+      address.set_ip_address(node_info->node_manager_address());
+      address.set_port(node_info->node_manager_port());
+    }
+    return address_opt;
+  };
+  auto creation_lease_policy =
+      RayConfig::instance().locality_aware_leasing_enabled()
+          ? std::unique_ptr<LeasePolicyInterface>(
+                std::make_unique<LocalityAwareLeasePolicy>(
+                    *reference_counter, creation_node_addr_factory, raylet_address))
+          : std::unique_ptr<LeasePolicyInterface>(
+                std::make_unique<LocalLeasePolicy>(raylet_address));
+  auto actor_creation_submitter =
+      std::make_unique<ActorCreationSubmitter>(rpc_address,
+                                               raylet_client_pool,
+                                               core_worker_client_pool,
+                                               io_service_,
+                                               std::move(creation_lease_policy));
+  // Owner-authored actor state enters the same dispatch as a GCS
+  // notification: connect the submitter and republish for borrowers.
+  auto owner_state_notifier = [this](const ActorID &actor_id,
+                                     const rpc::ActorTableData &actor_data) {
+    auto core_worker = GetCoreWorker();
+    core_worker->actor_manager_->HandleActorStateNotification(actor_id, actor_data);
+  };
+
   auto actor_task_submitter = std::make_unique<ActorTaskSubmitter>(
       *core_worker_client_pool,
       *raylet_client_pool,
@@ -562,7 +595,9 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
       on_excess_queueing,
       io_service_,
       reference_counter,
-      /*clock=*/clock_);
+      /*clock=*/clock_,
+      std::move(actor_creation_submitter),
+      std::move(owner_state_notifier));
 
   auto node_addr_factory = [this](const NodeID &node_id) {
     auto core_worker = GetCoreWorker();

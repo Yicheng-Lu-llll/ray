@@ -251,6 +251,7 @@ std::unique_ptr<EntityState> SubscriptionIndex::CreateEntityState(
 
   case rpc::ChannelType::WORKER_REF_REMOVED_CHANNEL:
   case rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL:
+  case rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL:
   case rpc::ChannelType::GCS_ACTOR_CHANNEL:
   case rpc::ChannelType::GCS_JOB_CHANNEL:
   case rpc::ChannelType::GCS_NODE_INFO_CHANNEL:
@@ -371,6 +372,18 @@ void Publisher::ConnectToSubscriber(
   const auto subscriber_id = UniqueID::FromBinary(request.subscriber_id());
   RAY_LOG(DEBUG) << "Long polling connection initiated by " << subscriber_id.Hex()
                  << ", publisher_id " << publisher_id_.Hex();
+  if (fail_on_publisher_id_mismatch_ && !request.publisher_id().empty() &&
+      UniqueID::FromBinary(request.publisher_id()) != publisher_id_) {
+    // The subscriber is polling a different publisher that used to live at
+    // this address (the port was recycled). Answering normally would park the
+    // poll forever; failing lets the subscriber treat the intended publisher
+    // as failed.
+    send_reply_callback(
+        Status::Invalid("Long poll intended for a different publisher id."),
+        nullptr,
+        nullptr);
+    return;
+  }
   absl::MutexLock lock(&mutex_);
   auto it = subscribers_.find(subscriber_id);
   if (it == subscribers_.end()) {

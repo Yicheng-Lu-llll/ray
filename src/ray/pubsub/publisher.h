@@ -373,12 +373,14 @@ class Publisher : public PublisherInterface {
             ClockInterface &clock,
             const uint64_t subscriber_timeout_ms,
             int64_t publish_batch_size,
-            UniqueID publisher_id = NodeID::FromRandom())
+            UniqueID publisher_id = NodeID::FromRandom(),
+            bool fail_on_publisher_id_mismatch = false)
       : periodical_runner_(&periodical_runner),
         clock_(clock),
         subscriber_timeout_ms_(subscriber_timeout_ms),
         publish_batch_size_(publish_batch_size),
-        publisher_id_(publisher_id) {
+        publisher_id_(publisher_id),
+        fail_on_publisher_id_mismatch_(fail_on_publisher_id_mismatch) {
     // Insert index map for each channel.
     for (auto type : channels) {
       subscription_index_map_.emplace(type, SubscriptionIndex(type));
@@ -520,6 +522,12 @@ class Publisher : public PublisherInterface {
   int64_t next_sequence_id_ ABSL_GUARDED_BY(mutex_) = 0;
 
   const UniqueID publisher_id_;
+  /// When set, a long poll naming a different publisher id is answered with an
+  /// error instead of being adopted: worker publishers set this because a
+  /// worker id is never legitimately reused at the same address (a mismatch
+  /// means the address was recycled and the intended publisher is dead),
+  /// while the GCS keeps the lenient behavior for failover.
+  const bool fail_on_publisher_id_mismatch_ = false;
 
   std::string possible_channel_types;
 };

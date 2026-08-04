@@ -329,19 +329,21 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
   auto object_info_publisher = std::make_unique<pubsub::PostingPublisher>(
       std::make_shared<pubsub::Publisher>(
           /*channels=*/
-          std::vector<rpc::ChannelType>{
-              rpc::ChannelType::WORKER_REF_REMOVED_CHANNEL,
-              rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL},
+          std::vector<rpc::ChannelType>{rpc::ChannelType::WORKER_REF_REMOVED_CHANNEL,
+                                        rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL,
+                                        rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL},
           /*periodical_runner=*/*periodical_runner,
           /*clock=*/clock_,
           /*subscriber_timeout_ms=*/RayConfig::instance().subscriber_timeout_ms(),
           /*publish_batch_size_=*/RayConfig::instance().publish_batch_size(),
-          worker_context->GetWorkerID()),
+          worker_context->GetWorkerID(),
+          /*fail_on_publisher_id_mismatch=*/true),
       io_service_);
   auto object_info_subscriber = std::make_unique<pubsub::Subscriber>(
       /*subscriber_id=*/worker_context->GetWorkerID(),
       /*channels=*/
-      std::vector<rpc::ChannelType>{rpc::ChannelType::WORKER_REF_REMOVED_CHANNEL,
+      std::vector<rpc::ChannelType>{rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL,
+                                    rpc::ChannelType::WORKER_REF_REMOVED_CHANNEL,
                                     rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL},
       /*max_command_batch_size*/ RayConfig::instance().max_command_batch_size(),
       /*get_client=*/

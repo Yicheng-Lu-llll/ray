@@ -128,6 +128,63 @@ class PublisherTest : public ::testing::Test {
   int64_t sequence_id_ = 0;
 };
 
+TEST_F(PublisherTest, StrictPublisherRejectsMismatchedPublisherId) {
+  // A worker publisher with fail_on_publisher_id_mismatch answers a long poll
+  // that names a different publisher with an error, so the subscriber can
+  // treat the intended (dead, address-recycled) publisher as failed. The
+  // lenient default keeps today's adopt-and-reset behavior for GCS failover.
+  Publisher strict_publisher(
+      /*channels=*/
+      std::vector<rpc::ChannelType>{rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL},
+      *periodical_runner_,
+      fake_clock_,
+      subscriber_timeout_ms_,
+      /*publish_batch_size=*/100,
+      kDefaultPublisherId,
+      /*fail_on_publisher_id_mismatch=*/true);
+  rpc::PubsubLongPollingRequest request;
+  request.set_subscriber_id(subscriber_id_.Binary());
+  request.set_publisher_id(UniqueID::FromRandom().Binary());
+  Status reply_status = Status::OK();
+  std::string publisher_id;
+  google::protobuf::RepeatedPtrField<rpc::PubMessage> pub_messages;
+  strict_publisher.ConnectToSubscriber(
+      request,
+      &publisher_id,
+      &pub_messages,
+      [&](Status status, std::function<void()>, std::function<void()>) {
+        reply_status = status;
+      });
+  EXPECT_TRUE(reply_status.IsInvalid());
+
+  // A matching (or empty) publisher id connects normally.
+  request.set_publisher_id(kDefaultPublisherId.Binary());
+  bool replied = false;
+  strict_publisher.ConnectToSubscriber(
+      request,
+      &publisher_id,
+      &pub_messages,
+      [&](Status status, std::function<void()>, std::function<void()>) {
+        replied = true;
+        EXPECT_TRUE(status.ok());
+      });
+  // The poll parks (no messages); no immediate reply expected.
+  EXPECT_FALSE(replied);
+}
+
+TEST_F(PublisherTest, WorkerActorStateChannelHasEntityState) {
+  // The new channel must be wired into CreateEntityState (a miss is FATAL).
+  SubscriptionIndex index(rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL);
+  auto message = std::make_shared<rpc::PubMessage>();
+  message->mutable_worker_actor_state_message()->set_num_restarts_total(1);
+  message->set_key_id("actor-key");
+  message->set_channel_type(rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL);
+  message->set_sequence_id(1);
+  index.AddEntry(message->key_id(), CreateSubscriber());
+  index.Publish(message, 1);
+  EXPECT_TRUE(index.HasKeyId(message->key_id()));
+}
+
 TEST_F(PublisherTest, TestSubscriptionIndexSingeNodeSingleObject) {
   auto oid = ObjectID::FromRandom();
   auto *subscriber = CreateSubscriber();

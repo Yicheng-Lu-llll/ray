@@ -50,6 +50,16 @@ void ActorCreationSubmitter::SubmitCreation(const TaskSpecification &creation_sp
       actor_id, start_raylet_address, /*is_spillback=*/false, /*reuse_lease_id=*/false);
 }
 
+void ActorCreationSubmitter::SubmitCreation(const TaskSpecification &creation_spec,
+                                            CreationCallback callback) {
+  RAY_CHECK(lease_policy_ != nullptr)
+      << "SubmitCreation without an explicit raylet requires a lease policy.";
+  auto [best_node_address, is_selected_based_on_locality] =
+      lease_policy_->GetBestNodeForLease(LeaseSpecification(creation_spec.GetMessage()));
+  (void)is_selected_based_on_locality;
+  SubmitCreation(creation_spec, best_node_address, std::move(callback));
+}
+
 void ActorCreationSubmitter::RequestLease(const ActorID &actor_id,
                                           const rpc::Address &raylet_address,
                                           bool is_spillback,

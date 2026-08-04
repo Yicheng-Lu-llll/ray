@@ -80,6 +80,7 @@ class ActorCreationSubmitterTest : public ::testing::Test {
                    raylet_client_pool_,
                    core_worker_client_pool_,
                    io_service_,
+                   /*lease_policy=*/nullptr,
                    /*retry_backoff_ms=*/0) {}
 
   /// Run deferred backoff retries to completion.
@@ -276,6 +277,37 @@ TEST_F(ActorCreationSubmitterTest, TerminatedActorCanBeResubmitted) {
                             RayletAddress(NodeID::FromRandom()),
                             [](const ActorCreationSubmitter::CreationResult &) {});
   EXPECT_EQ(raylet_client_->num_workers_requested, 2);
+}
+
+class RecordingLeasePolicy : public LeasePolicyInterface {
+ public:
+  explicit RecordingLeasePolicy(rpc::Address address) : address_(std::move(address)) {}
+  std::pair<rpc::Address, bool> GetBestNodeForLease(const LeaseSpecification &) override {
+    calls++;
+    return {address_, true};
+  }
+  int calls = 0;
+
+ private:
+  rpc::Address address_;
+};
+
+TEST_F(ActorCreationSubmitterTest, PolicyChoosesStartRaylet) {
+  auto policy_address = RayletAddress(NodeID::FromRandom());
+  auto policy = std::make_unique<RecordingLeasePolicy>(policy_address);
+  auto *policy_ptr = policy.get();
+  ActorCreationSubmitter submitter(OwnerAddress(),
+                                   raylet_client_pool_,
+                                   core_worker_client_pool_,
+                                   io_service_,
+                                   std::move(policy),
+                                   /*retry_backoff_ms=*/0);
+  const ActorID actor_id =
+      ActorID::Of(JobID::FromInt(9), TaskID::Nil(), /*parent_task_counter=*/1);
+  submitter.SubmitCreation(BuildCreationTaskSpec(actor_id),
+                           [](const ActorCreationSubmitter::CreationResult &) {});
+  EXPECT_EQ(policy_ptr->calls, 1);
+  EXPECT_EQ(raylet_client_->num_workers_requested, 1);
 }
 
 }  // namespace

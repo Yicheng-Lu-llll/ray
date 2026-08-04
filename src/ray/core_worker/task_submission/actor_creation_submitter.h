@@ -27,6 +27,7 @@
 #include "ray/common/lease/lease_spec.h"
 #include "ray/common/status.h"
 #include "ray/common/task/task_spec.h"
+#include "ray/core_worker/lease_policy.h"
 #include "ray/core_worker_rpc_client/core_worker_client_pool.h"
 #include "ray/raylet_rpc_client/raylet_client_pool.h"
 #include "ray/util/thread_checker.h"
@@ -66,12 +67,14 @@ class ActorCreationSubmitter {
       std::shared_ptr<rpc::RayletClientPool> raylet_client_pool,
       std::shared_ptr<rpc::CoreWorkerClientPool> core_worker_client_pool,
       instrumented_io_context &io_service,
+      std::unique_ptr<LeasePolicyInterface> lease_policy = nullptr,
       int64_t retry_backoff_ms = kDefaultRetryBackoffMs)
       : owner_address_(std::move(owner_address)),
         owner_worker_id_(WorkerID::FromBinary(owner_address_.worker_id())),
         raylet_client_pool_(std::move(raylet_client_pool)),
         core_worker_client_pool_(std::move(core_worker_client_pool)),
         io_service_(io_service),
+        lease_policy_(std::move(lease_policy)),
         retry_backoff_ms_(retry_backoff_ms) {}
 
   static constexpr int64_t kDefaultRetryBackoffMs = 100;
@@ -82,6 +85,10 @@ class ActorCreationSubmitter {
   void SubmitCreation(const TaskSpecification &creation_spec,
                       const rpc::Address &start_raylet_address,
                       CreationCallback callback);
+
+  /// As above, with the starting raylet chosen by the injected lease policy
+  /// (locality-aware when constructed with one).
+  void SubmitCreation(const TaskSpecification &creation_spec, CreationCallback callback);
 
   /// Cancel a creation that has not been granted yet, looping the cancel
   /// until it converges. When a creation ends cancelled, cancel callbacks
@@ -139,6 +146,7 @@ class ActorCreationSubmitter {
   std::shared_ptr<rpc::RayletClientPool> raylet_client_pool_;
   std::shared_ptr<rpc::CoreWorkerClientPool> core_worker_client_pool_;
   instrumented_io_context &io_service_;
+  std::unique_ptr<LeasePolicyInterface> lease_policy_;
   absl::flat_hash_map<ActorID, CreationEntry> creations_;
   ThreadChecker thread_checker_;
   const int64_t retry_backoff_ms_;

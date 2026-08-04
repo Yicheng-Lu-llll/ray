@@ -31,16 +31,16 @@
 namespace ray {
 namespace core {
 
-/// Class to manage lifetimes of actors that we create (actor children).
-/// Currently this class is only used to publish actor DEAD event
-/// for actor creation task failures. All other cases are managed
-/// by raylet.
 /// Build the owner's WORKER_ACTOR_STATE_CHANNEL message for one of its
 /// actors' state notifications (design doc §5.2 payload). is_restartable is
 /// only defined for DEAD actors and is false otherwise.
 rpc::PubMessage MakeOwnerActorStatePubMessage(const ActorID &actor_id,
                                               const rpc::ActorTableData &actor_data);
 
+/// Class to manage lifetimes of actors that we create (actor children).
+/// Currently this class is only used to publish actor DEAD event
+/// for actor creation task failures. All other cases are managed
+/// by raylet.
 class ActorManager {
  public:
   /// \param owner_state_publish_hook Called with every actor state

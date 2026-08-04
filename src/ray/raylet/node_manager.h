@@ -778,8 +778,8 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// One periodic pass over all pending tombstones: upgrade exited processes
   /// to exit-grade; escalate processes that overstayed their deadline to
   /// SIGKILL and record them deadline-grade (a single timer regardless of the
-  /// number of pending records). TODO(ownership): zombies (unreaped drivers)
-  /// and pid reuse both fool kill(pid,0) — needs start-time identity. On
+  /// number of pending records; probes /proc for state and start time, so a
+  /// zombie counts as exited and a reused pid cannot mask an exit). On
   /// Windows there is no exit observation: pending records stay pending (EOF
   /// records remain exit-grade, unverifiable) and every record is evictable
   /// so the ledger stays bounded.
@@ -991,6 +991,11 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
     };
     Grade grade = Grade::kPending;
     pid_t pid = -1;
+    /// Process start time (clock ticks since boot, /proc/<pid>/stat field 22)
+    /// captured at record time; 0 when unavailable. Guards the exit probe
+    /// against pid reuse: same pid + different start time = the original
+    /// process exited.
+    uint64_t start_time_ticks = 0;
     /// Steady-clock deadline (ms) after which a still-running pending process
     /// is escalated to SIGKILL and the record becomes deadline-grade.
     int64_t deadline_ms = 0;

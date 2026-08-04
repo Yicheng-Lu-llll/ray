@@ -24,6 +24,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_set>
@@ -2278,6 +2279,45 @@ void NodeManager::HandleReturnWorkerLease(rpc::ReturnWorkerLeaseRequest request,
   send_reply_callback(Status::OK(), nullptr, nullptr);
 }
 
+namespace {
+#ifndef _WIN32
+/// Probe /proc/<pid>/stat. Returns false when the process is gone (or /proc
+/// is unreadable, treated as gone on Linux). On success fills the state
+/// character (field 3) and start time (field 22).
+bool ProbeProcStat(pid_t pid, char *state, uint64_t *start_time_ticks) {
+  std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
+  if (!stat_file.good()) {
+    return false;
+  }
+  std::string content((std::istreambuf_iterator<char>(stat_file)),
+                      std::istreambuf_iterator<char>());
+  // The comm field (2) may contain spaces/parens; parse after the last ')'.
+  const size_t comm_end = content.rfind(')');
+  if (comm_end == std::string::npos) {
+    return false;
+  }
+  std::istringstream rest(content.substr(comm_end + 1));
+  std::string field;
+  rest >> field;
+  if (field.empty()) {
+    return false;
+  }
+  *state = field[0];
+  // Fields 4..21 precede start time (field 22): 18 more reads.
+  for (int i = 0; i < 18; i++) {
+    rest >> field;
+  }
+  uint64_t ticks = 0;
+  rest >> ticks;
+  if (rest.fail()) {
+    return false;
+  }
+  *start_time_ticks = ticks;
+  return true;
+}
+#endif
+}  // namespace
+
 void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
                                         DisconnectTrigger trigger,
                                         pid_t pid) {
@@ -2295,6 +2335,13 @@ void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
       exited ? WorkerTombstone::Grade::kExit : WorkerTombstone::Grade::kPending;
   tombstone.pid = pid;
   if (!exited) {
+#ifdef __linux__
+    char state = 0;
+    uint64_t ticks = 0;
+    if (pid > 0 && ProbeProcStat(pid, &state, &ticks)) {
+      tombstone.start_time_ticks = ticks;
+    }
+#endif
     // Raylet-initiated disconnects ride the graceful-kill escalation window;
     // a self-exiting worker gets a longer deadline that must exceed its own
     // graceful teardown budget (it keeps flushing after disconnecting).
@@ -2328,7 +2375,21 @@ void NodeManager::ScanPendingTombstones() {
     if (tombstone.grade != WorkerTombstone::Grade::kPending || tombstone.pid <= 0) {
       continue;
     }
-    if (kill(tombstone.pid, 0) == -1 && errno == ESRCH) {
+    bool gone = (kill(tombstone.pid, 0) == -1 && errno == ESRCH);
+#ifdef __linux__
+    if (!gone) {
+      char state = 0;
+      uint64_t ticks = 0;
+      if (!ProbeProcStat(tombstone.pid, &state, &ticks)) {
+        gone = true;  // /proc entry vanished between the kill(2) and the read.
+      } else if (state == 'Z' || state == 'X') {
+        gone = true;  // Exited but unreaped (zombie): no user code runs.
+      } else if (tombstone.start_time_ticks != 0 && ticks != tombstone.start_time_ticks) {
+        gone = true;  // The pid was reused; the original process exited.
+      }
+    }
+#endif
+    if (gone) {
       exited.push_back(worker_id);
     } else if (now_ms >= tombstone.deadline_ms) {
       overdue.push_back({worker_id, tombstone.pid});

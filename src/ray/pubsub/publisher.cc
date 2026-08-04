@@ -251,6 +251,9 @@ std::unique_ptr<EntityState> SubscriptionIndex::CreateEntityState(
 
   case rpc::ChannelType::WORKER_REF_REMOVED_CHANNEL:
   case rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL:
+  // TODO(actor-ownership): once subscription replies carry a full-state
+  // snapshot, dropped WORKER_ACTOR_STATE_CHANNEL messages become harmless
+  // and the channel can move to a bounded per-subscriber buffer.
   case rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL:
   case rpc::ChannelType::GCS_ACTOR_CHANNEL:
   case rpc::ChannelType::GCS_JOB_CHANNEL:

@@ -49,6 +49,7 @@
 #include "ray/common/scheduling/resource_set.h"
 #include "ray/core_worker_rpc_client/core_worker_client_pool.h"
 #include "ray/core_worker_rpc_client/fake_core_worker_client.h"
+#include "ray/flatbuffers/node_manager_generated.h"
 #include "ray/object_manager/plasma/fake_plasma_client.h"
 #include "ray/observability/fake_metric.h"
 #include "ray/pubsub/fake_subscriber.h"
@@ -57,6 +58,7 @@
 #include "ray/raylet/node_manager.h"
 #include "ray/raylet/scheduling/cluster_lease_manager.h"
 #include "ray/raylet/tests/util.h"
+#include "ray/raylet_ipc_client/client_connection.h"
 #include "ray/raylet_rpc_client/fake_raylet_client.h"
 #include "ray/rpc/utils.h"
 #include "ray/util/clock.h"
@@ -777,6 +779,96 @@ TEST_F(NodeManagerTest, PidlessPendingConvergesToDeadlineGrade) {
   EXPECT_FALSE(node_manager_->worker_tombstone_fifo_.empty());
 }
 #endif  // !_WIN32
+
+TEST_F(NodeManagerTest, ConnectionErrorRecordsEofGradeTombstone) {
+  // The connection-error path (socket EOF) must record an EOF-triggered
+  // tombstone for the registered worker; with no live process to verify
+  // against, it is exit-grade immediately.
+  local_stream_socket socket(io_service_);
+  auto conn = ClientConnection::Create(
+      [](std::shared_ptr<ClientConnection>, int64_t, const std::vector<uint8_t> &) {},
+      [](std::shared_ptr<ClientConnection>, const boost::system::error_code &) {},
+      std::move(socket),
+      "test",
+      {});
+  auto worker = std::make_shared<MockWorker>(WorkerID::FromRandom(), 10, clock_);
+  EXPECT_CALL(
+      mock_worker_pool_,
+      GetRegisteredWorker(testing::A<const std::shared_ptr<ClientConnection> &>()))
+      .WillOnce(Return(worker));
+  node_manager_->HandleClientConnectionError(conn, boost::asio::error::eof);
+
+  const auto &tombstone = node_manager_->worker_tombstones_.at(worker->WorkerId());
+  EXPECT_EQ(tombstone.trigger, NodeManager::DisconnectTrigger::kConnectionEof);
+  EXPECT_EQ(tombstone.grade, ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
+  EXPECT_FALSE(tombstone.is_driver);
+}
+
+TEST_F(NodeManagerTest, WorkerInitiatedDisconnectRecordsTombstone) {
+  // A worker's own DisconnectClientRequest must record a worker-initiated
+  // pending tombstone (it rides the long self-exit deadline, not the raylet
+  // graceful-kill window).
+  local_stream_socket socket(io_service_);
+  auto conn = ClientConnection::Create(
+      [](std::shared_ptr<ClientConnection>, int64_t, const std::vector<uint8_t> &) {},
+      [](std::shared_ptr<ClientConnection>, const boost::system::error_code &) {},
+      std::move(socket),
+      "test",
+      {});
+  auto worker = std::make_shared<MockWorker>(
+      WorkerID::FromRandom(), 10, clock_, 0, /*worker_process_pid=*/getpid());
+  EXPECT_CALL(
+      mock_worker_pool_,
+      GetRegisteredWorker(testing::A<const std::shared_ptr<ClientConnection> &>()))
+      .WillOnce(Return(worker));
+
+  flatbuffers::FlatBufferBuilder fbb;
+  auto message = protocol::CreateDisconnectClientRequest(
+      fbb,
+      static_cast<int>(rpc::WorkerExitType::INTENDED_USER_EXIT),
+      fbb.CreateString("test disconnect"));
+  fbb.Finish(message);
+  node_manager_->ProcessDisconnectClientMessage(conn, fbb.GetBufferPointer());
+
+  const auto &tombstone = node_manager_->worker_tombstones_.at(worker->WorkerId());
+  EXPECT_EQ(tombstone.trigger, NodeManager::DisconnectTrigger::kWorkerInitiated);
+  EXPECT_EQ(tombstone.grade, ray::raylet::NodeManager::WorkerTombstone::Grade::kPending);
+  EXPECT_FALSE(tombstone.is_driver);
+}
+
+TEST_F(NodeManagerTest, DriverDisconnectRecordsDriverTombstone) {
+  // A disconnecting driver must be recorded with is_driver so the deadline
+  // escalation never signals the (legitimately still-running) process.
+  local_stream_socket socket(io_service_);
+  auto conn = ClientConnection::Create(
+      [](std::shared_ptr<ClientConnection>, int64_t, const std::vector<uint8_t> &) {},
+      [](std::shared_ptr<ClientConnection>, const boost::system::error_code &) {},
+      std::move(socket),
+      "test",
+      {});
+  auto driver = std::make_shared<MockWorker>(
+      WorkerID::FromRandom(), 10, clock_, 0, /*worker_process_pid=*/getpid());
+  EXPECT_CALL(
+      mock_worker_pool_,
+      GetRegisteredWorker(testing::A<const std::shared_ptr<ClientConnection> &>()))
+      .WillOnce(Return(nullptr));
+  EXPECT_CALL(
+      mock_worker_pool_,
+      GetRegisteredDriver(testing::A<const std::shared_ptr<ClientConnection> &>()))
+      .WillOnce(Return(driver));
+
+  flatbuffers::FlatBufferBuilder fbb;
+  auto message = protocol::CreateDisconnectClientRequest(
+      fbb,
+      static_cast<int>(rpc::WorkerExitType::INTENDED_USER_EXIT),
+      fbb.CreateString("driver exiting"));
+  fbb.Finish(message);
+  node_manager_->ProcessDisconnectClientMessage(conn, fbb.GetBufferPointer());
+
+  const auto &tombstone = node_manager_->worker_tombstones_.at(driver->WorkerId());
+  EXPECT_EQ(tombstone.trigger, NodeManager::DisconnectTrigger::kWorkerInitiated);
+  EXPECT_TRUE(tombstone.is_driver);
+}
 
 #ifdef __linux__
 TEST_F(NodeManagerTest, EofZombieIsExitGradeImmediately) {

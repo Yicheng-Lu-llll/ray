@@ -810,6 +810,9 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   FRIEND_TEST(NodeManagerTest, EofDegradedDeadlineDoesNotSignal);
   FRIEND_TEST(NodeManagerTest, DriverDeadlineDoesNotSignal);
   FRIEND_TEST(NodeManagerTest, PidlessPendingConvergesToDeadlineGrade);
+  FRIEND_TEST(NodeManagerTest, ConnectionErrorRecordsEofGradeTombstone);
+  FRIEND_TEST(NodeManagerTest, WorkerInitiatedDisconnectRecordsTombstone);
+  FRIEND_TEST(NodeManagerTest, DriverDisconnectRecordsDriverTombstone);
 
   /// Disconnect a client.
   ///

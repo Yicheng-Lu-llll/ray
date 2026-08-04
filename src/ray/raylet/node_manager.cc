@@ -302,9 +302,10 @@ NodeManager::NodeManager(
       RayConfig::instance().raylet_check_for_unexpected_worker_disconnect_interval_ms(),
       "NodeManager.CheckForUnexpectedWorkerDisconnects");
 
-  periodical_runner_->RunFnPeriodically([this]() { ScanPendingTombstones(); },
-                                        /*period_ms=*/100,
-                                        "NodeManager.ScanPendingTombstones");
+  periodical_runner_->RunFnPeriodically(
+      [this]() { ScanPendingTombstones(); },
+      RayConfig::instance().worker_tombstone_scan_period_ms(),
+      "NodeManager.ScanPendingTombstones");
 
   RAY_CHECK_OK(store_client_->Connect(config.store_socket_name));
   // Run the node manager rpc server.
@@ -2290,8 +2291,19 @@ void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
   }
 #endif
   WorkerTombstone tombstone;
-  tombstone.exit_observed = exited;
+  tombstone.grade =
+      exited ? WorkerTombstone::Grade::kExit : WorkerTombstone::Grade::kPending;
   tombstone.pid = pid;
+  if (!exited) {
+    // Raylet-initiated disconnects ride the graceful-kill escalation window;
+    // a self-exiting worker gets a longer deadline that must exceed its own
+    // graceful teardown budget (it keeps flushing after disconnecting).
+    const int64_t deadline_budget_ms =
+        (trigger == DisconnectTrigger::kWorkerInitiated)
+            ? RayConfig::instance().worker_self_exit_escalation_timeout_ms()
+            : RayConfig::instance().kill_worker_timeout_milliseconds();
+    tombstone.deadline_ms = clock_.SteadyNowMillis() + deadline_budget_ms;
+  }
   worker_tombstones_[worker_id] = tombstone;
 #ifdef _WIN32
   // No exit-observation primitive on Windows: raylet/worker-initiated records
@@ -2309,21 +2321,48 @@ void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
 
 void NodeManager::ScanPendingTombstones() {
 #ifndef _WIN32
+  const int64_t now_ms = clock_.SteadyNowMillis();
   std::vector<WorkerID> exited;
+  std::vector<std::pair<WorkerID, pid_t>> overdue;
   for (const auto &[worker_id, tombstone] : worker_tombstones_) {
-    if (!tombstone.exit_observed && tombstone.pid > 0 && kill(tombstone.pid, 0) == -1 &&
-        errno == ESRCH) {
+    if (tombstone.grade != WorkerTombstone::Grade::kPending || tombstone.pid <= 0) {
+      continue;
+    }
+    if (kill(tombstone.pid, 0) == -1 && errno == ESRCH) {
       exited.push_back(worker_id);
+    } else if (now_ms >= tombstone.deadline_ms) {
+      overdue.push_back({worker_id, tombstone.pid});
     }
   }
   for (const auto &worker_id : exited) {
     MarkWorkerExitObserved(worker_id);
   }
+  for (const auto &[worker_id, pid] : overdue) {
+    // The process overstayed its deadline: escalate to SIGKILL and record
+    // deadline-grade — dead for every consumer, honest about the residue (a
+    // D-state process no longer runs user code but may hold resources until
+    // the kernel reaps it).
+    RAY_LOG(WARNING).WithField(worker_id)
+        << "Worker overstayed its shutdown deadline; escalating to SIGKILL.";
+    if (tombstone_escalation_fn_) {
+      tombstone_escalation_fn_(pid);
+    } else {
+      kill(pid, SIGKILL);
+    }
+    auto it = worker_tombstones_.find(worker_id);
+    if (it != worker_tombstones_.end()) {
+      it->second.grade = WorkerTombstone::Grade::kDeadline;
+      worker_tombstone_fifo_.push_back(worker_id);
+    }
+  }
+  if (!overdue.empty()) {
+    EvictWorkerTombstones();
+  }
 #endif
 }
 
 void NodeManager::EvictWorkerTombstones() {
-  while (worker_tombstones_.size() > kWorkerTombstoneCapacity &&
+  while (worker_tombstones_.size() > RayConfig::instance().worker_tombstone_capacity() &&
          !worker_tombstone_fifo_.empty()) {
     const WorkerID victim = worker_tombstone_fifo_.front();
     worker_tombstone_fifo_.pop_front();
@@ -2333,8 +2372,9 @@ void NodeManager::EvictWorkerTombstones() {
 
 void NodeManager::MarkWorkerExitObserved(const WorkerID &worker_id) {
   auto it = worker_tombstones_.find(worker_id);
-  if (it != worker_tombstones_.end() && !it->second.exit_observed) {
-    it->second.exit_observed = true;
+  if (it != worker_tombstones_.end() &&
+      it->second.grade == WorkerTombstone::Grade::kPending) {
+    it->second.grade = WorkerTombstone::Grade::kExit;
 #ifndef _WIN32
     // On Windows the record is already in the eviction FIFO (see
     // RecordWorkerTombstone).
@@ -2354,9 +2394,12 @@ void NodeManager::HandleGetWorkerLiveness(rpc::GetWorkerLivenessRequest request,
     reply->set_status(rpc::GetWorkerLivenessReply::ALIVE);
   } else if (auto it = worker_tombstones_.find(worker_id);
              it != worker_tombstones_.end()) {
-    if (it->second.exit_observed) {
+    if (it->second.grade == WorkerTombstone::Grade::kExit) {
       reply->set_status(rpc::GetWorkerLivenessReply::DEAD);
       reply->set_grade(rpc::GetWorkerLivenessReply::EXIT);
+    } else if (it->second.grade == WorkerTombstone::Grade::kDeadline) {
+      reply->set_status(rpc::GetWorkerLivenessReply::DEAD);
+      reply->set_grade(rpc::GetWorkerLivenessReply::DEADLINE);
     } else {
       reply->set_status(rpc::GetWorkerLivenessReply::PENDING);
     }

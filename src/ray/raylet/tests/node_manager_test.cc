@@ -618,21 +618,54 @@ TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingIsRetainedNotBlocking) {
   WorkerID pending_id = WorkerID::FromRandom();
   node_manager_->RecordWorkerTombstone(
       pending_id, NodeManager::DisconnectTrigger::kRayletInitiated, /*pid=*/-1);
-  for (size_t i = 0; i < NodeManager::kWorkerTombstoneCapacity + 5; i++) {
+  for (size_t i = 0; i < RayConfig::instance().worker_tombstone_capacity() + 5; i++) {
     node_manager_->RecordWorkerTombstone(WorkerID::FromRandom(),
                                          NodeManager::DisconnectTrigger::kConnectionEof,
                                          /*pid=*/-1);
   }
   EXPECT_EQ(node_manager_->worker_tombstones_.size(),
-            NodeManager::kWorkerTombstoneCapacity);
+            RayConfig::instance().worker_tombstone_capacity());
   EXPECT_TRUE(node_manager_->worker_tombstones_.contains(pending_id));
-  EXPECT_FALSE(node_manager_->worker_tombstones_.at(pending_id).exit_observed);
+  EXPECT_FALSE(node_manager_->worker_tombstones_.at(pending_id).grade ==
+               ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
 }
 #endif  // !_WIN32
 
 TEST_F(NodeManagerTest, MarkWorkerExitObservedUnknownIdIsSafe) {
   node_manager_->MarkWorkerExitObserved(WorkerID::FromRandom());
 }
+
+#ifndef _WIN32
+TEST_F(NodeManagerTest, ScanEscalatesOverduePendingToDeadlineGrade) {
+  // A pending record whose process overstays its deadline is SIGKILLed and
+  // becomes deadline-grade DEAD.
+  WorkerID worker_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(
+      worker_id, NodeManager::DisconnectTrigger::kRayletInitiated, getpid());
+  int escalations = 0;
+  node_manager_->tombstone_escalation_fn_ = [&](pid_t) { escalations++; };
+
+  node_manager_->ScanPendingTombstones();
+  EXPECT_EQ(escalations, 0);
+
+  fake_clock_.AdvanceTime(
+      absl::Milliseconds(RayConfig::instance().kill_worker_timeout_milliseconds() + 1));
+  node_manager_->ScanPendingTombstones();
+  EXPECT_EQ(escalations, 1);
+
+  rpc::GetWorkerLivenessRequest request;
+  request.set_worker_id(worker_id.Binary());
+  rpc::GetWorkerLivenessReply reply;
+  EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(worker_id))
+      .WillOnce(Return(nullptr));
+  EXPECT_CALL(mock_worker_pool_, GetRegisteredDriver(worker_id))
+      .WillOnce(Return(nullptr));
+  node_manager_->HandleGetWorkerLiveness(
+      request, &reply, [](Status, std::function<void()>, std::function<void()>) {});
+  EXPECT_EQ(reply.status(), rpc::GetWorkerLivenessReply::DEAD);
+  EXPECT_EQ(reply.grade(), rpc::GetWorkerLivenessReply::DEADLINE);
+}
+#endif  // !_WIN32
 
 #ifndef _WIN32
 TEST_F(NodeManagerTest, ScanPendingTombstonesUpgradesExitedPids) {
@@ -647,8 +680,10 @@ TEST_F(NodeManagerTest, ScanPendingTombstonesUpgradesExitedPids) {
 
   node_manager_->ScanPendingTombstones();
 
-  EXPECT_FALSE(node_manager_->worker_tombstones_.at(live_id).exit_observed);
-  EXPECT_TRUE(node_manager_->worker_tombstones_.at(dead_id).exit_observed);
+  EXPECT_FALSE(node_manager_->worker_tombstones_.at(live_id).grade ==
+               ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
+  EXPECT_TRUE(node_manager_->worker_tombstones_.at(dead_id).grade ==
+              ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
 }
 #endif  // !_WIN32
 

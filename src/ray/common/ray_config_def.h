@@ -313,6 +313,18 @@ RAY_CONFIG(int64_t, raylet_client_connect_timeout_milliseconds, 1000)
 /// the worker SIGKILL.
 RAY_CONFIG(int64_t, kill_worker_timeout_milliseconds, 5000)
 
+/// Capacity of the raylet's dead-worker tombstone ledger (evictable records;
+/// pending records are additionally retained until they converge).
+RAY_CONFIG(size_t, worker_tombstone_capacity, 10000)
+
+/// Period of the raylet's pending-tombstone exit scan.
+RAY_CONFIG(int64_t, worker_tombstone_scan_period_ms, 100)
+
+/// Deadline for a self-exiting worker's shutdown before the raylet escalates
+/// to SIGKILL and records a deadline-grade tombstone. Must exceed the
+/// worker-side graceful teardown budget (~30s of flushing after disconnect).
+RAY_CONFIG(int64_t, worker_self_exit_escalation_timeout_ms, 60000)
+
 /// Timeout for graceful actor shutdown (e.g. when actor goes out of scope).
 /// If an actor does not gracefully shut down within this timeout, it will be force
 /// killed. Set to -1 for infinite timeout to prevent the actor from being force killed

@@ -775,14 +775,18 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// is observed to have exited, making it evictable. Safe for unknown ids.
   void MarkWorkerExitObserved(const WorkerID &worker_id);
 
-  /// One periodic pass over all pending tombstones, upgrading those whose
-  /// process has exited: a single timer regardless of the number of pending
-  /// records. TODO(ownership): zombies (unreaped drivers) and pid reuse both
-  /// fool kill(pid,0) — needs start-time identity and the deadline-grade
-  /// escalation. On Windows there is no exit observation: raylet/worker-
-  /// initiated records stay pending forever (EOF records remain exit-grade,
-  /// unverifiable) and every record is evictable so the ledger stays bounded.
+  /// One periodic pass over all pending tombstones: upgrade exited processes
+  /// to exit-grade; escalate processes that overstayed their deadline to
+  /// SIGKILL and record them deadline-grade (a single timer regardless of the
+  /// number of pending records). TODO(ownership): zombies (unreaped drivers)
+  /// and pid reuse both fool kill(pid,0) — needs start-time identity. On
+  /// Windows there is no exit observation: pending records stay pending (EOF
+  /// records remain exit-grade, unverifiable) and every record is evictable
+  /// so the ledger stays bounded.
   void ScanPendingTombstones();
+
+  /// Test seam for the deadline escalation signal (defaults to SIGKILL).
+  std::function<void(pid_t)> tombstone_escalation_fn_;
 
   /// Evict oldest evictable tombstones beyond the cap.
   void EvictWorkerTombstones();
@@ -792,6 +796,7 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   FRIEND_TEST(NodeManagerTest, HandleGetWorkerLivenessPendingIsRetainedNotBlocking);
   FRIEND_TEST(NodeManagerTest, MarkWorkerExitObservedUnknownIdIsSafe);
   FRIEND_TEST(NodeManagerTest, ScanPendingTombstonesUpgradesExitedPids);
+  FRIEND_TEST(NodeManagerTest, ScanEscalatesOverduePendingToDeadlineGrade);
 
   /// Disconnect a client.
   ///
@@ -979,15 +984,22 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// fires -> deadline-grade) and exit-grade records are evicted FIFO beyond
   /// the cap; on Windows every record is evictable (no exit observation).
   struct WorkerTombstone {
-    bool exit_observed = false;
+    enum class Grade {
+      kPending,
+      kExit,
+      kDeadline,
+    };
+    Grade grade = Grade::kPending;
     pid_t pid = -1;
+    /// Steady-clock deadline (ms) after which a still-running pending process
+    /// is escalated to SIGKILL and the record becomes deadline-grade.
+    int64_t deadline_ms = 0;
   };
   absl::flat_hash_map<WorkerID, WorkerTombstone> worker_tombstones_;
   /// FIFO of evictable tombstone ids, oldest first. On POSIX only
   /// exit-observed records are listed (pending records join on exit
   /// observation); on Windows every record is listed at record time.
   std::deque<WorkerID> worker_tombstone_fifo_;
-  static constexpr size_t kWorkerTombstoneCapacity = 10000;
 
   /// Optional extra information about why the worker failed.
   absl::flat_hash_map<LeaseID, ray::TaskFailureEntry> worker_failure_reasons_;

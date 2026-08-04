@@ -222,6 +222,12 @@ ray_cc_library(
 )
 
 ray_cc_library(
+    name = "proc_stat",
+    srcs = ["proc_stat.cc"],
+    hdrs = ["proc_stat.h"],
+)
+
+ray_cc_library(
     name = "random",
     hdrs = ["random.h"],
     deps = [

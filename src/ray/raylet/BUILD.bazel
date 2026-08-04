@@ -341,6 +341,7 @@ ray_cc_library(
         "//src/ray/util:container_util",
         "//src/ray/util:network_util",
         "//src/ray/util:port_persistence",
+        "//src/ray/util:proc_stat",
         "//src/ray/util:process",
         "//src/ray/util:process_utils",
         "@boost//:system",

@@ -313,8 +313,10 @@ RAY_CONFIG(int64_t, raylet_client_connect_timeout_milliseconds, 1000)
 /// the worker SIGKILL.
 RAY_CONFIG(int64_t, kill_worker_timeout_milliseconds, 5000)
 
-/// Capacity of the raylet's dead-worker tombstone ledger (evictable records;
-/// pending records are additionally retained until they converge).
+/// Capacity of the raylet's dead-worker tombstone ledger, counting all
+/// records. Pending records are never evicted, so a burst of pending records
+/// can hold the ledger above this cap until they converge to a terminal
+/// grade (exit observation or deadline) and become evictable.
 RAY_CONFIG(size_t, worker_tombstone_capacity, 10000)
 
 /// Period of the raylet's pending-tombstone exit scan.

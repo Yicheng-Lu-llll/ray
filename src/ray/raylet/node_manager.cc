@@ -21,6 +21,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -62,6 +63,7 @@
 #include "ray/util/event.h"
 #include "ray/util/network_util.h"
 #include "ray/util/port_persistence.h"
+#include "ray/util/proc_stat.h"
 #include "ray/util/process.h"
 #include "ray/util/process_utils.h"
 #include "ray/util/string_utils.h"
@@ -1523,7 +1525,8 @@ void NodeManager::DisconnectClient(const std::shared_ptr<ClientConnection> &clie
 
   // Tombstone the worker before it leaves the registry: "seen-and-died" must
   // stay distinguishable from "never seen".
-  RecordWorkerTombstone(worker->WorkerId(), trigger, worker->GetProcess().GetId());
+  RecordWorkerTombstone(
+      worker->WorkerId(), trigger, worker->GetProcess().GetId(), is_driver);
 
   // Clean up any open ray.get or ray.wait calls that the worker made.
   lease_dependency_manager_.CancelGetRequest(worker->WorkerId());
@@ -2280,67 +2283,81 @@ void NodeManager::HandleReturnWorkerLease(rpc::ReturnWorkerLeaseRequest request,
 }
 
 namespace {
-#ifndef _WIN32
-/// Probe /proc/<pid>/stat. Returns false when the process is gone (or /proc
-/// is unreadable, treated as gone on Linux). On success fills the state
-/// character (field 3) and start time (field 22).
-bool ProbeProcStat(pid_t pid, char *state, uint64_t *start_time_ticks) {
-  std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
-  if (!stat_file.good()) {
-    return false;
+#ifdef __linux__
+enum class ProcProbeResult {
+  /// /proc/<pid> does not exist: the process exited and was reaped.
+  kGone,
+  /// The process exited but was not reaped (zombie): no user code runs.
+  kExitedUnreaped,
+  /// The process is running; start_time_ticks is filled.
+  kAlive,
+  /// /proc was unreadable (restricted mount, different uid) or unparsable:
+  /// no conclusion. Callers must fall back to kill(2)'s answer and must
+  /// never treat this as an exit.
+  kUnknown,
+};
+
+/// Probe /proc/<pid>/stat for liveness and start-time identity.
+ProcProbeResult ProbeProc(pid_t pid, uint64_t *start_time_ticks) {
+  const std::string path = "/proc/" + std::to_string(pid) + "/stat";
+  std::FILE *stat_file = std::fopen(path.c_str(), "re");
+  if (stat_file == nullptr) {
+    return errno == ENOENT ? ProcProbeResult::kGone : ProcProbeResult::kUnknown;
   }
-  std::string content((std::istreambuf_iterator<char>(stat_file)),
-                      std::istreambuf_iterator<char>());
-  // The comm field (2) may contain spaces/parens; parse after the last ')'.
-  const size_t comm_end = content.rfind(')');
-  if (comm_end == std::string::npos) {
-    return false;
-  }
-  std::istringstream rest(content.substr(comm_end + 1));
-  std::string field;
-  rest >> field;
-  if (field.empty()) {
-    return false;
-  }
-  *state = field[0];
-  // Fields 4..21 precede start time (field 22): 18 more reads.
-  for (int i = 0; i < 18; i++) {
-    rest >> field;
-  }
+  char buf[1024];
+  const size_t len = std::fread(buf, 1, sizeof(buf), stat_file);
+  std::fclose(stat_file);
+  char state = 0;
   uint64_t ticks = 0;
-  rest >> ticks;
-  if (rest.fail()) {
-    return false;
+  if (!ParseProcStat(std::string_view(buf, len), &state, &ticks)) {
+    return ProcProbeResult::kUnknown;
+  }
+  if (state == 'Z' || state == 'X') {
+    return ProcProbeResult::kExitedUnreaped;
   }
   *start_time_ticks = ticks;
-  return true;
+  return ProcProbeResult::kAlive;
 }
 #endif
 }  // namespace
 
 void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
                                         DisconnectTrigger trigger,
-                                        pid_t pid) {
+                                        pid_t pid,
+                                        bool is_driver) {
   bool exited = (trigger == DisconnectTrigger::kConnectionEof);
+  uint64_t start_time_ticks = 0;
 #ifndef _WIN32
   // A connection EOF normally means the process already exited, but that is an
   // inference from the socket, not an observation of the process. Verify when
   // we can; a still-running process is downgraded to pending and scanned.
+  // kill(2) alone is fooled by zombies (an exited-but-unreaped driver stays
+  // signalable indefinitely), so on Linux consult /proc as well: a zombie is
+  // exit-grade immediately. An unreadable /proc keeps kill(2)'s answer.
   if (exited && pid > 0 && kill(pid, 0) == 0) {
     exited = false;
+#ifdef __linux__
+    const ProcProbeResult probe = ProbeProc(pid, &start_time_ticks);
+    if (probe == ProcProbeResult::kGone || probe == ProcProbeResult::kExitedUnreaped) {
+      exited = true;
+    }
+#endif
   }
 #endif
   WorkerTombstone tombstone;
   tombstone.grade =
       exited ? WorkerTombstone::Grade::kExit : WorkerTombstone::Grade::kPending;
   tombstone.pid = pid;
+  tombstone.trigger = trigger;
+  tombstone.is_driver = is_driver;
   if (!exited) {
 #ifdef __linux__
-    char state = 0;
-    uint64_t ticks = 0;
-    if (pid > 0 && ProbeProcStat(pid, &state, &ticks)) {
-      tombstone.start_time_ticks = ticks;
+    // Capture start-time identity for the pid-reuse guard (best effort; the
+    // EOF path above may have probed already).
+    if (start_time_ticks == 0 && pid > 0) {
+      ProbeProc(pid, &start_time_ticks);
     }
+    tombstone.start_time_ticks = start_time_ticks;
 #endif
     // Raylet-initiated disconnects ride the graceful-kill escalation window;
     // a self-exiting worker gets a longer deadline that must exceed its own
@@ -2370,51 +2387,72 @@ void NodeManager::ScanPendingTombstones() {
 #ifndef _WIN32
   const int64_t now_ms = clock_.SteadyNowMillis();
   std::vector<WorkerID> exited;
-  std::vector<std::pair<WorkerID, pid_t>> overdue;
+  std::vector<WorkerID> overdue;
   for (const auto &[worker_id, tombstone] : worker_tombstones_) {
-    if (tombstone.grade != WorkerTombstone::Grade::kPending || tombstone.pid <= 0) {
+    if (tombstone.grade != WorkerTombstone::Grade::kPending) {
       continue;
     }
-    bool gone = (kill(tombstone.pid, 0) == -1 && errno == ESRCH);
+    bool gone = false;
+    if (tombstone.pid > 0) {
+      gone = (kill(tombstone.pid, 0) == -1 && errno == ESRCH);
 #ifdef __linux__
-    if (!gone) {
-      char state = 0;
-      uint64_t ticks = 0;
-      if (!ProbeProcStat(tombstone.pid, &state, &ticks)) {
-        gone = true;  // /proc entry vanished between the kill(2) and the read.
-      } else if (state == 'Z' || state == 'X') {
-        gone = true;  // Exited but unreaped (zombie): no user code runs.
-      } else if (tombstone.start_time_ticks != 0 && ticks != tombstone.start_time_ticks) {
-        gone = true;  // The pid was reused; the original process exited.
+      if (!gone) {
+        uint64_t ticks = 0;
+        switch (ProbeProc(tombstone.pid, &ticks)) {
+        case ProcProbeResult::kGone:
+        case ProcProbeResult::kExitedUnreaped:
+          gone = true;
+          break;
+        case ProcProbeResult::kAlive:
+          // Same pid but a different start time means the pid was reused;
+          // the original process exited.
+          gone = tombstone.start_time_ticks != 0 && ticks != tombstone.start_time_ticks;
+          break;
+        case ProcProbeResult::kUnknown:
+          // No conclusion from /proc: keep kill(2)'s "alive" answer. Faking
+          // an exit here would report a live process falsely DEAD.
+          break;
+        }
       }
-    }
 #endif
+    }
     if (gone) {
       exited.push_back(worker_id);
     } else if (now_ms >= tombstone.deadline_ms) {
-      overdue.push_back({worker_id, tombstone.pid});
+      overdue.push_back(worker_id);
     }
   }
   for (const auto &worker_id : exited) {
     MarkWorkerExitObserved(worker_id);
   }
-  for (const auto &[worker_id, pid] : overdue) {
-    // The process overstayed its deadline: escalate to SIGKILL and record
-    // deadline-grade — dead for every consumer, honest about the residue (a
-    // D-state process no longer runs user code but may hold resources until
-    // the kernel reaps it).
-    RAY_LOG(WARNING).WithField(worker_id)
-        << "Worker overstayed its shutdown deadline; escalating to SIGKILL.";
-    if (tombstone_escalation_fn_) {
-      tombstone_escalation_fn_(pid);
-    } else {
-      kill(pid, SIGKILL);
-    }
+  for (const auto &worker_id : overdue) {
     auto it = worker_tombstones_.find(worker_id);
-    if (it != worker_tombstones_.end()) {
-      it->second.grade = WorkerTombstone::Grade::kDeadline;
-      worker_tombstone_fifo_.push_back(worker_id);
+    if (it == worker_tombstones_.end()) {
+      continue;
     }
+    // The record overstayed its deadline: it becomes deadline-grade — dead
+    // for every consumer, honest about the residue (a D-state process no
+    // longer runs user code but may hold resources until the kernel reaps
+    // it). Only raylet- or self-initiated worker records are SIGKILLed:
+    // signalling a process we merely lost a socket to, a driver (which
+    // legitimately outlives its Ray connection), or an invalid pid is not
+    // part of today's contract.
+    // TODO(actor-ownership): attach a death_info from the kill initiator so
+    // DEAD(DEADLINE) replies carry a cause (design doc §5.3).
+    const bool signal = it->second.pid > 0 && !it->second.is_driver &&
+                        it->second.trigger != DisconnectTrigger::kConnectionEof;
+    RAY_LOG(WARNING).WithField(worker_id)
+        << "Worker overstayed its shutdown deadline; recording deadline-grade death"
+        << (signal ? " and escalating to SIGKILL." : ".");
+    if (signal) {
+      if (tombstone_escalation_fn_) {
+        tombstone_escalation_fn_(it->second.pid);
+      } else {
+        kill(it->second.pid, SIGKILL);
+      }
+    }
+    it->second.grade = WorkerTombstone::Grade::kDeadline;
+    worker_tombstone_fifo_.push_back(worker_id);
   }
   if (!overdue.empty()) {
     EvictWorkerTombstones();

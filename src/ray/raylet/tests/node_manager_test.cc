@@ -15,12 +15,18 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include <sys/wait.h>
+#endif
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <memory>
 #include <queue>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -626,8 +632,8 @@ TEST_F(NodeManagerTest, HandleGetWorkerLivenessPendingIsRetainedNotBlocking) {
   EXPECT_EQ(node_manager_->worker_tombstones_.size(),
             RayConfig::instance().worker_tombstone_capacity());
   EXPECT_TRUE(node_manager_->worker_tombstones_.contains(pending_id));
-  EXPECT_FALSE(node_manager_->worker_tombstones_.at(pending_id).grade ==
-               ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(pending_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kPending);
 }
 #endif  // !_WIN32
 
@@ -680,12 +686,142 @@ TEST_F(NodeManagerTest, ScanPendingTombstonesUpgradesExitedPids) {
 
   node_manager_->ScanPendingTombstones();
 
-  EXPECT_FALSE(node_manager_->worker_tombstones_.at(live_id).grade ==
-               ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
-  EXPECT_TRUE(node_manager_->worker_tombstones_.at(dead_id).grade ==
-              ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(live_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kPending);
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(dead_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
 }
 #endif  // !_WIN32
+
+#ifndef _WIN32
+TEST_F(NodeManagerTest, SelfExitEscalationUsesLongTimeout) {
+  // A self-exiting worker's pending record uses the long escalation timeout,
+  // not the raylet graceful-kill window: it keeps flushing after
+  // disconnecting.
+  WorkerID worker_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(
+      worker_id, NodeManager::DisconnectTrigger::kWorkerInitiated, getpid());
+  int escalations = 0;
+  node_manager_->tombstone_escalation_fn_ = [&](pid_t) { escalations++; };
+
+  fake_clock_.AdvanceTime(
+      absl::Milliseconds(RayConfig::instance().kill_worker_timeout_milliseconds() + 1));
+  node_manager_->ScanPendingTombstones();
+  EXPECT_EQ(escalations, 0);
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(worker_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kPending);
+
+  fake_clock_.AdvanceTime(absl::Milliseconds(
+      RayConfig::instance().worker_self_exit_escalation_timeout_ms() + 1));
+  node_manager_->ScanPendingTombstones();
+  EXPECT_EQ(escalations, 1);
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(worker_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kDeadline);
+}
+
+TEST_F(NodeManagerTest, EofDegradedDeadlineDoesNotSignal) {
+  // An EOF disconnect whose process turned out to still be alive (the socket
+  // died, not the process) is never signalled: at the deadline the record
+  // becomes deadline-grade without a SIGKILL.
+  WorkerID worker_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(
+      worker_id, NodeManager::DisconnectTrigger::kConnectionEof, getpid());
+  ASSERT_EQ(node_manager_->worker_tombstones_.at(worker_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kPending);
+  int escalations = 0;
+  node_manager_->tombstone_escalation_fn_ = [&](pid_t) { escalations++; };
+
+  fake_clock_.AdvanceTime(
+      absl::Milliseconds(RayConfig::instance().kill_worker_timeout_milliseconds() + 1));
+  node_manager_->ScanPendingTombstones();
+  EXPECT_EQ(escalations, 0);
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(worker_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kDeadline);
+}
+
+TEST_F(NodeManagerTest, DriverDeadlineDoesNotSignal) {
+  // A driver process legitimately outlives its Ray connection; the deadline
+  // gives its record a terminal grade without ever signalling the process.
+  WorkerID worker_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(worker_id,
+                                       NodeManager::DisconnectTrigger::kWorkerInitiated,
+                                       getpid(),
+                                       /*is_driver=*/true);
+  int escalations = 0;
+  node_manager_->tombstone_escalation_fn_ = [&](pid_t) { escalations++; };
+
+  fake_clock_.AdvanceTime(absl::Milliseconds(
+      RayConfig::instance().worker_self_exit_escalation_timeout_ms() + 1));
+  node_manager_->ScanPendingTombstones();
+  EXPECT_EQ(escalations, 0);
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(worker_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kDeadline);
+}
+
+TEST_F(NodeManagerTest, PidlessPendingConvergesToDeadlineGrade) {
+  // A pending record with no usable pid can never be observed exiting; the
+  // deadline still converges it to a terminal, evictable grade (unbounded
+  // pending records would leak the ledger).
+  WorkerID worker_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(
+      worker_id, NodeManager::DisconnectTrigger::kRayletInitiated, /*pid=*/-1);
+  int escalations = 0;
+  node_manager_->tombstone_escalation_fn_ = [&](pid_t) { escalations++; };
+
+  fake_clock_.AdvanceTime(
+      absl::Milliseconds(RayConfig::instance().kill_worker_timeout_milliseconds() + 1));
+  node_manager_->ScanPendingTombstones();
+  EXPECT_EQ(escalations, 0);
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(worker_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kDeadline);
+  EXPECT_FALSE(node_manager_->worker_tombstone_fifo_.empty());
+}
+#endif  // !_WIN32
+
+#ifdef __linux__
+TEST_F(NodeManagerTest, EofZombieIsExitGradeImmediately) {
+  // An exited-but-unreaped process (zombie) fools kill(pid, 0); the /proc
+  // probe must still grade an EOF disconnect exit-grade immediately.
+  pid_t child = fork();
+  ASSERT_NE(child, -1);
+  if (child == 0) {
+    _exit(0);
+  }
+  // Wait until the child is a zombie (state Z) without reaping it.
+  for (int i = 0; i < 1000; i++) {
+    std::ifstream stat_file("/proc/" + std::to_string(child) + "/stat");
+    std::string content((std::istreambuf_iterator<char>(stat_file)),
+                        std::istreambuf_iterator<char>());
+    if (content.find(") Z ") != std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(kill(child, 0), 0);  // Zombie: still signalable.
+
+  WorkerID worker_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(
+      worker_id, NodeManager::DisconnectTrigger::kConnectionEof, child);
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(worker_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
+  waitpid(child, nullptr, 0);
+}
+
+TEST_F(NodeManagerTest, ScanDetectsPidReuseViaStartTime) {
+  // Same pid, different start time = the original process exited and the pid
+  // was reused: the scan must grade the record exit, not keep it pending.
+  WorkerID worker_id = WorkerID::FromRandom();
+  node_manager_->RecordWorkerTombstone(
+      worker_id, NodeManager::DisconnectTrigger::kRayletInitiated, getpid());
+  auto &tombstone = node_manager_->worker_tombstones_.at(worker_id);
+  ASSERT_NE(tombstone.start_time_ticks, 0u);
+  tombstone.start_time_ticks += 1;
+
+  node_manager_->ScanPendingTombstones();
+  EXPECT_EQ(node_manager_->worker_tombstones_.at(worker_id).grade,
+            ray::raylet::NodeManager::WorkerTombstone::Grade::kExit);
+}
+#endif  // __linux__
 
 TEST_F(NodeManagerTest, HandleIsLocalWorkerDeadUnknownWorker) {
   WorkerID worker_id = WorkerID::FromRandom();

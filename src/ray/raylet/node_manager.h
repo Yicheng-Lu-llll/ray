@@ -766,23 +766,30 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// Record a tombstone for a disconnecting worker/driver; pending records
   /// converge via the periodic exit scan. Exit-grade when the disconnect was
   /// triggered by connection EOF (verified against the process when
-  /// possible), pending-exit otherwise.
+  /// possible: a zombie counts as exited), pending-exit otherwise. Drivers
+  /// are recorded with is_driver so the deadline escalation never signals
+  /// them (a driver process legitimately outlives its Ray connection).
   void RecordWorkerTombstone(const WorkerID &worker_id,
                              DisconnectTrigger trigger,
-                             pid_t pid);
+                             pid_t pid,
+                             bool is_driver = false);
 
   /// Upgrade a pending-exit tombstone to exit-grade once the worker process
   /// is observed to have exited, making it evictable. Safe for unknown ids.
   void MarkWorkerExitObserved(const WorkerID &worker_id);
 
   /// One periodic pass over all pending tombstones: upgrade exited processes
-  /// to exit-grade; escalate processes that overstayed their deadline to
-  /// SIGKILL and record them deadline-grade (a single timer regardless of the
-  /// number of pending records; probes /proc for state and start time, so a
-  /// zombie counts as exited and a reused pid cannot mask an exit). On
-  /// Windows there is no exit observation: pending records stay pending (EOF
-  /// records remain exit-grade, unverifiable) and every record is evictable
-  /// so the ledger stays bounded.
+  /// to exit-grade; records that overstayed their deadline become
+  /// deadline-grade (a single timer regardless of the number of pending
+  /// records; probes /proc for state and start time, so a zombie counts as
+  /// exited and a reused pid cannot mask an exit; an unreadable /proc entry
+  /// for a live process keeps the kill(2) answer rather than faking an
+  /// exit). The deadline escalation SIGKILLs only raylet- or self-initiated
+  /// worker records: EOF-degraded records (the socket died, not the
+  /// process), drivers, and pid-less records get the terminal grade without
+  /// a signal. On Windows there is no exit observation: pending records stay
+  /// pending (EOF records remain exit-grade, unverifiable) and every record
+  /// is evictable so the ledger stays bounded.
   void ScanPendingTombstones();
 
   /// Test seam for the deadline escalation signal (defaults to SIGKILL).
@@ -797,6 +804,12 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   FRIEND_TEST(NodeManagerTest, MarkWorkerExitObservedUnknownIdIsSafe);
   FRIEND_TEST(NodeManagerTest, ScanPendingTombstonesUpgradesExitedPids);
   FRIEND_TEST(NodeManagerTest, ScanEscalatesOverduePendingToDeadlineGrade);
+  FRIEND_TEST(NodeManagerTest, EofZombieIsExitGradeImmediately);
+  FRIEND_TEST(NodeManagerTest, ScanDetectsPidReuseViaStartTime);
+  FRIEND_TEST(NodeManagerTest, SelfExitEscalationUsesLongTimeout);
+  FRIEND_TEST(NodeManagerTest, EofDegradedDeadlineDoesNotSignal);
+  FRIEND_TEST(NodeManagerTest, DriverDeadlineDoesNotSignal);
+  FRIEND_TEST(NodeManagerTest, PidlessPendingConvergesToDeadlineGrade);
 
   /// Disconnect a client.
   ///
@@ -996,9 +1009,16 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
     /// against pid reuse: same pid + different start time = the original
     /// process exited.
     uint64_t start_time_ticks = 0;
-    /// Steady-clock deadline (ms) after which a still-running pending process
-    /// is escalated to SIGKILL and the record becomes deadline-grade.
+    /// Steady-clock deadline (ms) after which a still-pending record becomes
+    /// deadline-grade (with a SIGKILL escalation for raylet- or
+    /// self-initiated worker records).
     int64_t deadline_ms = 0;
+    /// What caused the disconnect. EOF-degraded records (socket died,
+    /// process verified alive) are never signalled at the deadline.
+    DisconnectTrigger trigger = DisconnectTrigger::kRayletInitiated;
+    /// Drivers are never signalled at the deadline: the process legitimately
+    /// outlives its Ray connection.
+    bool is_driver = false;
   };
   absl::flat_hash_map<WorkerID, WorkerTombstone> worker_tombstones_;
   /// FIFO of evictable tombstone ids, oldest first. On POSIX only

@@ -11,6 +11,16 @@ ray_cc_test(
 )
 
 ray_cc_test(
+    name = "proc_stat_test",
+    size = "small",
+    srcs = ["proc_stat_test.cc"],
+    tags = ["team:core"],
+    deps = [
+        "//src/ray/util:proc_stat",
+    ],
+)
+
+ray_cc_test(
     name = "file_persistence_test",
     size = "small",
     srcs = ["file_persistence_test.cc"],

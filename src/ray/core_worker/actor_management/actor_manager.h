@@ -36,12 +36,19 @@ namespace core {
 /// by raylet.
 class ActorManager {
  public:
+  /// \param owner_state_publish_hook Called with every actor state
+  /// notification for actors owned by this worker, so the owner can
+  /// republish the state on its own pubsub channel
+  /// (WORKER_ACTOR_STATE_CHANNEL). May be nullptr.
   ActorManager(std::shared_ptr<gcs::GcsClient> gcs_client,
                ActorTaskSubmitterInterface &actor_task_submitter,
-               ReferenceCounterInterface &reference_counter)
+               ReferenceCounterInterface &reference_counter,
+               std::function<void(const ActorID &, const rpc::ActorTableData &)>
+                   owner_state_publish_hook = nullptr)
       : gcs_client_(std::move(gcs_client)),
         actor_task_submitter_(actor_task_submitter),
-        reference_counter_(reference_counter) {}
+        reference_counter_(reference_counter),
+        owner_state_publish_hook_(std::move(owner_state_publish_hook)) {}
 
   ~ActorManager() = default;
 
@@ -204,6 +211,11 @@ class ActorManager {
   /// Used to keep track of actor handle reference counts.
   /// All actor handle related ref counting logic should be included here.
   ReferenceCounterInterface &reference_counter_;
+
+  /// Republishes owned actors' state notifications on the owner's own pubsub
+  /// channel. Nullptr when owner-side publishing is not wired.
+  std::function<void(const ActorID &, const rpc::ActorTableData &)>
+      owner_state_publish_hook_;
 
   mutable absl::Mutex mutex_;
 

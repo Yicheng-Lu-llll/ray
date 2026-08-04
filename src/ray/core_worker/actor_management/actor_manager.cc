@@ -265,6 +265,11 @@ void ActorManager::HandleActorStateNotification(const ActorID &actor_id,
   } else {
     // The actor is being created and not yet ready, just ignore!
   }
+
+  if (owner_state_publish_hook_ != nullptr &&
+      reference_counter_.OwnedByUs(ObjectID::ForActorHandle(actor_id))) {
+    owner_state_publish_hook_(actor_id, actor_data);
+  }
 }
 
 std::vector<ObjectID> ActorManager::GetActorHandleIDsFromHandles() {

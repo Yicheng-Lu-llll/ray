@@ -319,6 +319,73 @@ TEST_F(ActorManagerTest, TestActorStateNotificationAlive) {
       actor_info_accessor_->ActorStateNotificationPublished(actor_id, actor_table_data));
 }
 
+TEST_F(ActorManagerTest, TestOwnedActorStateNotificationRepublished) {
+  // The owner republishes state notifications for its own actors through the
+  // publish hook (wired to WORKER_ACTOR_STATE_CHANNEL in production).
+  std::vector<std::pair<ActorID, rpc::ActorTableData>> published;
+  actor_manager_ = std::make_shared<ActorManager>(
+      gcs_client_mock_,
+      *actor_task_submitter_,
+      *reference_counter_,
+      [&](const ActorID &actor_id, const rpc::ActorTableData &actor_data) {
+        published.emplace_back(actor_id, actor_data);
+      });
+  ActorID actor_id = AddActorHandle();
+  EXPECT_CALL(*actor_task_submitter_, ConnectActor(_, _, _)).Times(1);
+  rpc::ActorTableData actor_table_data;
+  actor_table_data.set_actor_id(actor_id.Binary());
+  actor_table_data.set_state(rpc::ActorTableData::ALIVE);
+  actor_table_data.set_num_restarts(3);
+  ASSERT_TRUE(
+      actor_info_accessor_->ActorStateNotificationPublished(actor_id, actor_table_data));
+  ASSERT_EQ(published.size(), 1u);
+  EXPECT_EQ(published[0].first, actor_id);
+  EXPECT_EQ(published[0].second.state(), rpc::ActorTableData::ALIVE);
+  EXPECT_EQ(published[0].second.num_restarts(), 3u);
+}
+
+TEST_F(ActorManagerTest, TestBorrowedActorStateNotificationNotRepublished) {
+  // Only the owner republishes: a borrowed handle's notifications must not
+  // fan out from this worker.
+  std::vector<ActorID> published;
+  actor_manager_ = std::make_shared<ActorManager>(
+      gcs_client_mock_,
+      *actor_task_submitter_,
+      *reference_counter_,
+      [&](const ActorID &actor_id, const rpc::ActorTableData &) {
+        published.push_back(actor_id);
+      });
+  JobID job_id = JobID::FromInt(2);
+  const TaskID task_id = TaskID::ForDriverTask(job_id);
+  ActorID actor_id = ActorID::Of(job_id, task_id, 1);
+  RayFunction function(Language::PYTHON,
+                       FunctionDescriptorBuilder::BuildPython("", "", "", ""));
+  auto actor_handle = absl::make_unique<ActorHandle>(actor_id,
+                                                     TaskID::Nil(),
+                                                     rpc::Address(),
+                                                     job_id,
+                                                     ObjectID::FromRandom(),
+                                                     function.GetLanguage(),
+                                                     function.GetFunctionDescriptor(),
+                                                     "",
+                                                     0,
+                                                     "",
+                                                     "",
+                                                     -1,
+                                                     false);
+  actor_manager_->EmplaceNewActorHandle(
+      std::move(actor_handle), "", rpc::Address(), /*owned=*/false);
+  actor_manager_->SubscribeActorState(actor_id);
+
+  EXPECT_CALL(*actor_task_submitter_, ConnectActor(_, _, _)).Times(1);
+  rpc::ActorTableData actor_table_data;
+  actor_table_data.set_actor_id(actor_id.Binary());
+  actor_table_data.set_state(rpc::ActorTableData::ALIVE);
+  ASSERT_TRUE(
+      actor_info_accessor_->ActorStateNotificationPublished(actor_id, actor_table_data));
+  EXPECT_TRUE(published.empty());
+}
+
 ///
 /// Verify `SubscribeActorState` is idempotent
 ///

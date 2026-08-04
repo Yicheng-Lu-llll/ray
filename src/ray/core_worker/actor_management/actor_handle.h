@@ -120,6 +120,11 @@ class ActorHandle {
 
   int32_t MaxPendingCalls() const { return inner_.max_pending_calls(); }
 
+  /// True when the owner manages this actor's lifecycle itself: borrowers
+  /// follow actor state on the owner's WORKER_ACTOR_STATE_CHANNEL instead of
+  /// the GCS.
+  bool OwnerManaged() const { return inner_.owner_managed(); }
+
   bool AllowOutOfOrderExecution() const { return inner_.allow_out_of_order_execution(); }
 
   bool EnableTensorTransport() const { return inner_.enable_tensor_transport(); }

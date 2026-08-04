@@ -27,6 +27,7 @@
 #include "ray/core_worker/reference_counter_interface.h"
 #include "ray/core_worker/task_submission/actor_task_submitter.h"
 #include "ray/gcs_rpc_client/gcs_client.h"
+#include "ray/pubsub/subscriber_interface.h"
 #include "src/ray/protobuf/pubsub.pb.h"
 namespace ray {
 namespace core {
@@ -47,15 +48,20 @@ class ActorManager {
   /// notification for actors owned by this worker, so the owner can
   /// republish the state on its own pubsub channel
   /// (WORKER_ACTOR_STATE_CHANNEL). May be nullptr.
+  /// \param worker_state_subscriber Subscribes to other owners'
+  /// WORKER_ACTOR_STATE_CHANNEL for borrowed owner-managed actors. May be
+  /// nullptr, in which case every subscription goes through the GCS.
   ActorManager(std::shared_ptr<gcs::GcsClient> gcs_client,
                ActorTaskSubmitterInterface &actor_task_submitter,
                ReferenceCounterInterface &reference_counter,
                std::function<void(const ActorID &, const rpc::ActorTableData &)>
-                   owner_state_publish_hook = nullptr)
+                   owner_state_publish_hook = nullptr,
+               pubsub::SubscriberInterface *worker_state_subscriber = nullptr)
       : gcs_client_(std::move(gcs_client)),
         actor_task_submitter_(actor_task_submitter),
         reference_counter_(reference_counter),
-        owner_state_publish_hook_(std::move(owner_state_publish_hook)) {}
+        owner_state_publish_hook_(std::move(owner_state_publish_hook)),
+        worker_state_subscriber_(worker_state_subscriber) {}
 
   ~ActorManager() = default;
 
@@ -160,12 +166,21 @@ class ActorManager {
   void SubscribeActorState(const ActorID &actor_id);
 
   /// Handle an actor state notification: from the GCS for GCS-managed
-  /// actors, or authored by this worker for actors it owns and manages.
+  /// actors, authored by this worker for actors it owns and manages, or
+  /// converted from an owner's channel message for borrowed ones.
   ///
   /// \param[in] actor_id The actor id of this notification.
   /// \param[in] actor_data The actor data.
+  /// \param[in] is_restartable Overrides the restartability computed from
+  /// actor_data on DEAD; channel messages carry it precomputed because the
+  /// conversion has no max_restarts to recompute it from.
   void HandleActorStateNotification(const ActorID &actor_id,
-                                    const rpc::ActorTableData &actor_data);
+                                    const rpc::ActorTableData &actor_data,
+                                    std::optional<bool> is_restartable = std::nullopt);
+
+  /// The last state this owner authored for an owner-managed actor it owns,
+  /// if any. Serves the snapshot a new subscriber is sent on subscribe.
+  std::optional<rpc::ActorTableData> GetOwnedActorStateSnapshot(const ActorID &actor_id);
 
   /// Returns the actor handle if it exists, nullptr otherwise.
   std::shared_ptr<ActorHandle> GetActorHandleIfExists(const ActorID &actor_id);
@@ -224,6 +239,15 @@ class ActorManager {
   /// channel. Nullptr when owner-side publishing is not wired.
   std::function<void(const ActorID &, const rpc::ActorTableData &)>
       owner_state_publish_hook_;
+
+  /// Subscribes to other owners' actor state channels for borrowed
+  /// owner-managed actors. Nullptr when not wired.
+  pubsub::SubscriberInterface *worker_state_subscriber_ = nullptr;
+
+  /// Last authored state per owned owner-managed actor, the source of the
+  /// on-subscribe snapshot for borrowers.
+  absl::flat_hash_map<ActorID, rpc::ActorTableData> owned_actor_states_
+      ABSL_GUARDED_BY(mutex_);
 
   mutable absl::Mutex mutex_;
 

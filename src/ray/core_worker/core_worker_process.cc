@@ -671,7 +671,8 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
       std::make_unique<ActorManager>(gcs_client,
                                      *actor_task_submitter,
                                      *reference_counter,
-                                     std::move(publish_owned_actor_state));
+                                     std::move(publish_owned_actor_state),
+                                     object_info_subscriber.get());
 
   // For the recovery manager to lookup the addresses / ports of the nodes with secondary
   // copies.

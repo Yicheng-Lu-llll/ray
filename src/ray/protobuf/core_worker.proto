@@ -78,6 +78,10 @@ message ActorHandle {
   bool is_detached = 17;
 
   optional int64 actor_generator_backpressure_num_objects = 18;
+  // True when the owner manages this actor's lifecycle itself (unnamed,
+  // non-detached): borrowers follow actor state on the owner's
+  // WORKER_ACTOR_STATE_CHANNEL instead of the GCS.
+  bool owner_managed = 19;
 }
 
 message PushTaskRequest {

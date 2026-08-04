@@ -246,8 +246,28 @@ rpc::PubMessage MakeOwnerActorStatePubMessage(const ActorID &actor_id,
   return pub_message;
 }
 
+namespace {
+
+/// Convert an owner's channel message back into the ActorTableData shape the
+/// notification dispatch consumes. Restartability travels separately (the
+/// message has no max_restarts to recompute it from).
+rpc::ActorTableData ActorTableDataFromChannelMessage(
+    const ActorID &actor_id, const rpc::WorkerActorStateMessage &message) {
+  rpc::ActorTableData actor_data;
+  actor_data.set_actor_id(actor_id.Binary());
+  actor_data.set_state(message.state());
+  *actor_data.mutable_address() = message.address();
+  actor_data.set_num_restarts(message.num_restarts_total());
+  *actor_data.mutable_death_cause() = message.death_cause();
+  actor_data.set_preempted(message.preempted());
+  return actor_data;
+}
+
+}  // namespace
+
 void ActorManager::HandleActorStateNotification(const ActorID &actor_id,
-                                                const rpc::ActorTableData &actor_data) {
+                                                const rpc::ActorTableData &actor_data,
+                                                std::optional<bool> is_restartable) {
   const auto &actor_state = rpc::ActorTableData::ActorState_Name(actor_data.state());
   const auto worker_id = WorkerID::FromBinary(actor_data.address().worker_id());
   const auto node_id = NodeID::FromBinary(actor_data.address().node_id());
@@ -269,11 +289,12 @@ void ActorManager::HandleActorStateNotification(const ActorID &actor_id,
                                           /*is_restartable=*/true);
   } else if (actor_data.state() == rpc::ActorTableData::DEAD) {
     OnActorKilled(actor_id);
-    actor_task_submitter_.DisconnectActor(actor_id,
-                                          actor_data.num_restarts(),
-                                          /*dead=*/true,
-                                          actor_data.death_cause(),
-                                          gcs::IsActorRestartable(actor_data));
+    actor_task_submitter_.DisconnectActor(
+        actor_id,
+        actor_data.num_restarts(),
+        /*dead=*/true,
+        actor_data.death_cause(),
+        is_restartable.value_or(gcs::IsActorRestartable(actor_data)));
     // We cannot erase the actor handle here because clients can still
     // submit tasks to dead actors. This also means we defer unsubscription,
     // otherwise we crash when bulk unsubscribing all actor handles.
@@ -286,8 +307,22 @@ void ActorManager::HandleActorStateNotification(const ActorID &actor_id,
 
   if (owner_state_publish_hook_ != nullptr &&
       reference_counter_.OwnedByUs(ObjectID::ForActorHandle(actor_id))) {
+    {
+      absl::MutexLock lock(&mutex_);
+      owned_actor_states_[actor_id] = actor_data;
+    }
     owner_state_publish_hook_(actor_id, actor_data);
   }
+}
+
+std::optional<rpc::ActorTableData> ActorManager::GetOwnedActorStateSnapshot(
+    const ActorID &actor_id) {
+  absl::MutexLock lock(&mutex_);
+  auto it = owned_actor_states_.find(actor_id);
+  if (it == owned_actor_states_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
 }
 
 std::vector<ObjectID> ActorManager::GetActorHandleIDsFromHandles() {
@@ -327,6 +362,57 @@ void ActorManager::SubscribeActorState(const ActorID &actor_id) {
   auto actor_handle = GetActorHandle(actor_id);
   RAY_CHECK(actor_handle != nullptr);
 
+  if (actor_handle->OwnerManaged() && worker_state_subscriber_ != nullptr) {
+    if (reference_counter_.OwnedByUs(ObjectID::ForActorHandle(actor_id))) {
+      // We author this actor's states ourselves; there is nothing to
+      // subscribe to.
+      return;
+    }
+    // Borrowed owner-managed actor: follow its state on the owner's channel.
+    // The owner answers the subscribe command with a snapshot of the current
+    // state, so a late subscriber still learns ALIVE.
+    const rpc::Address owner_address = actor_handle->GetOwnerAddress();
+    auto sub_message = std::make_unique<rpc::SubMessage>();
+    sub_message->mutable_worker_actor_state_sub_message();
+    worker_state_subscriber_->Subscribe(
+        std::move(sub_message),
+        rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL,
+        owner_address,
+        actor_id.Binary(),
+        /*subscribe_done_callback=*/nullptr,
+        /*subscription_callback=*/
+        [this](const rpc::PubMessage &msg) {
+          const auto published_actor_id = ActorID::FromBinary(msg.key_id());
+          const auto &state_message = msg.worker_actor_state_message();
+          HandleActorStateNotification(
+              published_actor_id,
+              ActorTableDataFromChannelMessage(published_actor_id, state_message),
+              state_message.is_restartable());
+        },
+        /*subscription_failure_callback=*/
+        [this](const std::string &actor_id_binary, const Status &status) {
+          // The owner is unreachable: without a live owner the actor cannot
+          // survive (the raylet reaps owned leases on owner death), so the
+          // borrower declares it dead.
+          const auto failed_actor_id = ActorID::FromBinary(actor_id_binary);
+          RAY_LOG(INFO).WithField(failed_actor_id)
+              << "The owner of the actor is unreachable, marking the actor dead: "
+              << status;
+          rpc::ActorTableData actor_data;
+          actor_data.set_actor_id(actor_id_binary);
+          actor_data.set_state(rpc::ActorTableData::DEAD);
+          auto *died_context =
+              actor_data.mutable_death_cause()->mutable_actor_died_error_context();
+          died_context->set_reason(rpc::ActorDiedErrorContext::OWNER_DIED);
+          died_context->set_actor_id(actor_id_binary);
+          died_context->set_error_message(
+              "The actor is dead because its owner is unreachable.");
+          HandleActorStateNotification(
+              failed_actor_id, actor_data, /*is_restartable=*/false);
+        });
+    return;
+  }
+
   std::string cached_actor_name;
   if (!actor_handle->GetName().empty()) {
     cached_actor_name =
@@ -334,11 +420,10 @@ void ActorManager::SubscribeActorState(const ActorID &actor_id) {
   }
 
   // Register a callback to handle actor notifications.
-  auto actor_notification_callback =
-      std::bind(&ActorManager::HandleActorStateNotification,
-                this,
-                std::placeholders::_1,
-                std::placeholders::_2);
+  auto actor_notification_callback = [this](const ActorID &notified_actor_id,
+                                            const rpc::ActorTableData &actor_data) {
+    HandleActorStateNotification(notified_actor_id, actor_data);
+  };
   gcs_client_->Actors().AsyncSubscribe(
       actor_id,
       actor_notification_callback,

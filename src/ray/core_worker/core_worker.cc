@@ -3915,16 +3915,26 @@ StatusSet<StatusT::InvalidArgument> CoreWorker::ProcessSubscribeMessage(
   }
 
   if (!sub_message.has_worker_ref_removed_message() &&
-      !sub_message.has_worker_object_locations_message()) {
+      !sub_message.has_worker_object_locations_message() &&
+      !sub_message.has_worker_actor_state_sub_message()) {
     return StatusT::InvalidArgument(
         absl::StrFormat("Unexpected subscribe command has been received: %s"
-                        "Expected worker_ref_removed or "
-                        "worker_object_locations message",
+                        "Expected worker_ref_removed, worker_object_locations "
+                        "or worker_actor_state message",
                         sub_message.DebugString()));
   }
 
   if (sub_message.has_worker_ref_removed_message()) {
     ProcessSubscribeForRefRemoved(sub_message.worker_ref_removed_message());
+  } else if (sub_message.has_worker_actor_state_sub_message()) {
+    // A borrower subscribed to one of our owner-managed actors: answer with a
+    // snapshot of the current state so a late subscriber still learns it
+    // (channel messages only flow forward from the subscription point).
+    const auto actor_id = ActorID::FromBinary(key_id);
+    auto snapshot = actor_manager_->GetOwnedActorStateSnapshot(actor_id);
+    if (snapshot.has_value()) {
+      object_info_publisher_->Publish(MakeOwnerActorStatePubMessage(actor_id, *snapshot));
+    }
   } else {  // worker_object_locations_message case
     ProcessSubscribeObjectLocations(sub_message.worker_object_locations_message());
   }

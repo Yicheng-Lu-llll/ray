@@ -18,6 +18,7 @@ ray_cc_library(
         "//src/ray/gcs_rpc_client:gcs_client",
         "//src/ray/protobuf:core_worker_cc_proto",
         "//src/ray/protobuf:pubsub_cc_proto",
+        "//src/ray/pubsub:subscriber_interface",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_googletest//:gtest_prod",
     ],

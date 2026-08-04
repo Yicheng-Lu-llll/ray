@@ -319,6 +319,122 @@ TEST_F(ActorManagerTest, TestActorStateNotificationAlive) {
       actor_info_accessor_->ActorStateNotificationPublished(actor_id, actor_table_data));
 }
 
+class RecordingSubscriber : public pubsub::FakeSubscriber {
+ public:
+  void Subscribe(
+      std::unique_ptr<rpc::SubMessage> sub_message,
+      rpc::ChannelType channel_type,
+      const rpc::Address &owner_address,
+      const std::optional<std::string> &key_id,
+      pubsub::SubscribeDoneCallback subscribe_done_callback,
+      pubsub::SubscriptionItemCallback subscription_callback,
+      pubsub::SubscriptionFailureCallback subscription_failure_callback) override {
+    channel_types.push_back(channel_type);
+    publisher_addresses.push_back(owner_address);
+    item_callbacks.push_back(std::move(subscription_callback));
+    failure_callbacks.push_back(std::move(subscription_failure_callback));
+  }
+
+  std::vector<rpc::ChannelType> channel_types;
+  std::vector<rpc::Address> publisher_addresses;
+  std::vector<pubsub::SubscriptionItemCallback> item_callbacks;
+  std::vector<pubsub::SubscriptionFailureCallback> failure_callbacks;
+};
+
+TEST_F(ActorManagerTest, TestOwnedOwnerManagedActorDoesNotSubscribe) {
+  // The owner authors its own actors' states: subscribing (anywhere) would
+  // be circular.
+  RecordingSubscriber recording_subscriber;
+  actor_manager_ = std::make_shared<ActorManager>(gcs_client_mock_,
+                                                  *actor_task_submitter_,
+                                                  *reference_counter_,
+                                                  /*owner_state_publish_hook=*/nullptr,
+                                                  &recording_subscriber);
+  AddActorHandle();
+  EXPECT_TRUE(recording_subscriber.channel_types.empty());
+}
+
+TEST_F(ActorManagerTest, TestBorrowedOwnerManagedActorSubscribesToOwner) {
+  // A borrower follows an owner-managed actor's state on the owner's
+  // channel, and a channel DEAD carries restartability precomputed.
+  RecordingSubscriber recording_subscriber;
+  actor_manager_ = std::make_shared<ActorManager>(gcs_client_mock_,
+                                                  *actor_task_submitter_,
+                                                  *reference_counter_,
+                                                  /*owner_state_publish_hook=*/nullptr,
+                                                  &recording_subscriber);
+  JobID job_id = JobID::FromInt(4);
+  const TaskID task_id = TaskID::ForDriverTask(job_id);
+  ActorID actor_id = ActorID::Of(job_id, task_id, 1);
+  rpc::Address owner_address;
+  owner_address.set_worker_id(WorkerID::FromRandom().Binary());
+  owner_address.set_ip_address("10.0.0.1");
+  owner_address.set_port(4321);
+  RayFunction function(Language::PYTHON,
+                       FunctionDescriptorBuilder::BuildPython("", "", "", ""));
+  auto actor_handle = absl::make_unique<ActorHandle>(actor_id,
+                                                     TaskID::Nil(),
+                                                     owner_address,
+                                                     job_id,
+                                                     ObjectID::FromRandom(),
+                                                     function.GetLanguage(),
+                                                     function.GetFunctionDescriptor(),
+                                                     "",
+                                                     0,
+                                                     "",
+                                                     "",
+                                                     -1,
+                                                     false);
+  ASSERT_TRUE(actor_handle->OwnerManaged());
+  actor_manager_->EmplaceNewActorHandle(
+      std::move(actor_handle), "", rpc::Address(), /*owned=*/false);
+  actor_manager_->SubscribeActorState(actor_id);
+
+  ASSERT_EQ(recording_subscriber.channel_types.size(), 1u);
+  EXPECT_EQ(recording_subscriber.channel_types[0],
+            rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL);
+  EXPECT_EQ(recording_subscriber.publisher_addresses[0].worker_id(),
+            owner_address.worker_id());
+
+  // An ALIVE message from the owner connects the actor.
+  EXPECT_CALL(*actor_task_submitter_, ConnectActor(actor_id, _, 2)).Times(1);
+  rpc::PubMessage alive_message;
+  alive_message.set_key_id(actor_id.Binary());
+  alive_message.set_channel_type(rpc::ChannelType::WORKER_ACTOR_STATE_CHANNEL);
+  auto *state = alive_message.mutable_worker_actor_state_message();
+  state->set_state(rpc::ActorTableData::ALIVE);
+  state->set_num_restarts_total(2);
+  recording_subscriber.item_callbacks[0](std::move(alive_message));
+
+  // Owner unreachable: the actor is declared dead, not restartable.
+  EXPECT_CALL(*actor_task_submitter_,
+              DisconnectActor(actor_id, _, /*dead=*/true, _, /*is_restartable=*/false))
+      .Times(1);
+  recording_subscriber.failure_callbacks[0](actor_id.Binary(),
+                                            Status::Invalid("publisher failed"));
+}
+
+TEST_F(ActorManagerTest, TestOwnedActorStateSnapshotStored) {
+  // The owner records the last authored state so a late subscriber gets a
+  // snapshot on subscribe.
+  actor_manager_ =
+      std::make_shared<ActorManager>(gcs_client_mock_,
+                                     *actor_task_submitter_,
+                                     *reference_counter_,
+                                     [](const ActorID &, const rpc::ActorTableData &) {});
+  ActorID actor_id = AddActorHandle();
+  EXPECT_FALSE(actor_manager_->GetOwnedActorStateSnapshot(actor_id).has_value());
+  EXPECT_CALL(*actor_task_submitter_, ConnectActor(_, _, _)).Times(1);
+  rpc::ActorTableData actor_table_data;
+  actor_table_data.set_actor_id(actor_id.Binary());
+  actor_table_data.set_state(rpc::ActorTableData::ALIVE);
+  ASSERT_TRUE(
+      actor_info_accessor_->ActorStateNotificationPublished(actor_id, actor_table_data));
+  auto snapshot = actor_manager_->GetOwnedActorStateSnapshot(actor_id);
+  ASSERT_TRUE(snapshot.has_value());
+  EXPECT_EQ(snapshot->state(), rpc::ActorTableData::ALIVE);
+}
+
 TEST_F(ActorManagerTest, TestOwnedActorStateNotificationRepublished) {
   // The owner republishes state notifications for its own actors through the
   // publish hook (wired to WORKER_ACTOR_STATE_CHANNEL in production).

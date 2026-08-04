@@ -59,6 +59,10 @@ rpc::ActorHandle CreateInnerActorHandle(
   inner.set_enable_task_events(enable_task_events.value_or(kDefaultTaskEventEnabled));
   inner.mutable_labels()->insert(labels.begin(), labels.end());
   inner.set_is_detached(is_detached);
+  // Derived, not passed in: the same predicate that routes creation through
+  // the owner-side submitter, so a handle's channel choice can never diverge
+  // from where the actor was actually created.
+  inner.set_owner_managed(name.empty() && !is_detached);
   if (actor_generator_backpressure_num_objects > 0) {
     inner.set_actor_generator_backpressure_num_objects(
         actor_generator_backpressure_num_objects);

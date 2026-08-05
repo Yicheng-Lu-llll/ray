@@ -322,6 +322,11 @@ RAY_CONFIG(size_t, worker_tombstone_capacity, 10000)
 /// Period of the raylet's pending-tombstone exit scan.
 RAY_CONFIG(int64_t, worker_tombstone_scan_period_ms, 100)
 
+/// Period of the raylet's reconciliation sweep verifying the owners of its
+/// held actor leases (backstops a lost owner-death broadcast, e.g. across a
+/// GCS restart). 0 disables.
+RAY_CONFIG(int64_t, raylet_lease_owner_reconciliation_period_ms, 60000)
+
 /// Period of the owner's reconciliation sweep over its owner-managed
 /// actors' liveness (backstops a lost raylet death notification). 0
 /// disables.

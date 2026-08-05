@@ -310,6 +310,13 @@ NodeManager::NodeManager(
       RayConfig::instance().worker_tombstone_scan_period_ms(),
       "NodeManager.ScanPendingTombstones");
 
+  if (RayConfig::instance().raylet_lease_owner_reconciliation_period_ms() > 0) {
+    periodical_runner_->RunFnPeriodically(
+        [this]() { ReconcileActorLeaseOwners(); },
+        RayConfig::instance().raylet_lease_owner_reconciliation_period_ms(),
+        "NodeManager.ReconcileActorLeaseOwners");
+  }
+
   RAY_CHECK_OK(store_client_->Connect(config.store_socket_name));
   // Run the node manager rpc server.
   node_manager_server_.RegisterService(
@@ -1130,6 +1137,9 @@ void NodeManager::HandleNotifyGCSRestart(rpc::NotifyGCSRestartRequest request,
   // registered to raylet first (blocking call) and then connect to GCS, so there is no
   // race condition here.
   gcs_client_.AsyncResubscribe();
+  // The restart may have lost owner-death broadcasts: re-verify the owners
+  // of held actor leases.
+  ReconcileActorLeaseOwners();
   auto workers = worker_pool_.GetAllRegisteredWorkers(/* filter_dead_workers */ true);
   for (const auto &worker : workers) {
     worker->AsyncNotifyGCSRestart();
@@ -2330,6 +2340,59 @@ ProcProbeResult ProbeProc(pid_t pid, uint64_t *start_time_ticks) {
 }
 #endif
 }  // namespace
+
+void NodeManager::ReconcileActorLeaseOwners() {
+  for (const auto &[lease_id, worker] : leased_workers_) {
+    if (worker->GetActorId().IsNil() || worker->IsDetachedActor() || worker->IsDead()) {
+      continue;
+    }
+    const auto owner_address = worker->GetOwnerAddress();
+    const auto owner_node_id = NodeID::FromBinary(owner_address.node_id());
+    const auto owner_worker_id = WorkerID::FromBinary(owner_address.worker_id());
+    if (gcs_client_.Nodes().IsNodeDead(owner_node_id)) {
+      RAY_LOG(INFO).WithField(worker->WorkerId())
+          << "Killing leased actor worker: its owner's node is dead "
+             "(reconciliation).";
+      worker->KillAsync(io_service_);
+      continue;
+    }
+    auto node_info = gcs_client_.Nodes().GetNodeAddressAndLiveness(owner_node_id);
+    if (!node_info.has_value()) {
+      // Inconclusive (node cache lag): re-check next round.
+      continue;
+    }
+    auto raylet_address = rpc::RayletClientPool::GenerateRayletAddress(
+        owner_node_id, node_info->node_manager_address(), node_info->node_manager_port());
+    const WorkerID leased_worker_id = worker->WorkerId();
+    raylet_client_pool_.GetOrConnectByAddress(raylet_address)
+        ->GetWorkerLiveness(
+            owner_worker_id,
+            [this, lease_id, owner_node_id, owner_worker_id, leased_worker_id](
+                const Status &status, rpc::GetWorkerLivenessReply &&reply) {
+              if (!status.ok() || reply.status() == rpc::GetWorkerLivenessReply::ALIVE ||
+                  reply.status() == rpc::GetWorkerLivenessReply::PENDING) {
+                // Alive, not yet terminal, or inconclusive: next round.
+                return;
+              }
+              if (reply.status() == rpc::GetWorkerLivenessReply::UNKNOWN &&
+                  NodeID::FromBinary(reply.node_id()) != owner_node_id) {
+                // A different raylet incarnation answered: not a verdict.
+                return;
+              }
+              // DEAD, or UNKNOWN from the raylet the owner was registered
+              // at: the owner is gone.
+              auto it = leased_workers_.find(lease_id);
+              if (it == leased_workers_.end() || it->second->IsDead() ||
+                  it->second->GetOwnerAddress().worker_id() != owner_worker_id.Binary()) {
+                return;
+              }
+              RAY_LOG(INFO).WithField(leased_worker_id)
+                  << "Killing leased actor worker: its owner is dead "
+                     "(reconciliation).";
+              it->second->KillAsync(io_service_);
+            });
+  }
+}
 
 void NodeManager::NotifyOwnerOfDeadActorWorker(const rpc::Address &owner_address,
                                                const WorkerID &worker_id,

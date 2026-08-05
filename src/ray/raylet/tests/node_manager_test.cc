@@ -335,9 +335,9 @@ class NodeManagerTest : public ::testing::Test {
   NodeManagerTest()
       : client_call_manager_(io_service_, /*record_stats=*/false, /*local_address=*/""),
         shared_worker_client_(std::make_shared<NotifyRecordingWorkerClient>()),
+        shared_raylet_client_(std::make_shared<rpc::FakeRayletClient>()),
         worker_rpc_pool_([this](const auto &) { return shared_worker_client_; }),
-        raylet_client_pool_(
-            [](const auto &) { return std::make_shared<rpc::FakeRayletClient>(); }),
+        raylet_client_pool_([this](const auto &) { return shared_raylet_client_; }),
         fake_task_by_state_counter_() {
     RayConfig::instance().initialize(R"({
       "raylet_liveness_self_check_interval_ms": 100
@@ -496,6 +496,7 @@ class NodeManagerTest : public ::testing::Test {
   instrumented_io_context io_service_;
   rpc::ClientCallManager client_call_manager_;
   std::shared_ptr<NotifyRecordingWorkerClient> shared_worker_client_;
+  std::shared_ptr<rpc::FakeRayletClient> shared_raylet_client_;
   rpc::CoreWorkerClientPool worker_rpc_pool_;
   rpc::RayletClientPool raylet_client_pool_;
 
@@ -880,6 +881,92 @@ TEST_F(NodeManagerTest, DriverDisconnectRecordsDriverTombstone) {
   const auto &tombstone = node_manager_->worker_tombstones_.at(driver->WorkerId());
   EXPECT_EQ(tombstone.trigger, NodeManager::DisconnectTrigger::kWorkerInitiated);
   EXPECT_TRUE(tombstone.is_driver);
+}
+
+TEST_F(NodeManagerTest, ReconciliationKillsLeasedWorkerOfDeadOwner) {
+  // The sweep kills a held actor lease's worker once the owner is confirmed
+  // dead (tombstone DEAD from the owner's raylet, or the owner's node dead).
+  JobID job_id = JobID::FromInt(30);
+  auto worker =
+      CreateActorWorker(TaskID::ForDriverTask(job_id), 0, 10, clock_, /*pid=*/-1);
+  rpc::Address owner_address;
+  const NodeID owner_node = NodeID::FromRandom();
+  owner_address.set_node_id(owner_node.Binary());
+  owner_address.set_worker_id(WorkerID::FromRandom().Binary());
+  worker->SetOwnerAddress(owner_address);
+  leased_workers_[worker->GetGrantedLeaseId()] = worker;
+
+  rpc::GcsNodeAddressAndLiveness owner_node_info;
+  owner_node_info.set_node_manager_address("127.0.0.1");
+  owner_node_info.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(owner_node))
+      .WillRepeatedly(Return(false));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor,
+              GetNodeAddressAndLiveness(owner_node, _))
+      .WillRepeatedly(Return(owner_node_info));
+
+  node_manager_->ReconcileActorLeaseOwners();
+  ASSERT_TRUE(shared_raylet_client_->ReplyGetWorkerLiveness(
+      rpc::GetWorkerLivenessReply::DEAD, rpc::GetWorkerLivenessReply::EXIT));
+  EXPECT_TRUE(std::static_pointer_cast<MockWorker>(worker)->IsKilled());
+  leased_workers_.clear();
+}
+
+TEST_F(NodeManagerTest, ReconciliationSparesLiveAndInconclusiveOwners) {
+  // ALIVE, PENDING, transport failure, and UNKNOWN from a different raylet
+  // incarnation all leave the lease alone.
+  JobID job_id = JobID::FromInt(31);
+  auto worker =
+      CreateActorWorker(TaskID::ForDriverTask(job_id), 0, 10, clock_, /*pid=*/-1);
+  rpc::Address owner_address;
+  const NodeID owner_node = NodeID::FromRandom();
+  owner_address.set_node_id(owner_node.Binary());
+  owner_address.set_worker_id(WorkerID::FromRandom().Binary());
+  worker->SetOwnerAddress(owner_address);
+  leased_workers_[worker->GetGrantedLeaseId()] = worker;
+
+  rpc::GcsNodeAddressAndLiveness owner_node_info;
+  owner_node_info.set_node_manager_address("127.0.0.1");
+  owner_node_info.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(owner_node))
+      .WillRepeatedly(Return(false));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor,
+              GetNodeAddressAndLiveness(owner_node, _))
+      .WillRepeatedly(Return(owner_node_info));
+
+  node_manager_->ReconcileActorLeaseOwners();
+  ASSERT_TRUE(
+      shared_raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::ALIVE));
+  EXPECT_FALSE(std::static_pointer_cast<MockWorker>(worker)->IsKilled());
+
+  node_manager_->ReconcileActorLeaseOwners();
+  ASSERT_TRUE(shared_raylet_client_->ReplyGetWorkerLiveness(
+      rpc::GetWorkerLivenessReply::PENDING));
+  EXPECT_FALSE(std::static_pointer_cast<MockWorker>(worker)->IsKilled());
+
+  // UNKNOWN answered by a different raylet incarnation: not a verdict.
+  node_manager_->ReconcileActorLeaseOwners();
+  ASSERT_TRUE(shared_raylet_client_->ReplyGetWorkerLiveness(
+      rpc::GetWorkerLivenessReply::UNKNOWN,
+      rpc::GetWorkerLivenessReply::GRADE_UNSPECIFIED,
+      Status::OK(),
+      NodeID::FromRandom()));
+  EXPECT_FALSE(std::static_pointer_cast<MockWorker>(worker)->IsKilled());
+
+  // Transport failure: inconclusive.
+  node_manager_->ReconcileActorLeaseOwners();
+  ASSERT_TRUE(shared_raylet_client_->ReplyGetWorkerLiveness(
+      rpc::GetWorkerLivenessReply::UNKNOWN,
+      rpc::GetWorkerLivenessReply::GRADE_UNSPECIFIED,
+      Status::IOError("unreachable")));
+  EXPECT_FALSE(std::static_pointer_cast<MockWorker>(worker)->IsKilled());
+
+  // The owner's node going dead is a verdict, no RPC needed.
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(owner_node))
+      .WillRepeatedly(Return(true));
+  node_manager_->ReconcileActorLeaseOwners();
+  EXPECT_TRUE(std::static_pointer_cast<MockWorker>(worker)->IsKilled());
+  leased_workers_.clear();
 }
 
 TEST_F(NodeManagerTest, DeadActorWorkerNotifiesOwner) {

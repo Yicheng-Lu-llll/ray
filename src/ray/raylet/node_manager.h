@@ -769,6 +769,15 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// possible: a zombie counts as exited), pending-exit otherwise. Drivers
   /// are recorded with is_driver so the deadline escalation never signals
   /// them (a driver process legitimately outlives its Ray connection).
+  /// Re-verify the owners of held non-detached actor leases (three-state:
+  /// a dead owner node or a tombstone-confirmed dead owner worker kills the
+  /// leased worker; ALIVE/PENDING and inconclusive answers leave it for the
+  /// next round). The periodic backstop for a lost owner-death broadcast.
+  void ReconcileActorLeaseOwners();
+
+  FRIEND_TEST(NodeManagerTest, ReconciliationKillsLeasedWorkerOfDeadOwner);
+  FRIEND_TEST(NodeManagerTest, ReconciliationSparesLiveAndInconclusiveOwners);
+
   /// Eagerly notify an owner that its leased actor worker died, with a
   /// bounded number of retries (the owner's lazy liveness probe backstops a
   /// lost notification).

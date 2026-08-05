@@ -1709,6 +1709,70 @@ TEST_F(OwnerManagedActorTest, OutOfScopeRestartableActorResurrectsOnNewTask) {
   EXPECT_TRUE(gcs::IsActorRestartable(notified_states[4].second));
 }
 
+TEST_F(OwnerManagedActorTest, PreemptedNodeDeathDoesNotConsumeBudget) {
+  // A drain-preempted node death restarts the actor without consuming the
+  // max_restarts budget (GCS RestartActor semantics): with max_restarts=1,
+  // one preemption restart + one failure restart succeed, the next failure
+  // is final.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(18), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  auto spec = BuildCreationTaskSpec(actor_id);
+  spec.GetMutableMessage().mutable_actor_creation_task_spec()->set_max_actor_restarts(1);
+  submitter_.SubmitActorCreationTask(spec);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  // First death: the node was drain-preempted.
+  rpc::GcsNodeAddressAndLiveness preempted_node;
+  preempted_node.set_node_manager_address("127.0.0.1");
+  preempted_node.set_node_manager_port(7000);
+  preempted_node.mutable_death_info()->set_reason(
+      rpc::NodeDeathInfo::AUTOSCALER_DRAIN_PREEMPTED);
+  rpc::GcsNodeAddressAndLiveness alive_node;
+  alive_node.set_node_manager_address("127.0.0.1");
+  alive_node.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillOnce(Return(preempted_node))
+      .WillRepeatedly(Return(alive_node));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillOnce(Return(true))
+      .WillRepeatedly(Return(false));
+
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::RESTARTING);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9999, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(notified_states.size(), 3u);
+  EXPECT_EQ(notified_states[2].second.state(), rpc::ActorTableData::ALIVE);
+
+  // Second death (worker failure): the budget was not consumed by the
+  // preemption, so this restart still fits max_restarts=1.
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::DEAD,
+                                                     rpc::GetWorkerLivenessReply::EXIT));
+  ASSERT_EQ(notified_states.size(), 4u);
+  EXPECT_EQ(notified_states[3].second.state(), rpc::ActorTableData::RESTARTING);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9997, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(notified_states.size(), 5u);
+  EXPECT_EQ(notified_states[4].second.state(), rpc::ActorTableData::ALIVE);
+
+  // Third death: the budget is now truly exhausted.
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::DEAD,
+                                                     rpc::GetWorkerLivenessReply::EXIT));
+  ASSERT_EQ(notified_states.size(), 6u);
+  EXPECT_EQ(notified_states[5].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(notified_states[5].second.num_restarts(), 2u);
+  EXPECT_EQ(notified_states[5].second.num_restarts_due_to_node_preemption(), 1u);
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

@@ -515,21 +515,29 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
 
   void ProbeOwnerManagedActorLiveness(const ActorID &actor_id);
   /// Death confirmed: restart within the max_restarts budget (authoring
-  /// RESTARTING then ALIVE) or author the final DEAD.
+  /// RESTARTING then ALIVE) or author the final DEAD. A death from node
+  /// preemption does not consume the budget (mirroring the GCS).
   void HandleOwnerManagedActorDeath(const ActorID &actor_id,
-                                    const rpc::ActorDeathCause &death_cause);
+                                    const rpc::ActorDeathCause &death_cause,
+                                    bool preempted = false);
   /// Liveness probes currently running, one per actor. io thread only.
   absl::flat_hash_set<ActorID> liveness_probes_in_flight_;
-  /// Failure-restart count per owner-managed actor (the num_restarts the
-  /// owner authors). io thread only.
-  absl::flat_hash_map<ActorID, uint64_t> owner_managed_restarts_;
+  /// Failure-restart accounting per owner-managed actor (the num_restarts
+  /// the owner authors, and how many were due to node preemption — those do
+  /// not consume the max_restarts budget, mirroring the GCS). io thread
+  /// only.
+  struct RestartCounts {
+    uint64_t total = 0;
+    uint64_t due_to_node_preemption = 0;
+  };
+  absl::flat_hash_map<ActorID, RestartCounts> owner_managed_restarts_;
 
   /// Owner-managed actors that died out-of-scope with restart budget left:
   /// their retained spec and restart count, kept so a later lineage
   /// reconstruction task can resurrect them (design doc §5.3).
   struct ResurrectableActor {
     TaskSpecification spec;
-    uint64_t restarts = 0;
+    RestartCounts restarts;
   };
   absl::flat_hash_map<ActorID, ResurrectableActor> resurrectable_actors_
       ABSL_GUARDED_BY(mu_);

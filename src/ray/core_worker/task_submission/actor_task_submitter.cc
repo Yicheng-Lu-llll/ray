@@ -315,12 +315,14 @@ void ActorTaskSubmitter::FinishOwnerManagedTermination(
     const std::optional<TaskSpecification> &spec,
     const std::optional<rpc::Address> &address) {
   auto actor_data = MakeOutOfScopeDeadState(actor_id);
-  const uint64_t restarts_used = owner_managed_restarts_[actor_id];
+  const RestartCounts restarts_used = owner_managed_restarts_[actor_id];
   if (spec.has_value()) {
     // Restartability travels in the DEAD state (the same
     // gcs::IsActorRestartable computation as a GCS-authored death).
     actor_data.set_max_restarts(spec->MaxActorRestarts());
-    actor_data.set_num_restarts(restarts_used);
+    actor_data.set_num_restarts(restarts_used.total);
+    actor_data.set_num_restarts_due_to_node_preemption(
+        restarts_used.due_to_node_preemption);
   }
   if (address.has_value()) {
     *actor_data.mutable_address() = *address;
@@ -462,13 +464,19 @@ void ActorTaskSubmitter::ProbeOwnerManagedActorLiveness(const ActorID &actor_id)
   const auto worker_id = WorkerID::FromBinary(address->worker_id());
   auto node_info = gcs_client_->Nodes().GetNodeAddressAndLiveness(node_id);
   if (!node_info.has_value() || gcs_client_->Nodes().IsNodeDead(node_id)) {
-    // The node is gone: the worker died with it.
+    // The node is gone: the worker died with it. A drain-preempted node
+    // death does not consume the restart budget (mirroring the GCS).
+    const bool preempted =
+        node_info.has_value() && node_info->death_info().reason() ==
+                                     rpc::NodeDeathInfo::AUTOSCALER_DRAIN_PREEMPTED;
     rpc::ActorDeathCause death_cause;
     auto *died_context = death_cause.mutable_actor_died_error_context();
     died_context->set_reason(rpc::ActorDiedErrorContext::NODE_DIED);
     died_context->set_actor_id(actor_id.Binary());
-    died_context->set_error_message("The node hosting the actor died.");
-    HandleOwnerManagedActorDeath(actor_id, death_cause);
+    died_context->set_error_message(preempted
+                                        ? "The node hosting the actor was preempted."
+                                        : "The node hosting the actor died.");
+    HandleOwnerManagedActorDeath(actor_id, death_cause, preempted);
     return;
   }
   auto raylet_address = rpc::RayletClientPool::GenerateRayletAddress(
@@ -515,7 +523,7 @@ void ActorTaskSubmitter::ProbeOwnerManagedActorLiveness(const ActorID &actor_id)
 }
 
 void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
-    const ActorID &actor_id, const rpc::ActorDeathCause &death_cause) {
+    const ActorID &actor_id, const rpc::ActorDeathCause &death_cause, bool preempted) {
   liveness_probes_in_flight_.erase(actor_id);
   if (creation_submitter_->IsCreationPushInFlight(actor_id)) {
     // A death verdict while the creation push is in flight is handled by the
@@ -541,14 +549,19 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
     return;
   }
   const int64_t max_restarts = spec->MaxActorRestarts();
-  uint64_t &restarts = owner_managed_restarts_[actor_id];
-  const bool restartable =
-      max_restarts == -1 || restarts < static_cast<uint64_t>(max_restarts);
+  RestartCounts &restarts = owner_managed_restarts_[actor_id];
+  // Preemption deaths do not consume the budget, and a preempted actor with
+  // max_restarts > 0 restarts even with the budget exhausted (GCS
+  // RestartActor semantics).
+  const uint64_t effective_restarts = restarts.total - restarts.due_to_node_preemption;
+  const bool restartable = max_restarts == -1 || (max_restarts > 0 && preempted) ||
+                           effective_restarts < static_cast<uint64_t>(max_restarts);
   if (!restartable) {
     rpc::ActorTableData actor_data;
     actor_data.set_actor_id(actor_id.Binary());
     actor_data.set_state(rpc::ActorTableData::DEAD);
-    actor_data.set_num_restarts(restarts);
+    actor_data.set_num_restarts(restarts.total);
+    actor_data.set_num_restarts_due_to_node_preemption(restarts.due_to_node_preemption);
     *actor_data.mutable_death_cause() = death_cause;
     {
       absl::MutexLock lock(&mu_);
@@ -559,8 +572,11 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
     owner_state_notifier_(actor_id, actor_data);
     return;
   }
-  restarts += 1;
-  const uint64_t restart_generation = restarts;
+  restarts.total += 1;
+  if (preempted) {
+    restarts.due_to_node_preemption += 1;
+  }
+  const uint64_t restart_generation = restarts.total;
   {
     rpc::ActorTableData actor_data;
     actor_data.set_actor_id(actor_id.Binary());
@@ -642,8 +658,10 @@ void ActorTaskSubmitter::ResurrectOwnerManagedActor(const ActorID &actor_id) {
     resurrectable_actors_.erase(it);
     owner_managed_actors_.insert(actor_id);
   }
-  const uint64_t restart_generation = resurrectable->restarts + 1;
-  owner_managed_restarts_[actor_id] = restart_generation;
+  RestartCounts counts = resurrectable->restarts;
+  counts.total += 1;
+  const uint64_t restart_generation = counts.total;
+  owner_managed_restarts_[actor_id] = counts;
   {
     // Author RESTARTING for borrowers; the local queue is already RESTARTING
     // (the dispatch is idempotent for it).

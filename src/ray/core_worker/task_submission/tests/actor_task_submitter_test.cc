@@ -1773,6 +1773,142 @@ TEST_F(OwnerManagedActorTest, PreemptedNodeDeathDoesNotConsumeBudget) {
   EXPECT_EQ(notified_states[5].second.num_restarts_due_to_node_preemption(), 1u);
 }
 
+TEST_F(OwnerManagedActorTest, PreemptionRestartsBeyondExhaustedBudget) {
+  // With max_restarts=1 already exhausted by a failure restart, a
+  // drain-preempted node death still restarts the actor (the
+  // max_restarts>0 && preempted clause).
+  ActorID actor_id = ActorID::Of(JobID::FromInt(19), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  auto spec = BuildCreationTaskSpec(actor_id);
+  spec.GetMutableMessage().mutable_actor_creation_task_spec()->set_max_actor_restarts(1);
+  submitter_.SubmitActorCreationTask(spec);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  rpc::GcsNodeAddressAndLiveness alive_node;
+  alive_node.set_node_manager_address("127.0.0.1");
+  alive_node.set_node_manager_port(7000);
+  rpc::GcsNodeAddressAndLiveness preempted_node = alive_node;
+  preempted_node.mutable_death_info()->set_reason(
+      rpc::NodeDeathInfo::AUTOSCALER_DRAIN_PREEMPTED);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillOnce(Return(alive_node))
+      .WillRepeatedly(Return(preempted_node));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillOnce(Return(false))
+      .WillRepeatedly(Return(true));
+
+  // Failure death exhausts the budget.
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::DEAD,
+                                                     rpc::GetWorkerLivenessReply::EXIT));
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::RESTARTING);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9999, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(notified_states.size(), 3u);
+
+  // Preemption death: only the exemption clause can allow this restart.
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_EQ(notified_states.size(), 4u);
+  EXPECT_EQ(notified_states[3].second.state(), rpc::ActorTableData::RESTARTING);
+  EXPECT_EQ(notified_states[3].second.num_restarts(), 2u);
+}
+
+TEST_F(OwnerManagedActorTest, PreemptionCountSurvivesResurrection) {
+  // The preemption exemption must survive the out-of-scope →
+  // resurrection round trip: the DEAD carries both counters and the
+  // resurrected actor's budget still excludes the preemption restart.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(20), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  submitter_.AddActorQueueIfNotExists(actor_id,
+                                      /*max_pending_calls=*/-1,
+                                      /*allow_out_of_order_execution=*/false,
+                                      /*fail_if_actor_unreachable=*/false,
+                                      /*owned=*/true);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(testing::AnyNumber());
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  auto spec = BuildCreationTaskSpec(actor_id);
+  spec.GetMutableMessage().mutable_actor_creation_task_spec()->set_max_actor_restarts(1);
+  submitter_.SubmitActorCreationTask(spec);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  // Preemption death and restart: counts {1,1}.
+  rpc::GcsNodeAddressAndLiveness preempted_node;
+  preempted_node.set_node_manager_address("127.0.0.1");
+  preempted_node.set_node_manager_port(7000);
+  preempted_node.mutable_death_info()->set_reason(
+      rpc::NodeDeathInfo::AUTOSCALER_DRAIN_PREEMPTED);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillOnce(Return(preempted_node));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillOnce(Return(true));
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9999, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(notified_states.size(), 3u);
+
+  // Lineage pin, then out of scope: the DEAD carries both counters.
+  reference_counter_->UpdateSubmittedTaskReferences(
+      /*return_ids=*/{}, {ObjectID::ForActorHandle(actor_id)});
+  reference_counter_->UpdateFinishedTaskReferences(
+      /*return_ids=*/{},
+      {ObjectID::ForActorHandle(actor_id)},
+      /*release_lineage=*/false,
+      rpc::Address(),
+      ::google::protobuf::RepeatedPtrField<rpc::ObjectReferenceCount>(),
+      nullptr);
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(notified_states.size(), 4u);
+  const auto &dead_state = notified_states[3].second;
+  EXPECT_EQ(dead_state.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(dead_state.num_restarts(), 1u);
+  EXPECT_EQ(dead_state.num_restarts_due_to_node_preemption(), 1u);
+  EXPECT_TRUE(gcs::IsActorRestartable(dead_state));
+  submitter_.DisconnectActor(actor_id,
+                             /*num_restarts=*/1,
+                             /*dead=*/true,
+                             dead_state.death_cause(),
+                             /*is_restartable=*/true);
+
+  // Resurrect; the exemption carried through (effective = 2-1 = 1 = max
+  // would forbid, so budget math must see the preserved preemption count).
+  reference_counter_->AddLocalReference(ObjectID::ForActorHandle(actor_id), "test");
+  submitter_.SubmitTask(CreateActorTaskHelper(actor_id, WorkerID::FromRandom(), 0));
+  Pump();
+  ASSERT_EQ(notified_states.size(), 5u);
+  EXPECT_EQ(notified_states[4].second.state(), rpc::ActorTableData::RESTARTING);
+  EXPECT_EQ(notified_states[4].second.num_restarts(), 2u);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9997, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  Pump();
+  ASSERT_EQ(notified_states.size(), 6u);
+  EXPECT_EQ(notified_states[5].second.state(), rpc::ActorTableData::ALIVE);
+
+  // Final failure death: effective = 2-1 = 1 = max, budget truly gone.
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillRepeatedly(Return(preempted_node));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(false));
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::DEAD,
+                                                     rpc::GetWorkerLivenessReply::EXIT));
+  ASSERT_EQ(notified_states.size(), 7u);
+  EXPECT_EQ(notified_states[6].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(notified_states[6].second.num_restarts(), 2u);
+  EXPECT_EQ(notified_states[6].second.num_restarts_due_to_node_preemption(), 1u);
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

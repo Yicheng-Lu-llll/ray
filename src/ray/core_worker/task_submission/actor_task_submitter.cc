@@ -327,6 +327,10 @@ void ActorTaskSubmitter::FinishOwnerManagedTermination(
   if (address.has_value()) {
     *actor_data.mutable_address() = *address;
   }
+  // Known divergence from the GCS: the sticky preempted bit is never set on
+  // owner-authored DEADs, so the (max_restarts > 0 && preempted) resurrection
+  // exemption in IsActorRestartable is unreachable here until the owner
+  // tracks drain events (B2.3b③).
   const bool keep_resurrectable = spec.has_value() && gcs::IsActorRestartable(actor_data);
   {
     absl::MutexLock lock(&mu_);
@@ -465,7 +469,15 @@ void ActorTaskSubmitter::ProbeOwnerManagedActorLiveness(const ActorID &actor_id)
   auto node_info = gcs_client_->Nodes().GetNodeAddressAndLiveness(node_id);
   if (!node_info.has_value() || gcs_client_->Nodes().IsNodeDead(node_id)) {
     // The node is gone: the worker died with it. A drain-preempted node
-    // death does not consume the restart budget (mirroring the GCS).
+    // death does not consume the restart budget. NOTE: this death-time
+    // reading of death_info.reason is an approximation of the GCS's sticky
+    // preempted bit (set at drain notice, while the node still lives) and
+    // is narrower in two known scenarios: (a) the worker dies before the
+    // node during a drain, so the probe takes the GetWorkerLiveness path
+    // with preempted=false; (b) a SIGTERM arriving at/before the drain
+    // deadline is recorded as EXPECTED/UNEXPECTED_TERMINATION, not
+    // PREEMPTED. The full fix is an owner-local sticky bit fed by drain
+    // events (tracked as B2.3b③ in the project ledger).
     const bool preempted =
         node_info.has_value() && node_info->death_info().reason() ==
                                      rpc::NodeDeathInfo::AUTOSCALER_DRAIN_PREEMPTED;

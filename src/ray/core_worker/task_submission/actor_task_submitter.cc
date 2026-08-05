@@ -418,36 +418,47 @@ void ActorTaskSubmitter::TerminateOwnerManagedActor(const ActorID &actor_id) {
 void ActorTaskSubmitter::KillOwnerManagedActorWorker(const ActorID &actor_id,
                                                      const rpc::Address &address,
                                                      int attempts_left) {
-  auto client = core_worker_client_pool_.GetOrConnect(address);
-  rpc::KillActorRequest request;
+  // Kill through the worker's raylet (design doc §5.3): the raylet answers
+  // authoritatively — an unregistered worker is already dead (tombstoned),
+  // a live one is killed with the raylet's own escalation — so no blind
+  // direct-to-worker retry loop is needed.
+  const auto node_id = NodeID::FromBinary(address.node_id());
+  auto node_info = gcs_client_->Nodes().GetNodeAddressAndLiveness(node_id);
+  if (!node_info.has_value() || gcs_client_->Nodes().IsNodeDead(node_id)) {
+    // The node died: its raylet reaped the worker already.
+    return;
+  }
+  auto raylet_address = rpc::RayletClientPool::GenerateRayletAddress(
+      node_id, node_info->node_manager_address(), node_info->node_manager_port());
+  rpc::KillLocalActorRequest request;
   request.set_intended_actor_id(actor_id.Binary());
+  request.set_worker_id(address.worker_id());
   request.set_force_kill(false);
-  client->KillActor(
-      request,
-      [this, actor_id, address, attempts_left](Status status, rpc::KillActorReply &&) {
-        if (status.ok()) {
-          return;
-        }
-        // An unreachable worker usually means it is already dead or dying (the
-        // raylet reaps the process and lease at disconnect), but a transient
-        // transport error would otherwise leak a live, unreferenced actor:
-        // retry a few times before trusting the unreachable=dead reading.
-        // TODO(actor-ownership): replace with the acked raylet kill from
-        // design doc §5.3, which discriminates dead from unreachable.
-        if (attempts_left <= 1) {
-          RAY_LOG(WARNING).WithField(actor_id)
-              << "Giving up delivering the out-of-scope kill; the worker is presumed "
-                 "dead: "
-              << status;
-          return;
-        }
-        execute_after(
-            io_service_,
-            [this, actor_id, address, attempts_left]() {
-              KillOwnerManagedActorWorker(actor_id, address, attempts_left - 1);
-            },
-            std::chrono::milliseconds(kill_retry_delay_ms_));
-      });
+  auto *died_context = request.mutable_death_cause()->mutable_actor_died_error_context();
+  died_context->set_reason(rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
+  died_context->set_actor_id(actor_id.Binary());
+  died_context->set_error_message("The actor went out of scope.");
+  raylet_client_pool_.GetOrConnectByAddress(raylet_address)
+      ->KillLocalActor(
+          request,
+          [this, actor_id, address, attempts_left](Status status,
+                                                   rpc::KillLocalActorReply &&) {
+            if (status.ok()) {
+              return;
+            }
+            if (attempts_left <= 1) {
+              RAY_LOG(WARNING).WithField(actor_id)
+                  << "Giving up delivering the out-of-scope kill to the raylet: "
+                  << status;
+              return;
+            }
+            execute_after(
+                io_service_,
+                [this, actor_id, address, attempts_left]() {
+                  KillOwnerManagedActorWorker(actor_id, address, attempts_left - 1);
+                },
+                std::chrono::milliseconds(kill_retry_delay_ms_));
+          });
 }
 
 void ActorTaskSubmitter::MaybeStartOwnerManagedLivenessProbe(const ActorID &actor_id) {

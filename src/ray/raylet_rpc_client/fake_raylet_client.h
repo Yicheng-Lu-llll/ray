@@ -345,7 +345,22 @@ class FakeRayletClient : public RayletClientInterface {
   void KillLocalActor(const KillLocalActorRequest &request,
                       const ClientCallback<KillLocalActorReply> &callback) override {
     killed_actors.push_back(ActorID::FromBinary(request.intended_actor_id()));
+    kill_local_requests.push_back(request);
+    kill_local_callbacks.push_back(callback);
   }
+
+  bool ReplyKillLocalActor(ray::Status status = ray::Status::OK()) {
+    if (kill_local_callbacks.empty()) {
+      return false;
+    }
+    auto callback = kill_local_callbacks.front();
+    kill_local_callbacks.pop_front();
+    callback(status, KillLocalActorReply());
+    return true;
+  }
+
+  std::vector<KillLocalActorRequest> kill_local_requests;
+  std::deque<ClientCallback<KillLocalActorReply>> kill_local_callbacks;
 
   void GlobalGC(const ClientCallback<GlobalGCReply> &callback) override {}
 

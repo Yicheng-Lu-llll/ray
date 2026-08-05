@@ -1105,7 +1105,19 @@ class OwnerManagedActorTest : public ::testing::Test {
             [this](const ActorID &actor_id, const rpc::ActorTableData &actor_data) {
               notified_states.emplace_back(actor_id, actor_data);
             },
-            /*kill_retry_delay_ms=*/5) {}
+            /*kill_retry_delay_ms=*/5) {
+    // The raylet-mediated kill path resolves the node on every use; default
+    // to an alive node so tests only override what they exercise.
+    rpc::GcsNodeAddressAndLiveness default_node;
+    default_node.set_node_manager_address("127.0.0.1");
+    default_node.set_node_manager_port(7000);
+    EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+        .Times(testing::AnyNumber())
+        .WillRepeatedly(Return(default_node));
+    EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+        .Times(testing::AnyNumber())
+        .WillRepeatedly(Return(false));
+  }
 
   void TearDown() override { io_context.stop(); }
 
@@ -1207,9 +1219,10 @@ TEST_F(OwnerManagedActorTest, OutOfScopeKillsGrantedActorAndPublishesDead) {
   reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
   Pump();
 
-  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
-  EXPECT_EQ(worker_client_->kill_requests[0].intended_actor_id(), actor_id.Binary());
-  EXPECT_FALSE(worker_client_->kill_requests[0].force_kill());
+  ASSERT_EQ(raylet_client_->kill_local_requests.size(), 1u);
+  EXPECT_EQ(raylet_client_->kill_local_requests[0].intended_actor_id(),
+            actor_id.Binary());
+  EXPECT_FALSE(raylet_client_->kill_local_requests[0].force_kill());
   ASSERT_EQ(notified_states.size(), 2u);
   EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
   EXPECT_EQ(notified_states[1].second.death_cause().actor_died_error_context().reason(),
@@ -1230,11 +1243,11 @@ TEST_F(OwnerManagedActorTest, OutOfScopeDuringPushDefersTermination) {
   // Push in flight: drop the handle now.
   reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
   Pump();
-  EXPECT_TRUE(worker_client_->kill_requests.empty());
+  EXPECT_TRUE(raylet_client_->kill_local_requests.empty());
 
   ASSERT_TRUE(worker_client_->ReplyPushTask());
-  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
-  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(raylet_client_->kill_local_requests.size(), 1u);
+  ASSERT_TRUE(raylet_client_->ReplyKillLocalActor());
   ASSERT_EQ(notified_states.size(), 2u);
   EXPECT_EQ(notified_states[0].second.state(), rpc::ActorTableData::ALIVE);
   EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
@@ -1261,7 +1274,7 @@ TEST_F(OwnerManagedActorTest, InitErrorAuthorsDeadWithCreationError) {
   EXPECT_EQ(
       notified_states[0].second.death_cause().actor_died_error_context().error_message(),
       "User exception: boom");
-  EXPECT_TRUE(worker_client_->kill_requests.empty());
+  EXPECT_TRUE(raylet_client_->kill_local_requests.empty());
 }
 
 TEST_F(OwnerManagedActorTest, InitErrorThenOutOfScopeKeepsDeathCause) {
@@ -1293,7 +1306,7 @@ TEST_F(OwnerManagedActorTest, InitErrorThenOutOfScopeKeepsDeathCause) {
   reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
   Pump();
   EXPECT_EQ(notified_states.size(), 1u);
-  EXPECT_TRUE(worker_client_->kill_requests.empty());
+  EXPECT_TRUE(raylet_client_->kill_local_requests.empty());
 }
 
 TEST_F(OwnerManagedActorTest, OutOfScopeKillRetriesTransientFailure) {
@@ -1309,14 +1322,14 @@ TEST_F(OwnerManagedActorTest, OutOfScopeKillRetriesTransientFailure) {
   ASSERT_TRUE(worker_client_->ReplyPushTask());
   reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
   Pump();
-  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
-  ASSERT_TRUE(worker_client_->ReplyKillActor(Status::IOError("transient")));
+  ASSERT_EQ(raylet_client_->kill_local_requests.size(), 1u);
+  ASSERT_TRUE(raylet_client_->ReplyKillLocalActor(Status::IOError("transient")));
   // The retry is scheduled with a backoff timer; run the io context until it
   // fires.
   io_context.restart();
   io_context.run_for(std::chrono::milliseconds(200));
-  ASSERT_EQ(worker_client_->kill_requests.size(), 2u);
-  ASSERT_TRUE(worker_client_->ReplyKillActor(Status::OK()));
+  ASSERT_EQ(raylet_client_->kill_local_requests.size(), 2u);
+  ASSERT_TRUE(raylet_client_->ReplyKillLocalActor(Status::OK()));
 }
 
 TEST_F(OwnerManagedActorTest, WorkerDeathRestartsWithinBudget) {
@@ -1489,12 +1502,12 @@ TEST_F(OwnerManagedActorTest, TerminateDuringRestartConverges) {
       "127.0.0.1", 9999, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
   reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
   Pump();
-  EXPECT_TRUE(worker_client_->kill_requests.empty());
+  EXPECT_TRUE(raylet_client_->kill_local_requests.empty());
 
   ASSERT_TRUE(worker_client_->ReplyPushTask());
   // ALIVE(1) authored, then the deferred termination kills the new worker.
-  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
-  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(raylet_client_->kill_local_requests.size(), 1u);
+  ASSERT_TRUE(raylet_client_->ReplyKillLocalActor());
   ASSERT_EQ(notified_states.size(), 4u);
   EXPECT_EQ(notified_states[2].second.state(), rpc::ActorTableData::ALIVE);
   EXPECT_EQ(notified_states[3].second.state(), rpc::ActorTableData::DEAD);
@@ -1574,11 +1587,11 @@ TEST_F(OwnerManagedActorTest, GrantWinningCancelRaceDefersTermination) {
   // The grant wins the race against the in-flight cancel.
   ASSERT_TRUE(raylet_client_->GrantWorkerLease(
       "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
-  EXPECT_TRUE(worker_client_->kill_requests.empty());
+  EXPECT_TRUE(raylet_client_->kill_local_requests.empty());
 
   ASSERT_TRUE(worker_client_->ReplyPushTask());
-  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
-  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(raylet_client_->kill_local_requests.size(), 1u);
+  ASSERT_TRUE(raylet_client_->ReplyKillLocalActor());
   ASSERT_EQ(notified_states.size(), 2u);
   EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
 }
@@ -1663,8 +1676,8 @@ TEST_F(OwnerManagedActorTest, OutOfScopeRestartableActorResurrectsOnNewTask) {
   // Out of scope: killed, but the DEAD carries restartability.
   reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
   Pump();
-  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
-  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(raylet_client_->kill_local_requests.size(), 1u);
+  ASSERT_TRUE(raylet_client_->ReplyKillLocalActor());
   ASSERT_EQ(notified_states.size(), 2u);
   const auto &dead_state = notified_states[1].second;
   EXPECT_EQ(dead_state.state(), rpc::ActorTableData::DEAD);
@@ -1695,14 +1708,14 @@ TEST_F(OwnerManagedActorTest, OutOfScopeRestartableActorResurrectsOnNewTask) {
   EXPECT_EQ(notified_states[3].second.num_restarts(), 1u);
   // The re-armed termination watches the restored reference; it must not
   // have fired.
-  EXPECT_EQ(worker_client_->kill_requests.size(), 1u);
+  EXPECT_EQ(raylet_client_->kill_local_requests.size(), 1u);
 
   // Second out-of-scope cycle: the re-armed termination kills the
   // resurrected worker and the DEAD stays restartable (max_restarts=-1).
   reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
   Pump();
-  ASSERT_EQ(worker_client_->kill_requests.size(), 2u);
-  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(raylet_client_->kill_local_requests.size(), 2u);
+  ASSERT_TRUE(raylet_client_->ReplyKillLocalActor());
   ASSERT_EQ(notified_states.size(), 5u);
   EXPECT_EQ(notified_states[4].second.state(), rpc::ActorTableData::DEAD);
   EXPECT_EQ(notified_states[4].second.num_restarts(), 1u);
@@ -1845,10 +1858,15 @@ TEST_F(OwnerManagedActorTest, PreemptionCountSurvivesResurrection) {
   preempted_node.set_node_manager_port(7000);
   preempted_node.mutable_death_info()->set_reason(
       rpc::NodeDeathInfo::AUTOSCALER_DRAIN_PREEMPTED);
+  rpc::GcsNodeAddressAndLiveness alive_node;
+  alive_node.set_node_manager_address("127.0.0.1");
+  alive_node.set_node_manager_port(7000);
   EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
-      .WillOnce(Return(preempted_node));
+      .WillOnce(Return(preempted_node))
+      .WillRepeatedly(Return(alive_node));
   EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
-      .WillOnce(Return(true));
+      .WillOnce(Return(true))
+      .WillRepeatedly(Return(false));
   submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
   ASSERT_TRUE(raylet_client_->GrantWorkerLease(
       "127.0.0.1", 9999, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
@@ -1867,7 +1885,7 @@ TEST_F(OwnerManagedActorTest, PreemptionCountSurvivesResurrection) {
       nullptr);
   reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
   Pump();
-  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_TRUE(raylet_client_->ReplyKillLocalActor());
   ASSERT_EQ(notified_states.size(), 4u);
   const auto &dead_state = notified_states[3].second;
   EXPECT_EQ(dead_state.state(), rpc::ActorTableData::DEAD);

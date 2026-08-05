@@ -511,8 +511,9 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   /// Backoff between out-of-scope kill retries (injectable for tests).
   const int64_t kill_retry_delay_ms_;
 
-  /// Deliver an out-of-scope kill to the granted worker, retrying transient
-  /// transport failures before trusting unreachable=dead.
+  /// Deliver an out-of-scope kill through the worker's raylet (authoritative
+  /// dead-or-killed answer, design doc §5.3), retrying transient transport
+  /// failures; a dead node needs no kill (the raylet reaped the worker).
   void KillOwnerManagedActorWorker(const ActorID &actor_id,
                                    const rpc::Address &address,
                                    int attempts_left);

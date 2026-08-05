@@ -769,6 +769,14 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// possible: a zombie counts as exited), pending-exit otherwise. Drivers
   /// are recorded with is_driver so the deadline escalation never signals
   /// them (a driver process legitimately outlives its Ray connection).
+  /// Eagerly notify an owner that its leased actor worker died, with a
+  /// bounded number of retries (the owner's lazy liveness probe backstops a
+  /// lost notification).
+  void NotifyOwnerOfDeadActorWorker(const rpc::Address &owner_address,
+                                    const WorkerID &worker_id,
+                                    const ActorID &actor_id,
+                                    int attempts_left);
+
   void RecordWorkerTombstone(const WorkerID &worker_id,
                              DisconnectTrigger trigger,
                              pid_t pid,
@@ -814,6 +822,7 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   FRIEND_TEST(NodeManagerTest, WorkerInitiatedDisconnectRecordsTombstone);
   FRIEND_TEST(NodeManagerTest, DriverDisconnectRecordsDriverTombstone);
   FRIEND_TEST(NodeManagerTest, DestroyWorkerRecordsRayletInitiatedTombstone);
+  FRIEND_TEST(NodeManagerTest, DeadActorWorkerNotifiesOwner);
 
   /// Disconnect a client.
   ///

@@ -417,6 +417,19 @@ message RayletNotifyGCSRestartRequest {}
 
 message RayletNotifyGCSRestartReply {}
 
+// Raylet -> owner: a leased actor worker died (eager trigger for the owner's
+// liveness probe; the probe still confirms against the raylet's tombstone).
+message NotifyLeasedWorkerDiedRequest {
+  // The worker that died.
+  bytes worker_id = 1;
+  // The actor it was running.
+  bytes actor_id = 2;
+  // The owner this notification is intended for.
+  bytes intended_worker_id = 3;
+}
+
+message NotifyLeasedWorkerDiedReply {}
+
 message NumPendingTasksRequest {}
 
 message NumPendingTasksReply {
@@ -472,6 +485,12 @@ service CoreWorkerService {
   // Failure: Always from local raylet, should not fail.
   rpc RayletNotifyGCSRestart(RayletNotifyGCSRestartRequest)
       returns (RayletNotifyGCSRestartReply);
+
+  // Raylet notifies the owner that its leased actor worker died.
+  // Failure: retried by the raylet a bounded number of times; the owner's
+  // lazy liveness probe is the backstop.
+  rpc NotifyLeasedWorkerDied(NotifyLeasedWorkerDiedRequest)
+      returns (NotifyLeasedWorkerDiedReply);
 
   // Failure: PushActorTask, PushNormalTask, and PushNormalTask from GCS all handle
   // failures. TODO: Failure behavior needs to be documented and tested.

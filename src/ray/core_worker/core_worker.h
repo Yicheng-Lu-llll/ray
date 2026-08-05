@@ -1370,6 +1370,12 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
                                     rpc::RayletNotifyGCSRestartReply *reply,
                                     rpc::SendReplyCallback send_reply_callback);
 
+  /// A raylet notifies this owner that a leased actor worker died: an eager
+  /// trigger for the owner-managed liveness probe.
+  void HandleNotifyLeasedWorkerDied(rpc::NotifyLeasedWorkerDiedRequest request,
+                                    rpc::NotifyLeasedWorkerDiedReply *reply,
+                                    rpc::SendReplyCallback send_reply_callback);
+
   /// Implements gRPC server handler.
   void HandleGetObjectStatus(rpc::GetObjectStatusRequest request,
                              rpc::GetObjectStatusReply *reply,

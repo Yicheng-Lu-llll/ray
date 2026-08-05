@@ -124,6 +124,10 @@ class FakeCoreWorkerClient : public CoreWorkerClientInterface {
       const RayletNotifyGCSRestartRequest &request,
       const ClientCallback<RayletNotifyGCSRestartReply> &callback) override {}
 
+  void NotifyLeasedWorkerDied(
+      const NotifyLeasedWorkerDiedRequest &request,
+      const ClientCallback<NotifyLeasedWorkerDiedReply> &callback) override {}
+
   void Exit(const ExitRequest &request,
             const ClientCallback<ExitReply> &callback) override {}
 

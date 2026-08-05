@@ -193,6 +193,12 @@ class CoreWorkerClient : public std::enable_shared_from_this<CoreWorkerClient>,
                          /*method_timeout_ms*/ -1,
                          override)
 
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         NotifyLeasedWorkerDied,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
   VOID_RPC_CLIENT_METHOD(
       CoreWorkerService, Exit, grpc_client_, /*method_timeout_ms*/ -1, override)
 

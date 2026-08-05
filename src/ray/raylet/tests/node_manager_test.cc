@@ -318,13 +318,23 @@ TEST(NodeManagerStaticTest, TestHandleReportWorkerBacklog) {
   }
 }
 
+class NotifyRecordingWorkerClient : public rpc::FakeCoreWorkerClient {
+ public:
+  void NotifyLeasedWorkerDied(
+      const rpc::NotifyLeasedWorkerDiedRequest &request,
+      const rpc::ClientCallback<rpc::NotifyLeasedWorkerDiedReply> &callback) override {
+    notify_requests.push_back(request);
+  }
+
+  std::vector<rpc::NotifyLeasedWorkerDiedRequest> notify_requests;
+};
+
 class NodeManagerTest : public ::testing::Test {
  public:
   NodeManagerTest()
       : client_call_manager_(io_service_, /*record_stats=*/false, /*local_address=*/""),
-        worker_rpc_pool_([](const auto &) {
-          return std::make_shared<rpc::MockCoreWorkerClientInterface>();
-        }),
+        shared_worker_client_(std::make_shared<NotifyRecordingWorkerClient>()),
+        worker_rpc_pool_([this](const auto &) { return shared_worker_client_; }),
         raylet_client_pool_(
             [](const auto &) { return std::make_shared<rpc::FakeRayletClient>(); }),
         fake_task_by_state_counter_() {
@@ -484,6 +494,7 @@ class NodeManagerTest : public ::testing::Test {
 
   instrumented_io_context io_service_;
   rpc::ClientCallManager client_call_manager_;
+  std::shared_ptr<NotifyRecordingWorkerClient> shared_worker_client_;
   rpc::CoreWorkerClientPool worker_rpc_pool_;
   rpc::RayletClientPool raylet_client_pool_;
 
@@ -868,6 +879,41 @@ TEST_F(NodeManagerTest, DriverDisconnectRecordsDriverTombstone) {
   const auto &tombstone = node_manager_->worker_tombstones_.at(driver->WorkerId());
   EXPECT_EQ(tombstone.trigger, NodeManager::DisconnectTrigger::kWorkerInitiated);
   EXPECT_TRUE(tombstone.is_driver);
+}
+
+TEST_F(NodeManagerTest, DeadActorWorkerNotifiesOwner) {
+  // A dying non-detached actor worker triggers an eager owner notification
+  // carrying the actor id and the intended owner.
+  local_stream_socket socket(io_service_);
+  auto conn = ClientConnection::Create(
+      [](std::shared_ptr<ClientConnection>, int64_t, const std::vector<uint8_t> &) {},
+      [](std::shared_ptr<ClientConnection>, const boost::system::error_code &) {},
+      std::move(socket),
+      "test",
+      {});
+  JobID job_id = JobID::FromInt(21);
+  auto worker =
+      CreateActorWorker(TaskID::ForDriverTask(job_id), 0, 10, clock_, /*pid=*/-1);
+  rpc::Address owner_address;
+  owner_address.set_worker_id(WorkerID::FromRandom().Binary());
+  worker->SetOwnerAddress(owner_address);
+  std::static_pointer_cast<MockWorker>(worker)->SetConnection(conn);
+  EXPECT_CALL(
+      mock_worker_pool_,
+      GetRegisteredWorker(testing::A<const std::shared_ptr<ClientConnection> &>()))
+      .WillOnce(Return(worker));
+  node_manager_->DestroyWorker(worker,
+                               rpc::WorkerExitType::INTENDED_SYSTEM_EXIT,
+                               "test",
+                               /*force=*/false);
+
+  ASSERT_EQ(shared_worker_client_->notify_requests.size(), 1u);
+  EXPECT_EQ(shared_worker_client_->notify_requests[0].actor_id(),
+            worker->GetActorId().Binary());
+  EXPECT_EQ(shared_worker_client_->notify_requests[0].intended_worker_id(),
+            owner_address.worker_id());
+  EXPECT_EQ(shared_worker_client_->notify_requests[0].worker_id(),
+            worker->WorkerId().Binary());
 }
 
 TEST_F(NodeManagerTest, DestroyWorkerRecordsRayletInitiatedTombstone) {

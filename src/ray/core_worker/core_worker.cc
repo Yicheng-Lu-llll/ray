@@ -3793,6 +3793,23 @@ void CoreWorker::HandleRayletNotifyGCSRestart(
   send_reply_callback(Status::OK(), nullptr, nullptr);
 }
 
+void CoreWorker::HandleNotifyLeasedWorkerDied(
+    rpc::NotifyLeasedWorkerDiedRequest request,
+    rpc::NotifyLeasedWorkerDiedReply *reply,
+    rpc::SendReplyCallback send_reply_callback) {
+  if (HandleWrongRecipient(WorkerID::FromBinary(request.intended_worker_id()),
+                           send_reply_callback)) {
+    return;
+  }
+  const auto actor_id = ActorID::FromBinary(request.actor_id());
+  RAY_LOG(INFO).WithField(actor_id)
+      << "Raylet reported the actor's leased worker died; probing.";
+  // The probe confirms against the raylet's tombstone before any verdict:
+  // the notification is an eager trigger, not a death authority.
+  actor_task_submitter_->MaybeStartOwnerManagedLivenessProbe(actor_id);
+  send_reply_callback(Status::OK(), nullptr, nullptr);
+}
+
 // HandleGetObjectStatus is expected to be idempotent
 void CoreWorker::HandleGetObjectStatus(rpc::GetObjectStatusRequest request,
                                        rpc::GetObjectStatusReply *reply,

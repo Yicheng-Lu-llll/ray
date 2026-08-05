@@ -117,6 +117,10 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
       const RayletNotifyGCSRestartRequest &request,
       const ClientCallback<RayletNotifyGCSRestartReply> &callback) = 0;
 
+  virtual void NotifyLeasedWorkerDied(
+      const NotifyLeasedWorkerDiedRequest &request,
+      const ClientCallback<NotifyLeasedWorkerDiedReply> &callback) = 0;
+
   virtual void Exit(const ExitRequest &request,
                     const ClientCallback<ExitReply> &callback) = 0;
 

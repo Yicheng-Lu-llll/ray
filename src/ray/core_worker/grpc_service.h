@@ -60,6 +60,10 @@ class CoreWorkerServiceHandler : public DelayedServiceHandler {
                                             RayletNotifyGCSRestartReply *reply,
                                             SendReplyCallback send_reply_callback) = 0;
 
+  virtual void HandleNotifyLeasedWorkerDied(NotifyLeasedWorkerDiedRequest request,
+                                            NotifyLeasedWorkerDiedReply *reply,
+                                            SendReplyCallback send_reply_callback) = 0;
+
   virtual void HandleGetObjectStatus(GetObjectStatusRequest request,
                                      GetObjectStatusReply *reply,
                                      SendReplyCallback send_reply_callback) = 0;

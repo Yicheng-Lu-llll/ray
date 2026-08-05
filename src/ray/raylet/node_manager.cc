@@ -1528,6 +1528,16 @@ void NodeManager::DisconnectClient(const std::shared_ptr<ClientConnection> &clie
   RecordWorkerTombstone(
       worker->WorkerId(), trigger, worker->GetProcess().GetId(), is_driver);
 
+  if (is_worker && !worker->GetActorId().IsNil() && !worker->IsDetachedActor()) {
+    // Eagerly tell the owner its actor worker died (it confirms against the
+    // tombstone before acting). Bounded retries; the owner's lazy liveness
+    // probe is the backstop, and a GCS-managed actor's owner ignores it.
+    NotifyOwnerOfDeadActorWorker(worker->GetOwnerAddress(),
+                                 worker->WorkerId(),
+                                 worker->GetActorId(),
+                                 /*attempts_left=*/3);
+  }
+
   // Clean up any open ray.get or ray.wait calls that the worker made.
   lease_dependency_manager_.CancelGetRequest(worker->WorkerId());
   lease_dependency_manager_.CancelWaitRequest(worker->WorkerId());
@@ -2320,6 +2330,37 @@ ProcProbeResult ProbeProc(pid_t pid, uint64_t *start_time_ticks) {
 }
 #endif
 }  // namespace
+
+void NodeManager::NotifyOwnerOfDeadActorWorker(const rpc::Address &owner_address,
+                                               const WorkerID &worker_id,
+                                               const ActorID &actor_id,
+                                               int attempts_left) {
+  if (WorkerID::FromBinary(owner_address.worker_id()).IsNil()) {
+    return;
+  }
+  auto client = worker_rpc_pool_.GetOrConnect(owner_address);
+  rpc::NotifyLeasedWorkerDiedRequest request;
+  request.set_worker_id(worker_id.Binary());
+  request.set_actor_id(actor_id.Binary());
+  request.set_intended_worker_id(owner_address.worker_id());
+  client->NotifyLeasedWorkerDied(
+      request,
+      [this, owner_address, worker_id, actor_id, attempts_left](
+          const Status &status, rpc::NotifyLeasedWorkerDiedReply &&) {
+        if (status.ok() || attempts_left <= 1) {
+          // Delivered, or the owner is presumed dead / unreachable: the
+          // owner-side lazy probe is the backstop.
+          return;
+        }
+        execute_after(
+            io_service_,
+            [this, owner_address, worker_id, actor_id, attempts_left]() {
+              NotifyOwnerOfDeadActorWorker(
+                  owner_address, worker_id, actor_id, attempts_left - 1);
+            },
+            std::chrono::seconds(1));
+      });
+}
 
 void NodeManager::RecordWorkerTombstone(const WorkerID &worker_id,
                                         DisconnectTrigger trigger,

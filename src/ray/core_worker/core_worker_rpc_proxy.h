@@ -49,6 +49,7 @@ class CoreWorkerServiceHandlerProxy : public rpc::CoreWorkerServiceHandler {
   RAY_CORE_WORKER_RPC_PROXY(PushTask)
   RAY_CORE_WORKER_RPC_PROXY(ActorCallArgWaitComplete)
   RAY_CORE_WORKER_RPC_PROXY(RayletNotifyGCSRestart)
+  RAY_CORE_WORKER_RPC_PROXY(NotifyLeasedWorkerDied)
   RAY_CORE_WORKER_RPC_PROXY(GetObjectStatus)
   RAY_CORE_WORKER_RPC_PROXY(WaitForActorRefDeleted)
   RAY_CORE_WORKER_RPC_PROXY(PubsubLongPolling)

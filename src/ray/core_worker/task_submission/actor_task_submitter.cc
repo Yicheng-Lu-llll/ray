@@ -209,6 +209,14 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
             }
             RAY_UNUSED(task_manager_.FailPendingTask(
                 task_id, rpc::ErrorType::ACTOR_CREATION_FAILED, &result.status, nullptr));
+            // Owner-issued cancels are authored by the terminate path; every
+            // other failure (transport failure to the worker, raylet-issued
+            // scheduling cancel) must author DEAD here or the queue never
+            // converges (there is no GCS to publish it).
+            const bool owner_cancelled =
+                result.status.IsSchedulingCancelled() &&
+                result.failure_type ==
+                    rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED;
             if (terminate_requested) {
               // The entry is gone (the submitter erases it on failure);
               // author the DEAD state so the queue converges.
@@ -216,7 +224,25 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
                 absl::MutexLock lock(&mu_);
                 owner_managed_actors_.erase(actor_id);
               }
+              owner_managed_restarts_.erase(actor_id);
               owner_state_notifier_(actor_id, MakeOutOfScopeDeadState(actor_id));
+            } else if (!owner_cancelled) {
+              rpc::ActorTableData actor_data;
+              actor_data.set_actor_id(actor_id.Binary());
+              actor_data.set_state(rpc::ActorTableData::DEAD);
+              auto *died_context =
+                  actor_data.mutable_death_cause()->mutable_actor_died_error_context();
+              died_context->set_reason(rpc::ActorDiedErrorContext::WORKER_DIED);
+              died_context->set_actor_id(actor_id.Binary());
+              died_context->set_error_message(result.scheduling_failure_message.empty()
+                                                  ? result.status.ToString()
+                                                  : result.scheduling_failure_message);
+              {
+                absl::MutexLock lock(&mu_);
+                owner_managed_actors_.erase(actor_id);
+              }
+              owner_managed_restarts_.erase(actor_id);
+              owner_state_notifier_(actor_id, actor_data);
             }
           });
       // The owner kills its own actor when the handle goes out of scope (the
@@ -310,6 +336,13 @@ void ActorTaskSubmitter::TerminateOwnerManagedActor(const ActorID &actor_id) {
     return;
   }
   creation_submitter_->CancelCreation(actor_id, [this, actor_id](bool cancelled) {
+    if (!cancelled && creation_submitter_->IsCreationPushInFlight(actor_id)) {
+      // The grant won the cancel race and the push is still in flight: the
+      // entry is not terminable yet, so defer to the creation callback like
+      // every other push-window termination.
+      pending_terminations_.insert(actor_id);
+      return;
+    }
     auto actor_data = MakeOutOfScopeDeadState(actor_id);
     if (!cancelled) {
       // A worker was granted: kill it and drop the entry.
@@ -324,6 +357,7 @@ void ActorTaskSubmitter::TerminateOwnerManagedActor(const ActorID &actor_id) {
       absl::MutexLock lock(&mu_);
       owner_managed_actors_.erase(actor_id);
     }
+    owner_managed_restarts_.erase(actor_id);
     owner_state_notifier_(actor_id, actor_data);
   });
 }
@@ -512,9 +546,13 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
           }
           return;
         }
-        if (result.status.IsSchedulingCancelled()) {
+        if (result.status.IsSchedulingCancelled() &&
+            result.failure_type ==
+                rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED) {
           // The out-of-scope cancel converged first and already authored the
-          // DEAD; a second one here would overwrite the death cause.
+          // DEAD; a second one here would overwrite the death cause. A
+          // raylet-issued cancel (unschedulable, runtime env failure) falls
+          // through to the final DEAD below instead.
           owner_managed_restarts_.erase(actor_id);
           return;
         }
@@ -529,7 +567,9 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
         died_context->set_actor_id(actor_id.Binary());
         died_context->set_error_message(
             result.status.ok() ? result.push_task_reply.task_execution_error()
-                               : result.status.ToString());
+            : !result.scheduling_failure_message.empty()
+                ? result.scheduling_failure_message
+                : result.status.ToString());
         {
           absl::MutexLock lock(&mu_);
           owner_managed_actors_.erase(actor_id);

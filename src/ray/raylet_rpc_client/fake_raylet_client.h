@@ -113,6 +113,22 @@ class FakeRayletClient : public RayletClientInterface {
     }
   }
 
+  bool ReplyCanceledWorkerLease(
+      rpc::RequestWorkerLeaseReply::SchedulingFailureType failure_type,
+      const std::string &failure_message) {
+    if (callbacks.size() == 0) {
+      return false;
+    }
+    RequestWorkerLeaseReply reply;
+    reply.set_canceled(true);
+    reply.set_failure_type(failure_type);
+    reply.set_scheduling_failure_message(failure_message);
+    auto callback = callbacks.front();
+    callback(ray::Status::OK(), std::move(reply));
+    callbacks.pop_front();
+    return true;
+  }
+
   bool ReplyCancelWorkerLease(bool success = true) {
     CancelWorkerLeaseReply reply;
     reply.set_success(success);

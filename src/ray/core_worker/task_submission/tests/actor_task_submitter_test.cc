@@ -1501,6 +1501,87 @@ TEST_F(OwnerManagedActorTest, TerminateDuringRestartConverges) {
             rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
 }
 
+TEST_F(OwnerManagedActorTest, RayletCancelDuringRestartAuthorsFinalDead) {
+  // A raylet-issued scheduling cancel of the restart lease (unschedulable,
+  // runtime env failure) is not an owner cancel: the actor must converge to
+  // a final DEAD instead of hanging in RESTARTING.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(12), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  auto spec = BuildCreationTaskSpec(actor_id);
+  spec.GetMutableMessage().mutable_actor_creation_task_spec()->set_max_actor_restarts(1);
+  submitter_.SubmitActorCreationTask(spec);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  rpc::GcsNodeAddressAndLiveness node_info;
+  node_info.set_node_manager_address("127.0.0.1");
+  node_info.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillRepeatedly(Return(node_info));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(false));
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::DEAD,
+                                                     rpc::GetWorkerLivenessReply::EXIT));
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::RESTARTING);
+
+  ASSERT_TRUE(raylet_client_->ReplyCanceledWorkerLease(
+      rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_UNSCHEDULABLE,
+      "no feasible node"));
+  ASSERT_EQ(notified_states.size(), 3u);
+  EXPECT_EQ(notified_states[2].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(
+      notified_states[2].second.death_cause().actor_died_error_context().error_message(),
+      "no feasible node");
+}
+
+TEST_F(OwnerManagedActorTest, InitialPushTransportFailureAuthorsDead) {
+  // A transport failure pushing the creation task fails the creation AND
+  // authors DEAD: without it, queued method calls would wait for ALIVE
+  // forever (there is no GCS to notice the death).
+  ActorID actor_id = ActorID::Of(JobID::FromInt(13), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, FailPendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask(Status::IOError("worker gone")));
+
+  ASSERT_EQ(notified_states.size(), 1u);
+  EXPECT_EQ(notified_states[0].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(notified_states[0].second.death_cause().actor_died_error_context().reason(),
+            rpc::ActorDiedErrorContext::WORKER_DIED);
+}
+
+TEST_F(OwnerManagedActorTest, GrantWinningCancelRaceDefersTermination) {
+  // The handle drops while the lease request is in flight; the grant wins
+  // the cancel race (push already sent). The termination must defer to push
+  // completion instead of touching the non-terminable entry.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(14), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  // Drop the handle before any grant.
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  // The grant wins the race against the in-flight cancel.
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  EXPECT_TRUE(worker_client_->kill_requests.empty());
+
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
+  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

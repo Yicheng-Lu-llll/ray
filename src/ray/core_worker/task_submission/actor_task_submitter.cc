@@ -150,7 +150,7 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
       }
       creation_submitter_->SubmitCreation(
           task_spec,
-          [this, actor_id, task_id](
+          [this, actor_id, task_id, creation_spec = task_spec](
               const ActorCreationSubmitter::CreationResult &result) {
             const bool terminate_requested = pending_terminations_.erase(actor_id) > 0;
             if (result.status.ok()) {
@@ -225,13 +225,10 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
             }
             if (terminate_requested) {
               // The entry is gone (the submitter erases it on failure);
-              // author the DEAD state so the queue converges.
-              {
-                absl::MutexLock lock(&mu_);
-                owner_managed_actors_.erase(actor_id);
-              }
-              owner_managed_restarts_.erase(actor_id);
-              owner_state_notifier_(actor_id, MakeOutOfScopeDeadState(actor_id));
+              // finish the termination with the submitted spec so a
+              // restartable actor keeps its resurrection eligibility.
+              FinishOwnerManagedTermination(
+                  actor_id, creation_spec, /*address=*/std::nullopt);
             } else if (!already_terminated) {
               rpc::ActorTableData actor_data;
               actor_data.set_actor_id(actor_id.Binary());
@@ -313,6 +310,47 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
   });
 }
 
+void ActorTaskSubmitter::FinishOwnerManagedTermination(
+    const ActorID &actor_id,
+    const std::optional<TaskSpecification> &spec,
+    const std::optional<rpc::Address> &address) {
+  auto actor_data = MakeOutOfScopeDeadState(actor_id);
+  const uint64_t restarts_used = owner_managed_restarts_[actor_id];
+  if (spec.has_value()) {
+    // Restartability travels in the DEAD state (the same
+    // gcs::IsActorRestartable computation as a GCS-authored death).
+    actor_data.set_max_restarts(spec->MaxActorRestarts());
+    actor_data.set_num_restarts(restarts_used);
+  }
+  if (address.has_value()) {
+    *actor_data.mutable_address() = *address;
+  }
+  const bool keep_resurrectable = spec.has_value() && gcs::IsActorRestartable(actor_data);
+  {
+    absl::MutexLock lock(&mu_);
+    owner_managed_actors_.erase(actor_id);
+    if (keep_resurrectable) {
+      resurrectable_actors_[actor_id] = ResurrectableActor{*spec, restarts_used};
+    }
+  }
+  if (keep_resurrectable) {
+    // The retained spec lives only as long as lineage can still reference
+    // the actor (the GCS analog: WaitForActorRefDeleted destroys the
+    // registered actor for good). If the references are already fully
+    // deleted the entry can never be hit.
+    if (!reference_counter_->AddObjectRefDeletedCallback(
+            ObjectID::ForActorHandle(actor_id), [this, actor_id](const ObjectID &) {
+              absl::MutexLock lock(&mu_);
+              resurrectable_actors_.erase(actor_id);
+            })) {
+      absl::MutexLock lock(&mu_);
+      resurrectable_actors_.erase(actor_id);
+    }
+  }
+  owner_managed_restarts_.erase(actor_id);
+  owner_state_notifier_(actor_id, actor_data);
+}
+
 void ActorTaskSubmitter::ArmOwnerManagedTermination(const ActorID &actor_id) {
   auto terminate = [this, actor_id](const ObjectID &) {
     io_service_.post([this, actor_id]() { TerminateOwnerManagedActor(actor_id); },
@@ -358,32 +396,16 @@ void ActorTaskSubmitter::TerminateOwnerManagedActor(const ActorID &actor_id) {
           pending_terminations_.insert(actor_id);
           return;
         }
-        auto actor_data = MakeOutOfScopeDeadState(actor_id);
-        const uint64_t restarts_used = owner_managed_restarts_[actor_id];
-        if (spec.has_value()) {
-          // Restartability travels in the DEAD state (the same
-          // gcs::IsActorRestartable computation as a GCS-authored death).
-          actor_data.set_max_restarts(spec->MaxActorRestarts());
-          actor_data.set_num_restarts(restarts_used);
-        }
+        std::optional<rpc::Address> address;
         if (!cancelled) {
           // A worker was granted: kill it and drop the entry.
-          auto address = creation_submitter_->GetActorAddress(actor_id);
+          address = creation_submitter_->GetActorAddress(actor_id);
           if (address.has_value()) {
-            *actor_data.mutable_address() = *address;
             KillOwnerManagedActorWorker(actor_id, *address, /*attempts_left=*/5);
           }
           creation_submitter_->OnActorTerminated(actor_id);
         }
-        {
-          absl::MutexLock lock(&mu_);
-          owner_managed_actors_.erase(actor_id);
-          if (spec.has_value() && gcs::IsActorRestartable(actor_data)) {
-            resurrectable_actors_[actor_id] = ResurrectableActor{*spec, restarts_used};
-          }
-        }
-        owner_managed_restarts_.erase(actor_id);
-        owner_state_notifier_(actor_id, actor_data);
+        FinishOwnerManagedTermination(actor_id, spec, address);
       });
 }
 

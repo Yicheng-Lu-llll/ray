@@ -541,6 +541,13 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
 
   /// (Re-)register the out-of-scope termination for an owner-managed actor.
   void ArmOwnerManagedTermination(const ActorID &actor_id);
+
+  /// Finish an out-of-scope termination: author DEAD (carrying
+  /// restartability from the spec), retain resurrection eligibility, and
+  /// clean the tracking state. io thread only.
+  void FinishOwnerManagedTermination(const ActorID &actor_id,
+                                     const std::optional<TaskSpecification> &spec,
+                                     const std::optional<rpc::Address> &address);
 };
 
 }  // namespace core

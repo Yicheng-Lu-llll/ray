@@ -1082,7 +1082,7 @@ class OwnerManagedActorTest : public ::testing::Test {
             [](const ObjectID &, const absl::flat_hash_set<NodeID> &) {},
             fake_owned_object_count_gauge_,
             fake_owned_object_size_gauge_,
-            /*lineage_pinning_enabled=*/false)),
+            /*lineage_pinning_enabled=*/true)),
         submitter_(
             *client_pool_,
             *raylet_client_pool_,
@@ -1645,6 +1645,21 @@ TEST_F(OwnerManagedActorTest, OutOfScopeRestartableActorResurrectsOnNewTask) {
       "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
   ASSERT_TRUE(worker_client_->ReplyPushTask());
 
+  // A downstream task's lineage references the actor handle (this is what
+  // makes resurrection reachable in production: without lineage the retained
+  // spec is dropped as soon as the reference is fully deleted).
+  reference_counter_->UpdateSubmittedTaskReferences(
+      /*return_ids=*/{}, {ObjectID::ForActorHandle(actor_id)});
+  // The task finished: its live reference goes away but the lineage
+  // reference stays pinned.
+  reference_counter_->UpdateFinishedTaskReferences(
+      /*return_ids=*/{},
+      {ObjectID::ForActorHandle(actor_id)},
+      /*release_lineage=*/false,
+      rpc::Address(),
+      ::google::protobuf::RepeatedPtrField<rpc::ObjectReferenceCount>(),
+      nullptr);
+
   // Out of scope: killed, but the DEAD carries restartability.
   reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
   Pump();
@@ -1661,7 +1676,10 @@ TEST_F(OwnerManagedActorTest, OutOfScopeRestartableActorResurrectsOnNewTask) {
                              dead_state.death_cause(),
                              /*is_restartable=*/true);
 
-  // A lineage reconstruction task arrives: the owner resurrects the actor.
+  // A lineage reconstruction task arrives; production restores a reference
+  // to the handle before resubmitting (task_manager resubmission), mirrored
+  // here so the re-armed termination has something to watch.
+  reference_counter_->AddLocalReference(ObjectID::ForActorHandle(actor_id), "test");
   auto task = CreateActorTaskHelper(actor_id, WorkerID::FromRandom(), 0);
   submitter_.SubmitTask(task);
   Pump();
@@ -1671,9 +1689,24 @@ TEST_F(OwnerManagedActorTest, OutOfScopeRestartableActorResurrectsOnNewTask) {
   ASSERT_TRUE(raylet_client_->GrantWorkerLease(
       "127.0.0.1", 9999, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
   ASSERT_TRUE(worker_client_->ReplyPushTask());
+  Pump();
   ASSERT_EQ(notified_states.size(), 4u);
   EXPECT_EQ(notified_states[3].second.state(), rpc::ActorTableData::ALIVE);
   EXPECT_EQ(notified_states[3].second.num_restarts(), 1u);
+  // The re-armed termination watches the restored reference; it must not
+  // have fired.
+  EXPECT_EQ(worker_client_->kill_requests.size(), 1u);
+
+  // Second out-of-scope cycle: the re-armed termination kills the
+  // resurrected worker and the DEAD stays restartable (max_restarts=-1).
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  ASSERT_EQ(worker_client_->kill_requests.size(), 2u);
+  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(notified_states.size(), 5u);
+  EXPECT_EQ(notified_states[4].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(notified_states[4].second.num_restarts(), 1u);
+  EXPECT_TRUE(gcs::IsActorRestartable(notified_states[4].second));
 }
 
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,

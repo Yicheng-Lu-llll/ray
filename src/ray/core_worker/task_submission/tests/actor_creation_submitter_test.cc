@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "ray/common/task/task_util.h"
@@ -67,10 +68,22 @@ rpc::Address RayletAddress(const NodeID &node_id) {
   return address;
 }
 
+class LeaseRecordingRayletClient : public rpc::FakeRayletClient {
+ public:
+  void RequestWorkerLease(
+      rpc::RequestWorkerLeaseRequest &&request,
+      const rpc::ClientCallback<rpc::RequestWorkerLeaseReply> &callback) override {
+    requested_lease_ids.push_back(LeaseID::FromBinary(request.lease_spec().lease_id()));
+    rpc::FakeRayletClient::RequestWorkerLease(std::move(request), callback);
+  }
+
+  std::vector<LeaseID> requested_lease_ids;
+};
+
 class DeadNodeSubmitterTest : public ::testing::Test {
  protected:
   DeadNodeSubmitterTest()
-      : raylet_client_(std::make_shared<rpc::FakeRayletClient>()),
+      : raylet_client_(std::make_shared<LeaseRecordingRayletClient>()),
         worker_client_(std::make_shared<PushRecordingWorkerClient>()),
         raylet_client_pool_(std::make_shared<rpc::RayletClientPool>(
             [this](const rpc::Address &) { return raylet_client_; })),
@@ -92,7 +105,7 @@ class DeadNodeSubmitterTest : public ::testing::Test {
   }
 
   instrumented_io_context io_service_;
-  std::shared_ptr<rpc::FakeRayletClient> raylet_client_;
+  std::shared_ptr<LeaseRecordingRayletClient> raylet_client_;
   std::shared_ptr<PushRecordingWorkerClient> worker_client_;
   std::shared_ptr<rpc::RayletClientPool> raylet_client_pool_;
   std::shared_ptr<rpc::CoreWorkerClientPool> core_worker_client_pool_;
@@ -110,7 +123,7 @@ TEST_F(DeadNodeSubmitterTest, TransportFailureOnDeadNodeRestartsCreation) {
                             [&](const ActorCreationSubmitter::CreationResult &result) {
                               completed = result.status.ok();
                             });
-  const LeaseID first_lease = *submitter_.GetGrantedLease(actor_id);
+  ASSERT_EQ(raylet_client_->requested_lease_ids.size(), 1u);
   // Transport failure; the node is reported dead.
   ASSERT_TRUE(raylet_client_->GrantWorkerLease("127.0.0.1",
                                                7000,
@@ -120,7 +133,9 @@ TEST_F(DeadNodeSubmitterTest, TransportFailureOnDeadNodeRestartsCreation) {
                                                Status::IOError("connection refused")));
   PumpBackoff();
   // A fresh lease request was issued under a new lease id.
-  ASSERT_NE(*submitter_.GetGrantedLease(actor_id), first_lease);
+  ASSERT_EQ(raylet_client_->requested_lease_ids.size(), 2u);
+  ASSERT_NE(raylet_client_->requested_lease_ids[0],
+            raylet_client_->requested_lease_ids[1]);
   ASSERT_TRUE(raylet_client_->GrantWorkerLease(
       "127.0.0.1", 7001, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
   ASSERT_TRUE(worker_client_->ReplyPushTask());

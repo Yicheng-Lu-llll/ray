@@ -2062,6 +2062,54 @@ TEST_F(OwnerManagedActorTest, ReconciliationSweepCatchesLostDeath) {
   EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::RESTARTING);
 }
 
+TEST_F(OwnerManagedActorTest, ReconciliationTimerFiresAndRearms) {
+  // The production wiring: a ctor-armed timer fires the sweep and re-arms
+  // itself. A submitter with a 5ms period probes a granted actor without any
+  // manual sweep call, and again after the verdict.
+  ActorTaskSubmitter sweeping_submitter(
+      *client_pool_,
+      *raylet_client_pool_,
+      mock_gcs_client_,
+      *store_,
+      *task_manager_,
+      actor_creator_,
+      [](const ObjectID &) { return std::nullopt; },
+      [](const ActorID &, const std::string &, int64_t) {},
+      io_context,
+      reference_counter_,
+      clock_,
+      std::make_unique<ActorCreationSubmitter>(
+          rpc::Address(),
+          raylet_client_pool_,
+          client_pool_,
+          io_context,
+          std::make_unique<LocalLeasePolicy>(LocalRayletAddress()),
+          /*retry_backoff_ms=*/0),
+      [this](const ActorID &actor_id, const rpc::ActorTableData &actor_data) {
+        notified_states.emplace_back(actor_id, actor_data);
+      },
+      /*kill_retry_delay_ms=*/5,
+      /*reconciliation_period_ms=*/5);
+  ActorID actor_id = ActorID::Of(JobID::FromInt(27), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  sweeping_submitter.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  // No manual sweep: the timer must issue the probe.
+  io_context.restart();
+  io_context.run_for(std::chrono::milliseconds(200));
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::ALIVE));
+  // Re-armed: a later tick probes again.
+  io_context.restart();
+  io_context.run_for(std::chrono::milliseconds(200));
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::ALIVE));
+  EXPECT_EQ(notified_states.size(), 1u);
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

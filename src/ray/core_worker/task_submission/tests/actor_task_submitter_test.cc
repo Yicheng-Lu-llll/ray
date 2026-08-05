@@ -1933,15 +1933,16 @@ TEST_F(OwnerManagedActorTest, NodeDeathProbesActorsOnNode) {
   EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
       .WillRepeatedly(Return(true));
 
+  // An unrelated node death while the actor is alive probes nothing: this
+  // is the assertion that actually discriminates the node filter.
+  submitter_.HandleNodeDead(NodeID::FromRandom());
+  Pump();
+  ASSERT_EQ(notified_states.size(), 1u);
+
   submitter_.HandleNodeDead(actor_node);
   Pump();
   ASSERT_EQ(notified_states.size(), 2u);
   EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::RESTARTING);
-
-  // An unrelated node death probes nothing further.
-  submitter_.HandleNodeDead(NodeID::FromRandom());
-  Pump();
-  EXPECT_EQ(notified_states.size(), 2u);
 }
 
 TEST_F(OwnerManagedActorTest, ProbeOnUnknownActorIsNoOp) {

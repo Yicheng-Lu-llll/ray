@@ -209,14 +209,20 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
             }
             RAY_UNUSED(task_manager_.FailPendingTask(
                 task_id, rpc::ErrorType::ACTOR_CREATION_FAILED, &result.status, nullptr));
-            // Owner-issued cancels are authored by the terminate path; every
-            // other failure (transport failure to the worker, raylet-issued
-            // scheduling cancel) must author DEAD here or the queue never
-            // converges (there is no GCS to publish it).
-            const bool owner_cancelled =
-                result.status.IsSchedulingCancelled() &&
-                result.failure_type ==
-                    rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED;
+            // If the terminate path already authored this actor's DEAD (its
+            // cancel callback runs before this one and erases the set), do
+            // not author a second one; every other failure (transport
+            // failure to the worker, any raylet-issued scheduling cancel)
+            // must author DEAD here or the queue never converges (there is
+            // no GCS to publish it). The failure_type is deliberately not
+            // used as the discriminator: raylets also send
+            // SCHEDULING_CANCELLED_INTENDED for cancels the owner never
+            // issued (e.g. released placement group bundles).
+            bool already_terminated;
+            {
+              absl::MutexLock lock(&mu_);
+              already_terminated = !owner_managed_actors_.contains(actor_id);
+            }
             if (terminate_requested) {
               // The entry is gone (the submitter erases it on failure);
               // author the DEAD state so the queue converges.
@@ -226,7 +232,7 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
               }
               owner_managed_restarts_.erase(actor_id);
               owner_state_notifier_(actor_id, MakeOutOfScopeDeadState(actor_id));
-            } else if (!owner_cancelled) {
+            } else if (!already_terminated) {
               rpc::ActorTableData actor_data;
               actor_data.set_actor_id(actor_id.Binary());
               actor_data.set_state(rpc::ActorTableData::DEAD);
@@ -546,15 +552,16 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
           }
           return;
         }
-        if (result.status.IsSchedulingCancelled() &&
-            result.failure_type ==
-                rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED) {
-          // The out-of-scope cancel converged first and already authored the
-          // DEAD; a second one here would overwrite the death cause. A
-          // raylet-issued cancel (unschedulable, runtime env failure) falls
-          // through to the final DEAD below instead.
-          owner_managed_restarts_.erase(actor_id);
-          return;
+        {
+          absl::MutexLock lock(&mu_);
+          if (!owner_managed_actors_.contains(actor_id)) {
+            // The terminate path already authored this actor's DEAD (its
+            // cancel callback runs first and erases the set); a second one
+            // here would overwrite the death cause. Any other failure falls
+            // through to the final DEAD below.
+            owner_managed_restarts_.erase(actor_id);
+            return;
+          }
         }
         // The restart itself failed: the actor is dead for good.
         rpc::ActorTableData actor_data;

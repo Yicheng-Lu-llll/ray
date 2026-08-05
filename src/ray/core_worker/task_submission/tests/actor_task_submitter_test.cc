@@ -1582,6 +1582,48 @@ TEST_F(OwnerManagedActorTest, GrantWinningCancelRaceDefersTermination) {
   EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
 }
 
+TEST_F(OwnerManagedActorTest, RayletIntendedCancelWithoutOwnerCancelAuthorsDead) {
+  // Raylets also send SCHEDULING_CANCELLED_INTENDED for cancels the owner
+  // never issued (released placement group bundles after a GCS restart):
+  // the owner must still author DEAD or method calls hang forever.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(15), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, MarkTaskNoRetry(_)).Times(1);
+  EXPECT_CALL(*task_manager_, FailPendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->ReplyCanceledWorkerLease(
+      rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED, "bundle released"));
+
+  ASSERT_EQ(notified_states.size(), 1u);
+  EXPECT_EQ(notified_states[0].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(
+      notified_states[0].second.death_cause().actor_died_error_context().error_message(),
+      "bundle released");
+}
+
+TEST_F(OwnerManagedActorTest, OwnerCancelConvergedByRayletCancelAuthorsOneDead) {
+  // An in-flight owner cancel converged by a raylet-issued cancel must yield
+  // exactly one DEAD (from the terminate path), not a second one that
+  // overwrites the death cause.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(16), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, MarkTaskNoRetry(_)).Times(1);
+  EXPECT_CALL(*task_manager_, FailPendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  ASSERT_TRUE(raylet_client_->ReplyCanceledWorkerLease(
+      rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_RUNTIME_ENV_SETUP_FAILED,
+      "env failed"));
+
+  ASSERT_EQ(notified_states.size(), 1u);
+  EXPECT_EQ(notified_states[0].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(notified_states[0].second.death_cause().actor_died_error_context().reason(),
+            rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

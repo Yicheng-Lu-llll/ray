@@ -395,16 +395,24 @@ void ActorTaskSubmitter::ProbeOwnerManagedActorLiveness(const ActorID &actor_id)
   raylet_client_pool_.GetOrConnectByAddress(raylet_address)
       ->GetWorkerLiveness(
           worker_id,
-          [this, actor_id](const Status &status, rpc::GetWorkerLivenessReply &&reply) {
+          [this, actor_id, node_id](const Status &status,
+                                    rpc::GetWorkerLivenessReply &&reply) {
             if (status.ok() && reply.status() == rpc::GetWorkerLivenessReply::ALIVE) {
               // Transient push failure; the worker is fine. Future failures
               // restart the probe.
               liveness_probes_in_flight_.erase(actor_id);
               return;
             }
-            if (!status.ok() || reply.status() == rpc::GetWorkerLivenessReply::PENDING) {
-              // Raylet unreachable (node not yet marked dead) or the exit is
-              // not yet observed: hold and re-probe.
+            const bool unknown_from_wrong_raylet =
+                status.ok() && reply.status() == rpc::GetWorkerLivenessReply::UNKNOWN &&
+                NodeID::FromBinary(reply.node_id()) != node_id;
+            if (!status.ok() || reply.status() == rpc::GetWorkerLivenessReply::PENDING ||
+                unknown_from_wrong_raylet) {
+              // Inconclusive: raylet unreachable (node not yet marked dead),
+              // exit not yet observed, or UNKNOWN answered by a different
+              // raylet incarnation than the one that granted this worker
+              // (UNKNOWN alone is never a verdict; the node-death branch
+              // guarantees convergence). Hold and re-probe.
               execute_after(
                   io_service_,
                   [this, actor_id]() { ProbeOwnerManagedActorLiveness(actor_id); },
@@ -428,6 +436,12 @@ void ActorTaskSubmitter::ProbeOwnerManagedActorLiveness(const ActorID &actor_id)
 void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
     const ActorID &actor_id, const rpc::ActorDeathCause &death_cause) {
   liveness_probes_in_flight_.erase(actor_id);
+  if (creation_submitter_->IsCreationPushInFlight(actor_id)) {
+    // A death verdict while the creation push is in flight is handled by the
+    // push completion itself (the push fails against a dead worker); acting
+    // here would touch a non-terminable entry.
+    return;
+  }
   {
     absl::MutexLock lock(&mu_);
     if (!owner_managed_actors_.contains(actor_id)) {
@@ -459,6 +473,7 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
       absl::MutexLock lock(&mu_);
       owner_managed_actors_.erase(actor_id);
     }
+    owner_managed_restarts_.erase(actor_id);
     creation_submitter_->OnActorTerminated(actor_id);
     owner_state_notifier_(actor_id, actor_data);
     return;
@@ -474,11 +489,17 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
     owner_state_notifier_(actor_id, actor_data);
   }
   TaskSpecification restart_spec = std::move(*spec);
+  // Each restart is a new execution attempt (mirrors the GCS bumping
+  // attempt_number at its restart decision point).
+  restart_spec.GetMutableMessage().set_attempt_number(restart_generation);
   creation_submitter_->OnActorTerminated(actor_id);
   creation_submitter_->SubmitCreation(
       restart_spec,
       [this, actor_id, restart_generation](
           const ActorCreationSubmitter::CreationResult &result) {
+        // Same terminate handshake as the initial creation: an out-of-scope
+        // that raced this restart deferred to us.
+        const bool terminate_requested = pending_terminations_.erase(actor_id) > 0;
         if (result.status.ok() && !result.push_task_reply.is_application_error()) {
           rpc::ActorTableData actor_data;
           actor_data.set_actor_id(actor_id.Binary());
@@ -486,6 +507,15 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
           *actor_data.mutable_address() = result.actor_address;
           actor_data.set_num_restarts(restart_generation);
           owner_state_notifier_(actor_id, actor_data);
+          if (terminate_requested) {
+            TerminateOwnerManagedActor(actor_id);
+          }
+          return;
+        }
+        if (result.status.IsSchedulingCancelled()) {
+          // The out-of-scope cancel converged first and already authored the
+          // DEAD; a second one here would overwrite the death cause.
+          owner_managed_restarts_.erase(actor_id);
           return;
         }
         // The restart itself failed: the actor is dead for good.
@@ -504,6 +534,7 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
           absl::MutexLock lock(&mu_);
           owner_managed_actors_.erase(actor_id);
         }
+        owner_managed_restarts_.erase(actor_id);
         if (result.status.ok()) {
           creation_submitter_->OnActorTerminated(actor_id);
         }

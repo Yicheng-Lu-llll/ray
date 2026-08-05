@@ -304,7 +304,8 @@ class FakeRayletClient : public RayletClientInterface {
   bool ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::Status status,
                               rpc::GetWorkerLivenessReply::Grade grade =
                                   rpc::GetWorkerLivenessReply::GRADE_UNSPECIFIED,
-                              ray::Status rpc_status = ray::Status::OK()) {
+                              ray::Status rpc_status = ray::Status::OK(),
+                              const NodeID &node_id = NodeID::Nil()) {
     if (liveness_callbacks.empty()) {
       return false;
     }
@@ -313,6 +314,7 @@ class FakeRayletClient : public RayletClientInterface {
     GetWorkerLivenessReply reply;
     reply.set_status(status);
     reply.set_grade(grade);
+    reply.set_node_id(node_id.Binary());
     callback(rpc_status, std::move(reply));
     return true;
   }

@@ -1413,6 +1413,94 @@ TEST_F(OwnerManagedActorTest, AliveProbeVerdictStopsProbing) {
   EXPECT_EQ(notified_states.size(), 1u);
 }
 
+TEST_F(OwnerManagedActorTest, UnknownFromWrongRayletIsInconclusive) {
+  // UNKNOWN answered by a different raylet incarnation than the granting one
+  // is never a death verdict: the probe holds and re-probes; UNKNOWN from
+  // the granting raylet (registered-then-evicted) is.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(10), TaskID::Nil(), 1);
+  const NodeID actor_node = NodeID::FromRandom();
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), actor_node, NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  rpc::GcsNodeAddressAndLiveness node_info;
+  node_info.set_node_manager_address("127.0.0.1");
+  node_info.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillRepeatedly(Return(node_info));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(false));
+
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  // Wrong raylet incarnation: inconclusive, no death authored.
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(
+      rpc::GetWorkerLivenessReply::UNKNOWN,
+      rpc::GetWorkerLivenessReply::GRADE_UNSPECIFIED,
+      Status::OK(),
+      NodeID::FromRandom()));
+  EXPECT_EQ(notified_states.size(), 1u);
+  // The re-probe fires on the backoff timer; the granting raylet answers
+  // UNKNOWN, which is a verdict.
+  io_context.restart();
+  io_context.run_for(std::chrono::milliseconds(200));
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(
+      rpc::GetWorkerLivenessReply::UNKNOWN,
+      rpc::GetWorkerLivenessReply::GRADE_UNSPECIFIED,
+      Status::OK(),
+      actor_node));
+  ASSERT_GE(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
+}
+
+TEST_F(OwnerManagedActorTest, TerminateDuringRestartConverges) {
+  // Out-of-scope racing a restart's in-flight push defers to the restart
+  // callback and then kills the fresh worker (no leak, no death-cause
+  // overwrite).
+  ActorID actor_id = ActorID::Of(JobID::FromInt(11), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  auto spec = BuildCreationTaskSpec(actor_id);
+  spec.GetMutableMessage().mutable_actor_creation_task_spec()->set_max_actor_restarts(1);
+  submitter_.SubmitActorCreationTask(spec);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  rpc::GcsNodeAddressAndLiveness node_info;
+  node_info.set_node_manager_address("127.0.0.1");
+  node_info.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillRepeatedly(Return(node_info));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(false));
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::DEAD,
+                                                     rpc::GetWorkerLivenessReply::EXIT));
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::RESTARTING);
+  // Restart lease granted; push is in flight when the handle goes away.
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9999, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  EXPECT_TRUE(worker_client_->kill_requests.empty());
+
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  // ALIVE(1) authored, then the deferred termination kills the new worker.
+  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
+  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(notified_states.size(), 4u);
+  EXPECT_EQ(notified_states[2].second.state(), rpc::ActorTableData::ALIVE);
+  EXPECT_EQ(notified_states[3].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(notified_states[3].second.death_cause().actor_died_error_context().reason(),
+            rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

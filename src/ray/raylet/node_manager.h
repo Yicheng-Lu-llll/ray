@@ -763,21 +763,6 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
     kWorkerInitiated,
   };
 
-  /// Record a tombstone for a disconnecting worker/driver; pending records
-  /// converge via the periodic exit scan. Exit-grade when the disconnect was
-  /// triggered by connection EOF (verified against the process when
-  /// possible: a zombie counts as exited), pending-exit otherwise. Drivers
-  /// are recorded with is_driver so the deadline escalation never signals
-  /// them (a driver process legitimately outlives its Ray connection).
-  /// Re-verify the owners of held non-detached actor leases (three-state:
-  /// a dead owner node or a tombstone-confirmed dead owner worker kills the
-  /// leased worker; ALIVE/PENDING and inconclusive answers leave it for the
-  /// next round). The periodic backstop for a lost owner-death broadcast.
-  void ReconcileActorLeaseOwners();
-
-  FRIEND_TEST(NodeManagerTest, ReconciliationKillsLeasedWorkerOfDeadOwner);
-  FRIEND_TEST(NodeManagerTest, ReconciliationSparesLiveAndInconclusiveOwners);
-
   /// Eagerly notify an owner that its leased actor worker died, with a
   /// bounded number of retries (the owner's lazy liveness probe backstops a
   /// lost notification).
@@ -786,6 +771,22 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
                                     const ActorID &actor_id,
                                     int attempts_left);
 
+  /// Re-verify the owners of held non-detached actor leases (three-state:
+  /// a dead owner node or a tombstone-confirmed dead owner worker kills the
+  /// leased worker; ALIVE/PENDING and inconclusive answers leave it for the
+  /// next round). The periodic backstop for a lost owner-death broadcast.
+  void ReconcileActorLeaseOwners();
+
+  FRIEND_TEST(NodeManagerTest, ReconciliationKillsLeasedWorkerOfDeadOwner);
+  FRIEND_TEST(NodeManagerTest, ReconciliationSparesLiveAndInconclusiveOwners);
+  FRIEND_TEST(NodeManagerTest, ReconciliationUnknownFromOwnersRayletKills);
+
+  /// Record a tombstone for a disconnecting worker/driver; pending records
+  /// converge via the periodic exit scan. Exit-grade when the disconnect was
+  /// triggered by connection EOF (verified against the process when
+  /// possible: a zombie counts as exited), pending-exit otherwise. Drivers
+  /// are recorded with is_driver so the deadline escalation never signals
+  /// them (a driver process legitimately outlives its Ray connection).
   void RecordWorkerTombstone(const WorkerID &worker_id,
                              DisconnectTrigger trigger,
                              pid_t pid,

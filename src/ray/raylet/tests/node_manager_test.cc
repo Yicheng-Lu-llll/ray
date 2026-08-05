@@ -969,6 +969,51 @@ TEST_F(NodeManagerTest, ReconciliationSparesLiveAndInconclusiveOwners) {
   leased_workers_.clear();
 }
 
+TEST_F(NodeManagerTest, ReconciliationUnknownFromOwnersRayletKills) {
+  // UNKNOWN answered by the raylet the owner was registered at is a death
+  // verdict (registered-then-evicted); a vanished lease at callback time is
+  // left alone.
+  JobID job_id = JobID::FromInt(32);
+  auto worker =
+      CreateActorWorker(TaskID::ForDriverTask(job_id), 0, 10, clock_, /*pid=*/-1);
+  rpc::Address owner_address;
+  const NodeID owner_node = NodeID::FromRandom();
+  owner_address.set_node_id(owner_node.Binary());
+  owner_address.set_worker_id(WorkerID::FromRandom().Binary());
+  worker->SetOwnerAddress(owner_address);
+  leased_workers_[worker->GetGrantedLeaseId()] = worker;
+
+  rpc::GcsNodeAddressAndLiveness owner_node_info;
+  owner_node_info.set_node_manager_address("127.0.0.1");
+  owner_node_info.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(owner_node))
+      .WillRepeatedly(Return(false));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor,
+              GetNodeAddressAndLiveness(owner_node, _))
+      .WillRepeatedly(Return(owner_node_info));
+
+  // Lease vanishes between the probe and the verdict: no crash, no kill.
+  node_manager_->ReconcileActorLeaseOwners();
+  leased_workers_.clear();
+  ASSERT_TRUE(shared_raylet_client_->ReplyGetWorkerLiveness(
+      rpc::GetWorkerLivenessReply::UNKNOWN,
+      rpc::GetWorkerLivenessReply::GRADE_UNSPECIFIED,
+      Status::OK(),
+      owner_node));
+  EXPECT_FALSE(std::static_pointer_cast<MockWorker>(worker)->IsKilled());
+
+  // UNKNOWN from the owner's own raylet incarnation: verdict.
+  leased_workers_[worker->GetGrantedLeaseId()] = worker;
+  node_manager_->ReconcileActorLeaseOwners();
+  ASSERT_TRUE(shared_raylet_client_->ReplyGetWorkerLiveness(
+      rpc::GetWorkerLivenessReply::UNKNOWN,
+      rpc::GetWorkerLivenessReply::GRADE_UNSPECIFIED,
+      Status::OK(),
+      owner_node));
+  EXPECT_TRUE(std::static_pointer_cast<MockWorker>(worker)->IsKilled());
+  leased_workers_.clear();
+}
+
 TEST_F(NodeManagerTest, DeadActorWorkerNotifiesOwner) {
   // A dying non-detached actor worker triggers an eager owner notification
   // carrying the actor id and the intended owner.

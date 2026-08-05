@@ -1138,8 +1138,13 @@ void NodeManager::HandleNotifyGCSRestart(rpc::NotifyGCSRestartRequest request,
   // race condition here.
   gcs_client_.AsyncResubscribe();
   // The restart may have lost owner-death broadcasts: re-verify the owners
-  // of held actor leases.
-  ReconcileActorLeaseOwners();
+  // of held actor leases. Gated on the same config as the periodic sweep —
+  // without the periodic re-check, inconclusive first-round answers (the
+  // node table is stale-ALIVE right after a GCS restart) would never
+  // converge.
+  if (RayConfig::instance().raylet_lease_owner_reconciliation_period_ms() > 0) {
+    ReconcileActorLeaseOwners();
+  }
   auto workers = worker_pool_.GetAllRegisteredWorkers(/* filter_dead_workers */ true);
   for (const auto &worker : workers) {
     worker->AsyncNotifyGCSRestart();
@@ -2343,7 +2348,11 @@ ProcProbeResult ProbeProc(pid_t pid, uint64_t *start_time_ticks) {
 
 void NodeManager::ReconcileActorLeaseOwners() {
   for (const auto &[lease_id, worker] : leased_workers_) {
-    if (worker->GetActorId().IsNil() || worker->IsDetachedActor() || worker->IsDead()) {
+    // The lease spec identifies actor leases from grant time (GetActorId is
+    // only assigned after the constructor finishes, which would blind the
+    // sweep to actors stuck in a long __init__).
+    if (!worker->GetGrantedLease().GetLeaseSpecification().IsActorCreationTask() ||
+        worker->IsDetachedActor() || worker->IsDead()) {
       continue;
     }
     const auto owner_address = worker->GetOwnerAddress();

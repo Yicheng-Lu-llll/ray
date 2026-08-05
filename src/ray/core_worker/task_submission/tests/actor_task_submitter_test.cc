@@ -1103,7 +1103,8 @@ class OwnerManagedActorTest : public ::testing::Test {
                 /*retry_backoff_ms=*/0),
             [this](const ActorID &actor_id, const rpc::ActorTableData &actor_data) {
               notified_states.emplace_back(actor_id, actor_data);
-            }) {}
+            },
+            /*kill_retry_delay_ms=*/5) {}
 
   void TearDown() override { io_context.stop(); }
 
@@ -1121,6 +1122,9 @@ class OwnerManagedActorTest : public ::testing::Test {
     spec.set_task_id(TaskID::ForActorCreationTask(actor_id).Binary());
     spec.set_job_id(actor_id.JobId().Binary());
     spec.set_num_returns(1);
+    // The task display name is never empty in production (the routing
+    // predicate must read the actor name, not this).
+    spec.set_name("Actor.__init__");
     spec.mutable_actor_creation_task_spec()->set_actor_id(actor_id.Binary());
     return TaskSpecification(std::move(spec));
   }
@@ -1259,6 +1263,38 @@ TEST_F(OwnerManagedActorTest, InitErrorAuthorsDeadWithCreationError) {
   EXPECT_TRUE(worker_client_->kill_requests.empty());
 }
 
+TEST_F(OwnerManagedActorTest, InitErrorThenOutOfScopeKeepsDeathCause) {
+  // After a failed __init__ authored DEAD(WORKER_DIED), the handle going out
+  // of scope must not overwrite the death cause with OUT_OF_SCOPE.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(6), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  submitter_.AddActorQueueIfNotExists(actor_id,
+                                      /*max_pending_calls=*/-1,
+                                      /*allow_out_of_order_execution=*/false,
+                                      /*fail_if_actor_unreachable=*/false,
+                                      /*owned=*/true);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask(Status::OK(),
+                                            /*is_application_error=*/true,
+                                            "User exception: boom"));
+  ASSERT_EQ(notified_states.size(), 1u);
+  // Mirror ActorManager's dispatch of the authored DEAD.
+  submitter_.DisconnectActor(actor_id,
+                             /*num_restarts=*/0,
+                             /*dead=*/true,
+                             notified_states[0].second.death_cause(),
+                             /*is_restartable=*/false);
+
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  EXPECT_EQ(notified_states.size(), 1u);
+  EXPECT_TRUE(worker_client_->kill_requests.empty());
+}
+
 TEST_F(OwnerManagedActorTest, OutOfScopeKillRetriesTransientFailure) {
   // A transient transport failure of the kill must not leak a live actor:
   // the kill is retried.
@@ -1277,7 +1313,7 @@ TEST_F(OwnerManagedActorTest, OutOfScopeKillRetriesTransientFailure) {
   // The retry is scheduled with a backoff timer; run the io context until it
   // fires.
   io_context.restart();
-  io_context.run_for(std::chrono::milliseconds(1500));
+  io_context.run_for(std::chrono::milliseconds(200));
   ASSERT_EQ(worker_client_->kill_requests.size(), 2u);
   ASSERT_TRUE(worker_client_->ReplyKillActor(Status::OK()));
 }

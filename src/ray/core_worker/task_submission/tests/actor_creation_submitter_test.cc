@@ -67,6 +67,66 @@ rpc::Address RayletAddress(const NodeID &node_id) {
   return address;
 }
 
+class DeadNodeSubmitterTest : public ::testing::Test {
+ protected:
+  DeadNodeSubmitterTest()
+      : raylet_client_(std::make_shared<rpc::FakeRayletClient>()),
+        worker_client_(std::make_shared<PushRecordingWorkerClient>()),
+        raylet_client_pool_(std::make_shared<rpc::RayletClientPool>(
+            [this](const rpc::Address &) { return raylet_client_; })),
+        core_worker_client_pool_(std::make_shared<rpc::CoreWorkerClientPool>(
+            [this](const rpc::Address &) { return worker_client_; })),
+        submitter_(rpc::Address(),
+                   raylet_client_pool_,
+                   core_worker_client_pool_,
+                   io_service_,
+                   /*lease_policy=*/nullptr,
+                   /*retry_backoff_ms=*/0,
+                   /*is_node_dead=*/[](const NodeID &) { return true; }) {}
+
+  void PumpBackoff() {
+    for (int i = 0; i < 10; i++) {
+      io_service_.restart();
+      io_service_.poll();
+    }
+  }
+
+  instrumented_io_context io_service_;
+  std::shared_ptr<rpc::FakeRayletClient> raylet_client_;
+  std::shared_ptr<PushRecordingWorkerClient> worker_client_;
+  std::shared_ptr<rpc::RayletClientPool> raylet_client_pool_;
+  std::shared_ptr<rpc::CoreWorkerClientPool> core_worker_client_pool_;
+  ActorCreationSubmitter submitter_;
+};
+
+TEST_F(DeadNodeSubmitterTest, TransportFailureOnDeadNodeRestartsCreation) {
+  // A transport failure against a raylet the GCS marked dead must not retry
+  // the same lease id forever: the creation restarts under a fresh lease.
+  const ActorID actor_id =
+      ActorID::Of(JobID::FromInt(9), TaskID::ForDriverTask(JobID::FromInt(9)), 1);
+  bool completed = false;
+  submitter_.SubmitCreation(BuildCreationTaskSpec(actor_id),
+                            RayletAddress(NodeID::FromRandom()),
+                            [&](const ActorCreationSubmitter::CreationResult &result) {
+                              completed = result.status.ok();
+                            });
+  const LeaseID first_lease = *submitter_.GetGrantedLease(actor_id);
+  // Transport failure; the node is reported dead.
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease("127.0.0.1",
+                                               7000,
+                                               WorkerID::FromRandom(),
+                                               NodeID::FromRandom(),
+                                               NodeID::Nil(),
+                                               Status::IOError("connection refused")));
+  PumpBackoff();
+  // A fresh lease request was issued under a new lease id.
+  ASSERT_NE(*submitter_.GetGrantedLease(actor_id), first_lease);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 7001, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  EXPECT_TRUE(completed);
+}
+
 class ActorCreationSubmitterTest : public ::testing::Test {
  protected:
   ActorCreationSubmitterTest()

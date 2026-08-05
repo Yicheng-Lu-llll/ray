@@ -70,6 +70,11 @@ rpc::ActorHandle CreateInnerActorHandle(
   return inner;
 }
 
+// TODO(actor-ownership): a handle serialized by a pre-owner-managed process
+// has no owner_managed field and defaults to false, sending the borrower to
+// a GCS that does not know the actor (permanent hang). The design doc
+// requires deserialization to validate the field explicitly for
+// cross-version safety before this ships.
 rpc::ActorHandle CreateInnerActorHandleFromString(const std::string &serialized) {
   rpc::ActorHandle inner;
   inner.ParseFromString(serialized);

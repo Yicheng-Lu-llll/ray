@@ -136,8 +136,12 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
     // permanent lease; the GCS is not involved. Named actors still go
     // through the GCS for name uniqueness; detached actors' lifetimes are
     // not bound to the owner, so the GCS keeps managing them.
+    // NOTE: the actor name lives in actor_creation_task_spec (GetName() is
+    // the task display name, never empty in production). This predicate must
+    // stay in lockstep with CoreWorker::CreateActor's register-skip and the
+    // handle's owner_managed derivation in CreateInnerActorHandle.
     if (creation_submitter_ != nullptr && !task_spec.IsDetachedActor() &&
-        task_spec.GetName().empty()) {
+        task_spec.GetMessage().actor_creation_task_spec().name().empty()) {
       RAY_LOG(DEBUG).WithField(actor_id).WithField(task_id)
           << "Creating actor from the owner";
       {
@@ -289,9 +293,12 @@ void ActorTaskSubmitter::TerminateOwnerManagedActor(const ActorID &actor_id) {
   {
     absl::MutexLock lock(&mu_);
     if (auto iter = client_queues_.find(actor_id); iter != client_queues_.end()) {
-      if (iter->second.state_ != rpc::ActorTableData::DEAD) {
-        iter->second.pending_out_of_scope_death_ = true;
+      if (iter->second.state_ == rpc::ActorTableData::DEAD) {
+        // Already terminated (e.g. a failed __init__ authored DEAD): a second
+        // DEAD here would overwrite the real death cause with OUT_OF_SCOPE.
+        return;
       }
+      iter->second.pending_out_of_scope_death_ = true;
     }
   }
   if (creation_submitter_->IsCreationPushInFlight(actor_id)) {
@@ -352,7 +359,7 @@ void ActorTaskSubmitter::KillOwnerManagedActorWorker(const ActorID &actor_id,
             [this, actor_id, address, attempts_left]() {
               KillOwnerManagedActorWorker(actor_id, address, attempts_left - 1);
             },
-            std::chrono::milliseconds(1000));
+            std::chrono::milliseconds(kill_retry_delay_ms_));
       });
 }
 

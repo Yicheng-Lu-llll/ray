@@ -100,14 +100,33 @@ void ActorCreationSubmitter::RequestLease(const ActorID &actor_id,
         if (!status.ok()) {
           // A raylet that is confirmed dead can never answer, and its death
           // killed the lease and any grant with it: safe to restart the
-          // creation from the first hop under a fresh lease id.
+          // creation under a fresh lease id. Restart at the first hop, or a
+          // fresh policy pick when the first hop itself is dead; behind a
+          // backoff so a stale policy pick cannot spin.
           if (is_node_dead_ != nullptr &&
               is_node_dead_(NodeID::FromBinary(e.current_raylet_address.node_id()))) {
-            const rpc::Address first_hop = e.first_raylet_address;
-            RequestLease(actor_id,
-                         first_hop,
-                         /*is_spillback=*/false,
-                         /*reuse_lease_id=*/false);
+            rpc::Address restart_address = e.first_raylet_address;
+            if (is_node_dead_(NodeID::FromBinary(restart_address.node_id())) &&
+                lease_policy_ != nullptr) {
+              restart_address =
+                  lease_policy_
+                      ->GetBestNodeForLease(LeaseSpecification(e.spec.GetMessage()))
+                      .first;
+            }
+            RetryAfterBackoff([this, actor_id, restart_address, issued_lease_id]() {
+              auto retry_it = creations_.find(actor_id);
+              if (retry_it == creations_.end() ||
+                  retry_it->second.lease_id != issued_lease_id) {
+                return;
+              }
+              // The dead first hop must not be restarted at again on the
+              // next failure.
+              retry_it->second.first_raylet_address = restart_address;
+              RequestLease(actor_id,
+                           restart_address,
+                           /*is_spillback=*/false,
+                           /*reuse_lease_id=*/false);
+            });
             return;
           }
           // Otherwise the raylet may have granted even though the reply was

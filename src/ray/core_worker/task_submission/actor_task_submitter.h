@@ -89,7 +89,8 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
                      ClockInterface &clock,
                      std::unique_ptr<ActorCreationSubmitter> creation_submitter = nullptr,
                      std::function<void(const ActorID &, const rpc::ActorTableData &)>
-                         owner_state_notifier = nullptr)
+                         owner_state_notifier = nullptr,
+                     int64_t kill_retry_delay_ms = 1000)
       : core_worker_client_pool_(core_worker_client_pool),
         raylet_client_pool_(raylet_client_pool),
         gcs_client_(std::move(gcs_client)),
@@ -103,7 +104,8 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
         reference_counter_(std::move(reference_counter)),
         clock_(clock),
         creation_submitter_(std::move(creation_submitter)),
-        owner_state_notifier_(std::move(owner_state_notifier)) {
+        owner_state_notifier_(std::move(owner_state_notifier)),
+        kill_retry_delay_ms_(kill_retry_delay_ms) {
     RAY_CHECK(creation_submitter_ == nullptr || owner_state_notifier_ != nullptr)
         << "owner_state_notifier is required with a creation submitter.";
   }
@@ -496,6 +498,8 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   /// Terminations deferred until the in-flight creation push completes.
   /// io_service thread only.
   absl::flat_hash_set<ActorID> pending_terminations_;
+  /// Backoff between out-of-scope kill retries (injectable for tests).
+  const int64_t kill_retry_delay_ms_;
 
   /// Deliver an out-of-scope kill to the granted worker, retrying transient
   /// transport failures before trusting unreachable=dead.

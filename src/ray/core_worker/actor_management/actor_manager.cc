@@ -307,11 +307,16 @@ void ActorManager::HandleActorStateNotification(const ActorID &actor_id,
 
   if (owner_state_publish_hook_ != nullptr &&
       reference_counter_.OwnedByUs(ObjectID::ForActorHandle(actor_id))) {
-    {
-      absl::MutexLock lock(&mutex_);
-      owned_actor_states_[actor_id] = actor_data;
+    // Only owner-managed actors publish on the owner channel; named and
+    // detached actors' states stay with the GCS.
+    auto handle = GetActorHandleIfExists(actor_id);
+    if (handle != nullptr && handle->OwnerManaged()) {
+      {
+        absl::MutexLock lock(&mutex_);
+        owned_actor_states_[actor_id] = actor_data;
+      }
+      owner_state_publish_hook_(actor_id, actor_data);
     }
-    owner_state_publish_hook_(actor_id, actor_data);
   }
 }
 
@@ -393,7 +398,10 @@ void ActorManager::SubscribeActorState(const ActorID &actor_id) {
         [this](const std::string &actor_id_binary, const Status &status) {
           // The owner is unreachable: without a live owner the actor cannot
           // survive (the raylet reaps owned leases on owner death), so the
-          // borrower declares it dead.
+          // borrower declares it dead. This fires only on confirmed owner
+          // death (retryable transport errors never fail the poll).
+          // TODO(actor-ownership): route this through the four-state
+          // liveness confirmation (design doc §5.2-3) once wired.
           const auto failed_actor_id = ActorID::FromBinary(actor_id_binary);
           RAY_LOG(INFO).WithField(failed_actor_id)
               << "The owner of the actor is unreachable, marking the actor dead: "

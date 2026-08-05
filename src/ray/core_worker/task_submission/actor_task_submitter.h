@@ -142,9 +142,13 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
 
   /// Start (at most one per actor) the liveness probe loop against the
   /// actor's raylet: the owner is the only death detector for owner-managed
-  /// actors. Called on push transport failures (and later by raylet death
-  /// notifications). io_service thread only.
+  /// actors. Called on push transport failures, raylet death notifications,
+  /// and node deaths. io_service thread only.
   void MaybeStartOwnerManagedLivenessProbe(const ActorID &actor_id);
+
+  /// A node died: probe every owner-managed actor granted on it (the node's
+  /// raylet can no longer notify anyone). Safe from any thread.
+  void HandleNodeDead(const NodeID &node_id);
 
   /// Terminate an owner-managed actor: cancel an ungranted creation or kill
   /// the granted worker, then dispatch the owner-authored DEAD state. While

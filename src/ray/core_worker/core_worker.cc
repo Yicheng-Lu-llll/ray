@@ -836,7 +836,8 @@ void CoreWorker::SubscribeToNodeChanges() {
     // raylet_client_pool, and core_worker_client_pool here to avoid destruction order
     // fiasco between gcs_client, reference_counter_, raylet_client_pool_, and
     // core_worker_client_pool_.
-    auto on_node_change = [reference_counter = reference_counter_,
+    auto on_node_change = [this,
+                           reference_counter = reference_counter_,
                            rate_limiter = lease_request_rate_limiter_,
                            raylet_client_pool = raylet_client_pool_,
                            core_worker_client_pool = core_worker_client_pool_](
@@ -849,6 +850,11 @@ void CoreWorker::SubscribeToNodeChanges() {
         reference_counter->ResetObjectsOnRemovedNode(node_id);
         raylet_client_pool->Disconnect(node_id);
         core_worker_client_pool->Disconnect(node_id);
+        // The dead node's raylet can no longer notify owners: probe every
+        // owner-managed actor granted there. (`this` is safe like the
+        // subscription-done callback below: the GCS client disconnects
+        // before the submitter is destroyed.)
+        actor_task_submitter_->HandleNodeDead(node_id);
       }
       auto cluster_size_based_rate_limiter =
           dynamic_cast<ClusterSizeBasedLeaseRequestRateLimiter *>(rate_limiter.get());

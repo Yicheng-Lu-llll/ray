@@ -1909,6 +1909,50 @@ TEST_F(OwnerManagedActorTest, PreemptionCountSurvivesResurrection) {
   EXPECT_EQ(notified_states[6].second.num_restarts_due_to_node_preemption(), 1u);
 }
 
+TEST_F(OwnerManagedActorTest, NodeDeathProbesActorsOnNode) {
+  // A node death must reach idle actors (no push in flight, no raylet to
+  // notify): every owner-managed actor granted on the node gets probed.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(22), TaskID::Nil(), 1);
+  const NodeID actor_node = NodeID::FromRandom();
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  auto spec = BuildCreationTaskSpec(actor_id);
+  spec.GetMutableMessage().mutable_actor_creation_task_spec()->set_max_actor_restarts(1);
+  submitter_.SubmitActorCreationTask(spec);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), actor_node, NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(notified_states.size(), 1u);
+
+  rpc::GcsNodeAddressAndLiveness dead_node;
+  dead_node.set_node_manager_address("127.0.0.1");
+  dead_node.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillRepeatedly(Return(dead_node));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(true));
+
+  submitter_.HandleNodeDead(actor_node);
+  Pump();
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::RESTARTING);
+
+  // An unrelated node death probes nothing further.
+  submitter_.HandleNodeDead(NodeID::FromRandom());
+  Pump();
+  EXPECT_EQ(notified_states.size(), 2u);
+}
+
+TEST_F(OwnerManagedActorTest, ProbeOnUnknownActorIsNoOp) {
+  // A death notification for an actor this owner does not manage (e.g. a
+  // GCS-managed actor) must be a harmless no-op.
+  submitter_.MaybeStartOwnerManagedLivenessProbe(
+      ActorID::Of(JobID::FromInt(23), TaskID::Nil(), 1));
+  Pump();
+  EXPECT_TRUE(notified_states.empty());
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

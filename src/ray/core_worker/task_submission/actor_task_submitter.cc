@@ -457,6 +457,19 @@ void ActorTaskSubmitter::MaybeStartOwnerManagedLivenessProbe(const ActorID &acto
   ProbeOwnerManagedActorLiveness(actor_id);
 }
 
+void ActorTaskSubmitter::HandleNodeDead(const NodeID &node_id) {
+  if (creation_submitter_ == nullptr) {
+    return;
+  }
+  io_service_.post(
+      [this, node_id]() {
+        for (const auto &actor_id : creation_submitter_->GetActorsOnNode(node_id)) {
+          MaybeStartOwnerManagedLivenessProbe(actor_id);
+        }
+      },
+      "ActorTaskSubmitter.HandleNodeDead");
+}
+
 void ActorTaskSubmitter::ProbeOwnerManagedActorLiveness(const ActorID &actor_id) {
   auto address = creation_submitter_->GetActorAddress(actor_id);
   if (!address.has_value()) {

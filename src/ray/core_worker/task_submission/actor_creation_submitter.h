@@ -114,6 +114,9 @@ class ActorCreationSubmitter {
   /// The granted actor worker's address, once a worker was granted.
   std::optional<rpc::Address> GetActorAddress(const ActorID &actor_id) const;
 
+  /// Actors whose granted worker lives on the given node.
+  std::vector<ActorID> GetActorsOnNode(const NodeID &node_id) const;
+
   /// The retained creation spec (present while the entry lives, including
   /// permanently held kAlive entries); the restart path resubmits it.
   std::optional<TaskSpecification> GetCreationSpec(const ActorID &actor_id) const;

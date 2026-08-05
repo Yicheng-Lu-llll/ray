@@ -381,6 +381,19 @@ std::optional<TaskSpecification> ActorCreationSubmitter::GetCreationSpec(
   return it->second.spec;
 }
 
+std::vector<ActorID> ActorCreationSubmitter::GetActorsOnNode(
+    const NodeID &node_id) const {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
+  std::vector<ActorID> actors;
+  for (const auto &[actor_id, entry] : creations_) {
+    if (entry.state != CreationState::kPendingLease &&
+        NodeID::FromBinary(entry.actor_address.node_id()) == node_id) {
+      actors.push_back(actor_id);
+    }
+  }
+  return actors;
+}
+
 bool ActorCreationSubmitter::IsCreationPushInFlight(const ActorID &actor_id) const {
   RAY_CHECK(thread_checker_.IsOnSameThread());
   auto it = creations_.find(actor_id);

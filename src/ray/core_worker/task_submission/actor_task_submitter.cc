@@ -255,15 +255,7 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
       // GCS never learns about owner-managed actors). Registered after
       // SubmitCreation so an already-out-of-scope handle cancels the entry
       // just created.
-      auto terminate = [this, actor_id](const ObjectID &) {
-        io_service_.post([this, actor_id]() { TerminateOwnerManagedActor(actor_id); },
-                         "ActorTaskSubmitter.TerminateOwnerManagedActor");
-      };
-      const auto actor_creation_return_id = ObjectID::ForActorHandle(actor_id);
-      if (!reference_counter_->AddObjectOutOfScopeOrFreedCallback(
-              actor_creation_return_id, terminate)) {
-        terminate(actor_creation_return_id);
-      }
+      ArmOwnerManagedTermination(actor_id);
       return;
     }
     // The actor creation task will be sent to
@@ -321,6 +313,18 @@ void ActorTaskSubmitter::SubmitActorCreationTask(TaskSpecification task_spec) {
   });
 }
 
+void ActorTaskSubmitter::ArmOwnerManagedTermination(const ActorID &actor_id) {
+  auto terminate = [this, actor_id](const ObjectID &) {
+    io_service_.post([this, actor_id]() { TerminateOwnerManagedActor(actor_id); },
+                     "ActorTaskSubmitter.TerminateOwnerManagedActor");
+  };
+  const auto actor_creation_return_id = ObjectID::ForActorHandle(actor_id);
+  if (!reference_counter_->AddObjectOutOfScopeOrFreedCallback(actor_creation_return_id,
+                                                              terminate)) {
+    terminate(actor_creation_return_id);
+  }
+}
+
 void ActorTaskSubmitter::TerminateOwnerManagedActor(const ActorID &actor_id) {
   {
     absl::MutexLock lock(&mu_);
@@ -341,31 +345,46 @@ void ActorTaskSubmitter::TerminateOwnerManagedActor(const ActorID &actor_id) {
     pending_terminations_.insert(actor_id);
     return;
   }
-  creation_submitter_->CancelCreation(actor_id, [this, actor_id](bool cancelled) {
-    if (!cancelled && creation_submitter_->IsCreationPushInFlight(actor_id)) {
-      // The grant won the cancel race and the push is still in flight: the
-      // entry is not terminable yet, so defer to the creation callback like
-      // every other push-window termination.
-      pending_terminations_.insert(actor_id);
-      return;
-    }
-    auto actor_data = MakeOutOfScopeDeadState(actor_id);
-    if (!cancelled) {
-      // A worker was granted: kill it and drop the entry.
-      auto address = creation_submitter_->GetActorAddress(actor_id);
-      if (address.has_value()) {
-        *actor_data.mutable_address() = *address;
-        KillOwnerManagedActorWorker(actor_id, *address, /*attempts_left=*/5);
-      }
-      creation_submitter_->OnActorTerminated(actor_id);
-    }
-    {
-      absl::MutexLock lock(&mu_);
-      owner_managed_actors_.erase(actor_id);
-    }
-    owner_managed_restarts_.erase(actor_id);
-    owner_state_notifier_(actor_id, actor_data);
-  });
+  // Capture the spec before the cancel path erases the submitter entry: an
+  // out-of-scope death with restart budget left stays resurrectable for
+  // lineage reconstruction.
+  auto spec = creation_submitter_->GetCreationSpec(actor_id);
+  creation_submitter_->CancelCreation(
+      actor_id, [this, actor_id, spec = std::move(spec)](bool cancelled) {
+        if (!cancelled && creation_submitter_->IsCreationPushInFlight(actor_id)) {
+          // The grant won the cancel race and the push is still in flight: the
+          // entry is not terminable yet, so defer to the creation callback like
+          // every other push-window termination.
+          pending_terminations_.insert(actor_id);
+          return;
+        }
+        auto actor_data = MakeOutOfScopeDeadState(actor_id);
+        const uint64_t restarts_used = owner_managed_restarts_[actor_id];
+        if (spec.has_value()) {
+          // Restartability travels in the DEAD state (the same
+          // gcs::IsActorRestartable computation as a GCS-authored death).
+          actor_data.set_max_restarts(spec->MaxActorRestarts());
+          actor_data.set_num_restarts(restarts_used);
+        }
+        if (!cancelled) {
+          // A worker was granted: kill it and drop the entry.
+          auto address = creation_submitter_->GetActorAddress(actor_id);
+          if (address.has_value()) {
+            *actor_data.mutable_address() = *address;
+            KillOwnerManagedActorWorker(actor_id, *address, /*attempts_left=*/5);
+          }
+          creation_submitter_->OnActorTerminated(actor_id);
+        }
+        {
+          absl::MutexLock lock(&mu_);
+          owner_managed_actors_.erase(actor_id);
+          if (spec.has_value() && gcs::IsActorRestartable(actor_data)) {
+            resurrectable_actors_[actor_id] = ResurrectableActor{*spec, restarts_used};
+          }
+        }
+        owner_managed_restarts_.erase(actor_id);
+        owner_state_notifier_(actor_id, actor_data);
+      });
 }
 
 void ActorTaskSubmitter::KillOwnerManagedActorWorker(const ActorID &actor_id,
@@ -589,6 +608,85 @@ void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
       });
 }
 
+void ActorTaskSubmitter::ResurrectOwnerManagedActor(const ActorID &actor_id) {
+  std::optional<ResurrectableActor> resurrectable;
+  {
+    absl::MutexLock lock(&mu_);
+    auto it = resurrectable_actors_.find(actor_id);
+    if (it == resurrectable_actors_.end()) {
+      return;
+    }
+    resurrectable = std::move(it->second);
+    resurrectable_actors_.erase(it);
+    owner_managed_actors_.insert(actor_id);
+  }
+  const uint64_t restart_generation = resurrectable->restarts + 1;
+  owner_managed_restarts_[actor_id] = restart_generation;
+  {
+    // Author RESTARTING for borrowers; the local queue is already RESTARTING
+    // (the dispatch is idempotent for it).
+    rpc::ActorTableData actor_data;
+    actor_data.set_actor_id(actor_id.Binary());
+    actor_data.set_state(rpc::ActorTableData::RESTARTING);
+    actor_data.set_num_restarts(restart_generation);
+    owner_state_notifier_(actor_id, actor_data);
+  }
+  TaskSpecification restart_spec = std::move(resurrectable->spec);
+  restart_spec.GetMutableMessage().set_attempt_number(restart_generation);
+  creation_submitter_->SubmitCreation(
+      restart_spec,
+      [this, actor_id, restart_generation](
+          const ActorCreationSubmitter::CreationResult &result) {
+        const bool terminate_requested = pending_terminations_.erase(actor_id) > 0;
+        if (result.status.ok() && !result.push_task_reply.is_application_error()) {
+          rpc::ActorTableData actor_data;
+          actor_data.set_actor_id(actor_id.Binary());
+          actor_data.set_state(rpc::ActorTableData::ALIVE);
+          *actor_data.mutable_address() = result.actor_address;
+          actor_data.set_num_restarts(restart_generation);
+          owner_state_notifier_(actor_id, actor_data);
+          // The reconstruction tasks restored references to the actor
+          // handle; arm the next out-of-scope termination like the GCS path
+          // re-arms its out-of-scope report.
+          ArmOwnerManagedTermination(actor_id);
+          if (terminate_requested) {
+            TerminateOwnerManagedActor(actor_id);
+          }
+          return;
+        }
+        {
+          absl::MutexLock lock(&mu_);
+          if (!owner_managed_actors_.contains(actor_id)) {
+            // The terminate path already authored the DEAD.
+            owner_managed_restarts_.erase(actor_id);
+            return;
+          }
+        }
+        rpc::ActorTableData actor_data;
+        actor_data.set_actor_id(actor_id.Binary());
+        actor_data.set_state(rpc::ActorTableData::DEAD);
+        actor_data.set_num_restarts(restart_generation);
+        auto *died_context =
+            actor_data.mutable_death_cause()->mutable_actor_died_error_context();
+        died_context->set_reason(rpc::ActorDiedErrorContext::WORKER_DIED);
+        died_context->set_actor_id(actor_id.Binary());
+        died_context->set_error_message(
+            result.status.ok() ? result.push_task_reply.task_execution_error()
+            : !result.scheduling_failure_message.empty()
+                ? result.scheduling_failure_message
+                : result.status.ToString());
+        {
+          absl::MutexLock lock(&mu_);
+          owner_managed_actors_.erase(actor_id);
+        }
+        owner_managed_restarts_.erase(actor_id);
+        if (result.status.ok()) {
+          creation_submitter_->OnActorTerminated(actor_id);
+        }
+        owner_state_notifier_(actor_id, actor_data);
+      });
+}
+
 void ActorTaskSubmitter::SubmitTask(TaskSpecification task_spec) {
   auto task_id = task_spec.TaskId();
   auto actor_id = task_spec.ActorId();
@@ -782,6 +880,13 @@ void ActorTaskSubmitter::RestartActorForLineageReconstruction(const ActorID &act
   RAY_CHECK(queue->second.is_restartable_) << "This actor is no longer restartable";
   queue->second.state_ = rpc::ActorTableData::RESTARTING;
   queue->second.num_restarts_due_to_lineage_reconstructions_ += 1;
+  if (resurrectable_actors_.contains(actor_id)) {
+    // Owner-managed: the owner resurrects the actor itself (the GCS does not
+    // know it). mu_ is held here; the resubmission runs on the io thread.
+    io_service_.post([this, actor_id]() { ResurrectOwnerManagedActor(actor_id); },
+                     "ActorTaskSubmitter.ResurrectOwnerManagedActor");
+    return;
+  }
   actor_creator_.AsyncRestartActorForLineageReconstruction(
       actor_id,
       queue->second.num_restarts_due_to_lineage_reconstructions_,

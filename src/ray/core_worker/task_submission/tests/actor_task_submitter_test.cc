@@ -23,6 +23,7 @@
 #include "gtest/gtest.h"
 #include "mock/ray/core_worker/task_manager_interface.h"
 #include "mock/ray/gcs_client/gcs_client.h"
+#include "ray/common/protobuf_utils.h"
 #include "ray/common/test_utils.h"
 #include "ray/core_worker/actor_management/fake_actor_creator.h"
 #include "ray/core_worker/lease_policy.h"
@@ -1622,6 +1623,57 @@ TEST_F(OwnerManagedActorTest, OwnerCancelConvergedByRayletCancelAuthorsOneDead) 
   EXPECT_EQ(notified_states[0].second.state(), rpc::ActorTableData::DEAD);
   EXPECT_EQ(notified_states[0].second.death_cause().actor_died_error_context().reason(),
             rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
+}
+
+TEST_F(OwnerManagedActorTest, OutOfScopeRestartableActorResurrectsOnNewTask) {
+  // An out-of-scope death with restart budget left keeps the actor
+  // resurrectable: a later lineage-reconstruction task restarts it from the
+  // owner (no GCS involved), doc §5.3.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(17), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  submitter_.AddActorQueueIfNotExists(actor_id,
+                                      /*max_pending_calls=*/-1,
+                                      /*allow_out_of_order_execution=*/false,
+                                      /*fail_if_actor_unreachable=*/false,
+                                      /*owned=*/true);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(testing::AnyNumber());
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  auto spec = BuildCreationTaskSpec(actor_id);
+  spec.GetMutableMessage().mutable_actor_creation_task_spec()->set_max_actor_restarts(-1);
+  submitter_.SubmitActorCreationTask(spec);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  // Out of scope: killed, but the DEAD carries restartability.
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  ASSERT_EQ(worker_client_->kill_requests.size(), 1u);
+  ASSERT_TRUE(worker_client_->ReplyKillActor());
+  ASSERT_EQ(notified_states.size(), 2u);
+  const auto &dead_state = notified_states[1].second;
+  EXPECT_EQ(dead_state.state(), rpc::ActorTableData::DEAD);
+  EXPECT_TRUE(gcs::IsActorRestartable(dead_state));
+  // Mirror the production dispatch of the DEAD.
+  submitter_.DisconnectActor(actor_id,
+                             /*num_restarts=*/0,
+                             /*dead=*/true,
+                             dead_state.death_cause(),
+                             /*is_restartable=*/true);
+
+  // A lineage reconstruction task arrives: the owner resurrects the actor.
+  auto task = CreateActorTaskHelper(actor_id, WorkerID::FromRandom(), 0);
+  submitter_.SubmitTask(task);
+  Pump();
+  ASSERT_EQ(notified_states.size(), 3u);
+  EXPECT_EQ(notified_states[2].second.state(), rpc::ActorTableData::RESTARTING);
+  EXPECT_EQ(notified_states[2].second.num_restarts(), 1u);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9999, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(notified_states.size(), 4u);
+  EXPECT_EQ(notified_states[3].second.state(), rpc::ActorTableData::ALIVE);
+  EXPECT_EQ(notified_states[3].second.num_restarts(), 1u);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,

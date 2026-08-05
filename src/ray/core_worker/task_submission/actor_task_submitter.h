@@ -523,6 +523,24 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   /// Failure-restart count per owner-managed actor (the num_restarts the
   /// owner authors). io thread only.
   absl::flat_hash_map<ActorID, uint64_t> owner_managed_restarts_;
+
+  /// Owner-managed actors that died out-of-scope with restart budget left:
+  /// their retained spec and restart count, kept so a later lineage
+  /// reconstruction task can resurrect them (design doc §5.3).
+  struct ResurrectableActor {
+    TaskSpecification spec;
+    uint64_t restarts = 0;
+  };
+  absl::flat_hash_map<ActorID, ResurrectableActor> resurrectable_actors_
+      ABSL_GUARDED_BY(mu_);
+
+  /// Resurrect an out-of-scope owner-managed actor for lineage
+  /// reconstruction: author RESTARTING, resubmit the retained spec, author
+  /// ALIVE and re-arm the out-of-scope termination. io thread only.
+  void ResurrectOwnerManagedActor(const ActorID &actor_id);
+
+  /// (Re-)register the out-of-scope termination for an owner-managed actor.
+  void ArmOwnerManagedTermination(const ActorID &actor_id);
 };
 
 }  // namespace core

@@ -1814,6 +1814,39 @@ TEST_F(OwnerManagedActorTest, OutOfScopeOnDeadNodeSkipsKill) {
   EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
 }
 
+TEST_F(OwnerManagedActorTest, OutOfScopeKillRetriesOnNodeCacheMiss) {
+  // A node absent from the cache is NOT a death verdict (the grant can
+  // outrun the node-add notification): the kill retries until the node
+  // appears.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(25), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  rpc::GcsNodeAddressAndLiveness alive_node;
+  alive_node.set_node_manager_address("127.0.0.1");
+  alive_node.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(false));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillOnce(Return(std::optional<rpc::GcsNodeAddressAndLiveness>()))
+      .WillRepeatedly(Return(alive_node));
+
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  // First attempt hit the cache miss: no kill yet, no give-up.
+  EXPECT_TRUE(raylet_client_->kill_local_requests.empty());
+  // The retry timer fires and the node has appeared.
+  io_context.restart();
+  io_context.run_for(std::chrono::milliseconds(200));
+  ASSERT_EQ(raylet_client_->kill_local_requests.size(), 1u);
+  ASSERT_TRUE(raylet_client_->ReplyKillLocalActor());
+}
+
 TEST_F(OwnerManagedActorTest, PreemptionRestartsBeyondExhaustedBudget) {
   // With max_restarts=1 already exhausted by a failure restart, a
   // drain-preempted node death still restarts the actor (the

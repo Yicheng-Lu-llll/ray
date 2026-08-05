@@ -22,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <queue>
@@ -1835,6 +1836,46 @@ INSTANTIATE_TEST_SUITE_P(PinObjectIDsIdempotencyVariations,
 
 class NodeManagerKillActorTest : public NodeManagerTest,
                                  public ::testing::WithParamInterface<bool> {};
+
+class KillCapturingWorkerClient : public rpc::FakeCoreWorkerClient {
+ public:
+  void KillActor(const rpc::KillActorRequest &request,
+                 const rpc::ClientCallback<rpc::KillActorReply> &callback) override {
+    kill_callbacks.push_back(callback);
+  }
+  std::deque<rpc::ClientCallback<rpc::KillActorReply>> kill_callbacks;
+};
+
+TEST_F(NodeManagerTest, KillLocalActorTransportErrorRechecksRegistration) {
+  // A graceful kill's normal success looks like a transport error (the
+  // worker exits without replying): if the worker is gone by then, the
+  // raylet must answer OK, not Invalid.
+  WorkerID worker_id = WorkerID::FromRandom();
+  JobID job_id = JobID::FromInt(2);
+  ActorID actor_id = ActorID::Of(job_id, TaskID::ForDriverTask(job_id), 1);
+  auto kill_client = std::make_shared<KillCapturingWorkerClient>();
+  auto worker = std::make_shared<MockWorker>(worker_id, 10, clock_);
+  worker->Connect(kill_client);
+  // First lookup (handler): registered. Second lookup (transport-error
+  // recheck): gone.
+  EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(worker_id))
+      .WillOnce(Return(worker))
+      .WillOnce(Return(nullptr));
+
+  rpc::KillLocalActorRequest request;
+  request.set_worker_id(worker_id.Binary());
+  request.set_intended_actor_id(actor_id.Binary());
+  request.set_force_kill(false);
+  Status replied_status = Status::Invalid("not replied");
+  node_manager_->HandleKillLocalActor(
+      request, nullptr, [&](Status s, std::function<void()>, std::function<void()>) {
+        replied_status = s;
+      });
+  ASSERT_EQ(kill_client->kill_callbacks.size(), 1u);
+  kill_client->kill_callbacks.front()(Status::IOError("connection reset"),
+                                      rpc::KillActorReply());
+  EXPECT_TRUE(replied_status.ok());
+}
 
 TEST_P(NodeManagerKillActorTest, TestHandleKillLocalActorIdempotency) {
   // worker_is_alive: determines whether the worker is alive and whether KillActor RPC

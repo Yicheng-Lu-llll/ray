@@ -53,13 +53,16 @@ class ClusterResourceScheduler {
   /// with the local node.
   /// \param is_node_available_fn: Function to determine whether a node is available.
   /// \param is_local_node_with_raylet: Whether there is a raylet on the local node.
+  /// \param reset_remote_node_views: Whether to periodically revert locally modified
+  /// remote node views to the last received sync message.
   ClusterResourceScheduler(std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
                            scheduling::NodeID local_node_id,
                            const NodeResources &local_node_resources,
                            std::function<bool(scheduling::NodeID)> is_node_available_fn,
                            ray::observability::MetricInterface &resource_usage_gauge,
                            ClockInterface &clock,
-                           bool is_local_node_with_raylet = true);
+                           bool is_local_node_with_raylet = true,
+                           bool reset_remote_node_views = true);
 
   ClusterResourceScheduler(
       std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
@@ -149,7 +152,8 @@ class ClusterResourceScheduler {
             std::function<bool(void)> get_pull_manager_at_capacity,
             std::function<void(const rpc::NodeDeathInfo &)> shutdown_raylet_gracefully,
             ray::observability::MetricInterface &resource_usage_gauge,
-            ClockInterface &clock);
+            ClockInterface &clock,
+            bool reset_remote_node_views);
 
   bool NodeAvailable(scheduling::NodeID node_id) const;
 

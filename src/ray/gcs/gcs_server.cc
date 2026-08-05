@@ -563,7 +563,14 @@ void GcsServer::InitClusterResourceScheduler() {
       [](auto) { return true; },
       /*resource_usage_gauge=*/metrics_.resource_usage_gauge,
       /*clock=*/clock_,
-      /*is_local_node_with_raylet=*/false);
+      /*is_local_node_with_raylet=*/false,
+      // The periodic reset exists to garbage-collect raylet-side optimistic
+      // deductions whose follow-up request may never be sent (e.g. a spillback
+      // redirect dropped by the owner). Every GCS deduction is immediately
+      // followed by a prepare/commit RPC that GCS sends itself, and raylet
+      // broadcasts reconcile the view, so reverting to stale snapshots here
+      // only erases correct bookkeeping.
+      /*reset_remote_node_views=*/false);
 }
 
 void GcsServer::InitGcsJobManager(

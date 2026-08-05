@@ -50,8 +50,11 @@ class GcsActorSchedulerTest;
 /// This class is not thread safe.
 class ClusterResourceManager {
  public:
+  /// \param reset_remote_node_views Whether to periodically revert locally
+  /// modified remote node views to the last received sync message.
   explicit ClusterResourceManager(
-      std::shared_ptr<PeriodicalRunnerInterface> periodical_runner);
+      std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
+      bool reset_remote_node_views = true);
 
   /// Get the resource view of the cluster.
   const absl::flat_hash_map<scheduling::NodeID, Node> &GetResourceView() const;

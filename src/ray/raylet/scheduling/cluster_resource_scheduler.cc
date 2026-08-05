@@ -30,7 +30,8 @@ ClusterResourceScheduler::ClusterResourceScheduler(
     std::function<bool(scheduling::NodeID)> is_node_available_fn,
     ray::observability::MetricInterface &resource_usage_gauge,
     ClockInterface &clock,
-    bool is_local_node_with_raylet)
+    bool is_local_node_with_raylet,
+    bool reset_remote_node_views)
     : local_node_id_(local_node_id),
       is_node_available_fn_(is_node_available_fn),
       is_local_node_with_raylet_(is_local_node_with_raylet) {
@@ -40,7 +41,8 @@ ClusterResourceScheduler::ClusterResourceScheduler(
        /*get_pull_manager_at_capacity=*/nullptr,
        /*shutdown_raylet_gracefully=*/nullptr,
        resource_usage_gauge,
-       clock);
+       clock,
+       reset_remote_node_views);
 }
 
 ClusterResourceScheduler::ClusterResourceScheduler(
@@ -63,7 +65,8 @@ ClusterResourceScheduler::ClusterResourceScheduler(
        get_pull_manager_at_capacity,
        shutdown_raylet_gracefully,
        resource_usage_gauge,
-       clock);
+       clock,
+       /*reset_remote_node_views=*/true);
 }
 
 void ClusterResourceScheduler::Init(
@@ -73,9 +76,10 @@ void ClusterResourceScheduler::Init(
     std::function<bool(void)> get_pull_manager_at_capacity,
     std::function<void(const rpc::NodeDeathInfo &)> shutdown_raylet_gracefully,
     ray::observability::MetricInterface &resource_usage_gauge,
-    ClockInterface &clock) {
-  cluster_resource_manager_ =
-      std::make_unique<ClusterResourceManager>(std::move(periodical_runner));
+    ClockInterface &clock,
+    bool reset_remote_node_views) {
+  cluster_resource_manager_ = std::make_unique<ClusterResourceManager>(
+      std::move(periodical_runner), reset_remote_node_views);
   local_resource_manager_ = std::make_unique<LocalResourceManager>(
       local_node_id_,
       local_node_resources,

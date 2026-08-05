@@ -420,12 +420,29 @@ void ActorTaskSubmitter::KillOwnerManagedActorWorker(const ActorID &actor_id,
                                                      int attempts_left) {
   // Kill through the worker's raylet (design doc §5.3): the raylet answers
   // authoritatively — an unregistered worker is already dead (tombstoned),
-  // a live one is killed with the raylet's own escalation — so no blind
-  // direct-to-worker retry loop is needed.
+  // a live one is killed with the raylet's own escalation. The bounded retry
+  // covers raylet transport failures and node-cache lag.
   const auto node_id = NodeID::FromBinary(address.node_id());
-  auto node_info = gcs_client_->Nodes().GetNodeAddressAndLiveness(node_id);
-  if (!node_info.has_value() || gcs_client_->Nodes().IsNodeDead(node_id)) {
+  if (gcs_client_->Nodes().IsNodeDead(node_id)) {
     // The node died: its raylet reaped the worker already.
+    return;
+  }
+  auto node_info = gcs_client_->Nodes().GetNodeAddressAndLiveness(node_id);
+  if (!node_info.has_value()) {
+    // Not in the node cache yet (the grant can outrun the node-add
+    // notification): this is not a death verdict, retry.
+    if (attempts_left <= 1) {
+      RAY_LOG(WARNING).WithField(actor_id)
+          << "Giving up the out-of-scope kill: the actor's node never appeared "
+             "in the node cache.";
+      return;
+    }
+    execute_after(
+        io_service_,
+        [this, actor_id, address, attempts_left]() {
+          KillOwnerManagedActorWorker(actor_id, address, attempts_left - 1);
+        },
+        std::chrono::milliseconds(kill_retry_delay_ms_));
     return;
   }
   auto raylet_address = rpc::RayletClientPool::GenerateRayletAddress(

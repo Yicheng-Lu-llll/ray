@@ -1223,6 +1223,13 @@ TEST_F(OwnerManagedActorTest, OutOfScopeKillsGrantedActorAndPublishesDead) {
   EXPECT_EQ(raylet_client_->kill_local_requests[0].intended_actor_id(),
             actor_id.Binary());
   EXPECT_FALSE(raylet_client_->kill_local_requests[0].force_kill());
+  EXPECT_EQ(raylet_client_->kill_local_requests[0]
+                .death_cause()
+                .actor_died_error_context()
+                .reason(),
+            rpc::ActorDiedErrorContext::OUT_OF_SCOPE);
+  EXPECT_FALSE(
+      WorkerID::FromBinary(raylet_client_->kill_local_requests[0].worker_id()).IsNil());
   ASSERT_EQ(notified_states.size(), 2u);
   EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
   EXPECT_EQ(notified_states[1].second.death_cause().actor_died_error_context().reason(),
@@ -1784,6 +1791,27 @@ TEST_F(OwnerManagedActorTest, PreemptedNodeDeathDoesNotConsumeBudget) {
   EXPECT_EQ(notified_states[5].second.state(), rpc::ActorTableData::DEAD);
   EXPECT_EQ(notified_states[5].second.num_restarts(), 2u);
   EXPECT_EQ(notified_states[5].second.num_restarts_due_to_node_preemption(), 1u);
+}
+
+TEST_F(OwnerManagedActorTest, OutOfScopeOnDeadNodeSkipsKill) {
+  // The dead node's raylet already reaped the worker: no kill is sent, the
+  // DEAD is still authored.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(24), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(true));
+  reference_counter_->RemoveLocalReference(ObjectID::ForActorHandle(actor_id), nullptr);
+  Pump();
+  EXPECT_TRUE(raylet_client_->kill_local_requests.empty());
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
 }
 
 TEST_F(OwnerManagedActorTest, PreemptionRestartsBeyondExhaustedBudget) {

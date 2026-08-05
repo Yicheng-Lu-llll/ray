@@ -3961,7 +3961,8 @@ void NodeManager::HandleKillLocalActor(rpc::KillLocalActorRequest request,
                         << "ms, force killing with SIGKILL.";
           DestroyWorker(current_worker,
                         rpc::WorkerExitType::INTENDED_SYSTEM_EXIT,
-                        "Actor killed by GCS",
+                        "Actor kill escalated to SIGKILL after the graceful "
+                        "shutdown timed out",
                         /*force=*/true);
         }
 
@@ -3973,12 +3974,22 @@ void NodeManager::HandleKillLocalActor(rpc::KillLocalActorRequest request,
 
   worker->rpc_client()->KillActor(
       kill_actor_request,
-      [actor_id, timer, send_reply_callback, replied](const ray::Status &status,
-                                                      const rpc::KillActorReply &) {
+      [this, actor_id, worker_id, timer, send_reply_callback, replied](
+          const ray::Status &status, const rpc::KillActorReply &) {
         if (*replied) {
           return;
         }
         if (!status.ok()) {
+          // A graceful kill's normal success looks like a transport error:
+          // the worker exits without replying and the connection drops. Only
+          // report a failure if the worker is in fact still registered.
+          auto current_worker = worker_pool_.GetRegisteredWorker(worker_id);
+          if (current_worker == nullptr || current_worker->IsDead()) {
+            *replied = true;
+            timer->cancel();
+            send_reply_callback(Status::OK(), nullptr, nullptr);
+            return;
+          }
           std::ostringstream stream;
           stream << "KillActor RPC failed for actor " << actor_id << ": "
                  << status.ToString();

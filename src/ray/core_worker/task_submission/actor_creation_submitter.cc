@@ -371,6 +371,16 @@ std::optional<rpc::Address> ActorCreationSubmitter::GetActorAddress(
   return it->second.actor_address;
 }
 
+std::optional<TaskSpecification> ActorCreationSubmitter::GetCreationSpec(
+    const ActorID &actor_id) const {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
+  auto it = creations_.find(actor_id);
+  if (it == creations_.end()) {
+    return std::nullopt;
+  }
+  return it->second.spec;
+}
+
 bool ActorCreationSubmitter::IsCreationPushInFlight(const ActorID &actor_id) const {
   RAY_CHECK(thread_checker_.IsOnSameThread());
   auto it = creations_.find(actor_id);

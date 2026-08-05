@@ -114,6 +114,10 @@ class ActorCreationSubmitter {
   /// The granted actor worker's address, once a worker was granted.
   std::optional<rpc::Address> GetActorAddress(const ActorID &actor_id) const;
 
+  /// The retained creation spec (present while the entry lives, including
+  /// permanently held kAlive entries); the restart path resubmits it.
+  std::optional<TaskSpecification> GetCreationSpec(const ActorID &actor_id) const;
+
   /// True while the creation task push has not completed yet: a worker was
   /// granted but the creation callback has not fired, so termination must
   /// wait for it (the push-completion is the cancel/kill convergence point).

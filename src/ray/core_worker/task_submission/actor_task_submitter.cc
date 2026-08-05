@@ -363,6 +363,154 @@ void ActorTaskSubmitter::KillOwnerManagedActorWorker(const ActorID &actor_id,
       });
 }
 
+void ActorTaskSubmitter::MaybeStartOwnerManagedLivenessProbe(const ActorID &actor_id) {
+  if (!liveness_probes_in_flight_.insert(actor_id).second) {
+    return;
+  }
+  ProbeOwnerManagedActorLiveness(actor_id);
+}
+
+void ActorTaskSubmitter::ProbeOwnerManagedActorLiveness(const ActorID &actor_id) {
+  auto address = creation_submitter_->GetActorAddress(actor_id);
+  if (!address.has_value()) {
+    // No granted worker (terminated or already restarting): nothing to probe.
+    liveness_probes_in_flight_.erase(actor_id);
+    return;
+  }
+  const auto node_id = NodeID::FromBinary(address->node_id());
+  const auto worker_id = WorkerID::FromBinary(address->worker_id());
+  auto node_info = gcs_client_->Nodes().GetNodeAddressAndLiveness(node_id);
+  if (!node_info.has_value() || gcs_client_->Nodes().IsNodeDead(node_id)) {
+    // The node is gone: the worker died with it.
+    rpc::ActorDeathCause death_cause;
+    auto *died_context = death_cause.mutable_actor_died_error_context();
+    died_context->set_reason(rpc::ActorDiedErrorContext::NODE_DIED);
+    died_context->set_actor_id(actor_id.Binary());
+    died_context->set_error_message("The node hosting the actor died.");
+    HandleOwnerManagedActorDeath(actor_id, death_cause);
+    return;
+  }
+  auto raylet_address = rpc::RayletClientPool::GenerateRayletAddress(
+      node_id, node_info->node_manager_address(), node_info->node_manager_port());
+  raylet_client_pool_.GetOrConnectByAddress(raylet_address)
+      ->GetWorkerLiveness(
+          worker_id,
+          [this, actor_id](const Status &status, rpc::GetWorkerLivenessReply &&reply) {
+            if (status.ok() && reply.status() == rpc::GetWorkerLivenessReply::ALIVE) {
+              // Transient push failure; the worker is fine. Future failures
+              // restart the probe.
+              liveness_probes_in_flight_.erase(actor_id);
+              return;
+            }
+            if (!status.ok() || reply.status() == rpc::GetWorkerLivenessReply::PENDING) {
+              // Raylet unreachable (node not yet marked dead) or the exit is
+              // not yet observed: hold and re-probe.
+              execute_after(
+                  io_service_,
+                  [this, actor_id]() { ProbeOwnerManagedActorLiveness(actor_id); },
+                  std::chrono::milliseconds(kill_retry_delay_ms_));
+              return;
+            }
+            // DEAD, or UNKNOWN from the raylet we know granted this worker
+            // (registered-then-evicted): the worker is gone.
+            rpc::ActorDeathCause death_cause;
+            auto *died_context = death_cause.mutable_actor_died_error_context();
+            died_context->set_reason(rpc::ActorDiedErrorContext::WORKER_DIED);
+            died_context->set_actor_id(actor_id.Binary());
+            died_context->set_error_message(
+                reply.status() == rpc::GetWorkerLivenessReply::DEAD
+                    ? "The actor worker process died."
+                    : "The actor worker process is gone from its raylet.");
+            HandleOwnerManagedActorDeath(actor_id, death_cause);
+          });
+}
+
+void ActorTaskSubmitter::HandleOwnerManagedActorDeath(
+    const ActorID &actor_id, const rpc::ActorDeathCause &death_cause) {
+  liveness_probes_in_flight_.erase(actor_id);
+  {
+    absl::MutexLock lock(&mu_);
+    if (!owner_managed_actors_.contains(actor_id)) {
+      // Already terminated (out of scope or init failure).
+      return;
+    }
+    if (auto iter = client_queues_.find(actor_id);
+        iter != client_queues_.end() &&
+        (iter->second.state_ == rpc::ActorTableData::DEAD ||
+         iter->second.pending_out_of_scope_death_)) {
+      return;
+    }
+  }
+  auto spec = creation_submitter_->GetCreationSpec(actor_id);
+  if (!spec.has_value()) {
+    return;
+  }
+  const int64_t max_restarts = spec->MaxActorRestarts();
+  uint64_t &restarts = owner_managed_restarts_[actor_id];
+  const bool restartable =
+      max_restarts == -1 || restarts < static_cast<uint64_t>(max_restarts);
+  if (!restartable) {
+    rpc::ActorTableData actor_data;
+    actor_data.set_actor_id(actor_id.Binary());
+    actor_data.set_state(rpc::ActorTableData::DEAD);
+    actor_data.set_num_restarts(restarts);
+    *actor_data.mutable_death_cause() = death_cause;
+    {
+      absl::MutexLock lock(&mu_);
+      owner_managed_actors_.erase(actor_id);
+    }
+    creation_submitter_->OnActorTerminated(actor_id);
+    owner_state_notifier_(actor_id, actor_data);
+    return;
+  }
+  restarts += 1;
+  const uint64_t restart_generation = restarts;
+  {
+    rpc::ActorTableData actor_data;
+    actor_data.set_actor_id(actor_id.Binary());
+    actor_data.set_state(rpc::ActorTableData::RESTARTING);
+    actor_data.set_num_restarts(restart_generation);
+    *actor_data.mutable_death_cause() = death_cause;
+    owner_state_notifier_(actor_id, actor_data);
+  }
+  TaskSpecification restart_spec = std::move(*spec);
+  creation_submitter_->OnActorTerminated(actor_id);
+  creation_submitter_->SubmitCreation(
+      restart_spec,
+      [this, actor_id, restart_generation](
+          const ActorCreationSubmitter::CreationResult &result) {
+        if (result.status.ok() && !result.push_task_reply.is_application_error()) {
+          rpc::ActorTableData actor_data;
+          actor_data.set_actor_id(actor_id.Binary());
+          actor_data.set_state(rpc::ActorTableData::ALIVE);
+          *actor_data.mutable_address() = result.actor_address;
+          actor_data.set_num_restarts(restart_generation);
+          owner_state_notifier_(actor_id, actor_data);
+          return;
+        }
+        // The restart itself failed: the actor is dead for good.
+        rpc::ActorTableData actor_data;
+        actor_data.set_actor_id(actor_id.Binary());
+        actor_data.set_state(rpc::ActorTableData::DEAD);
+        actor_data.set_num_restarts(restart_generation);
+        auto *died_context =
+            actor_data.mutable_death_cause()->mutable_actor_died_error_context();
+        died_context->set_reason(rpc::ActorDiedErrorContext::WORKER_DIED);
+        died_context->set_actor_id(actor_id.Binary());
+        died_context->set_error_message(
+            result.status.ok() ? result.push_task_reply.task_execution_error()
+                               : result.status.ToString());
+        {
+          absl::MutexLock lock(&mu_);
+          owner_managed_actors_.erase(actor_id);
+        }
+        if (result.status.ok()) {
+          creation_submitter_->OnActorTerminated(actor_id);
+        }
+        owner_state_notifier_(actor_id, actor_data);
+      });
+}
+
 void ActorTaskSubmitter::SubmitTask(TaskSpecification task_spec) {
   auto task_id = task_spec.TaskId();
   auto actor_id = task_spec.ActorId();
@@ -941,6 +1089,13 @@ void ActorTaskSubmitter::HandlePushTaskReply(const Status &status,
                                      status.ToString());
         error_info.set_error_type(rpc::ErrorType::ACTOR_UNAVAILABLE);
         error_info.mutable_actor_unavailable_error()->set_actor_id(actor_id.Binary());
+        if (owner_managed_actors_.contains(actor_id)) {
+          // The owner is the only death detector for its managed actors:
+          // resolve unavailable vs dead through the raylet's liveness ledger.
+          io_service_.post(
+              [this, actor_id]() { MaybeStartOwnerManagedLivenessProbe(actor_id); },
+              "ActorTaskSubmitter.OwnerManagedLivenessProbe");
+        }
       }
     }
 

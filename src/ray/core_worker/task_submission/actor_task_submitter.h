@@ -140,6 +140,12 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   /// Submit an actor creation task to an actor via GCS.
   void SubmitActorCreationTask(TaskSpecification task_spec);
 
+  /// Start (at most one per actor) the liveness probe loop against the
+  /// actor's raylet: the owner is the only death detector for owner-managed
+  /// actors. Called on push transport failures (and later by raylet death
+  /// notifications). io_service thread only.
+  void MaybeStartOwnerManagedLivenessProbe(const ActorID &actor_id);
+
   /// Terminate an owner-managed actor: cancel an ungranted creation or kill
   /// the granted worker, then dispatch the owner-authored DEAD state. While
   /// the creation push is in flight the termination is deferred to the
@@ -506,6 +512,17 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   void KillOwnerManagedActorWorker(const ActorID &actor_id,
                                    const rpc::Address &address,
                                    int attempts_left);
+
+  void ProbeOwnerManagedActorLiveness(const ActorID &actor_id);
+  /// Death confirmed: restart within the max_restarts budget (authoring
+  /// RESTARTING then ALIVE) or author the final DEAD.
+  void HandleOwnerManagedActorDeath(const ActorID &actor_id,
+                                    const rpc::ActorDeathCause &death_cause);
+  /// Liveness probes currently running, one per actor. io thread only.
+  absl::flat_hash_set<ActorID> liveness_probes_in_flight_;
+  /// Failure-restart count per owner-managed actor (the num_restarts the
+  /// owner authors). io thread only.
+  absl::flat_hash_map<ActorID, uint64_t> owner_managed_restarts_;
 };
 
 }  // namespace core

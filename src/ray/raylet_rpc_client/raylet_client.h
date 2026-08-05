@@ -141,6 +141,10 @@ class RayletClient : public RayletClientInterface {
       const WorkerID &worker_id,
       const rpc::ClientCallback<rpc::IsLocalWorkerDeadReply> &callback) override;
 
+  void GetWorkerLiveness(
+      const WorkerID &worker_id,
+      const rpc::ClientCallback<rpc::GetWorkerLivenessReply> &callback) override;
+
   void GetSystemConfig(
       const rpc::ClientCallback<rpc::GetSystemConfigReply> &callback) override;
 

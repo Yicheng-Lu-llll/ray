@@ -412,6 +412,19 @@ void RayletClient::IsLocalWorkerDead(
                   /*method_timeout_ms*/ -1);
 }
 
+void RayletClient::GetWorkerLiveness(
+    const WorkerID &worker_id,
+    const rpc::ClientCallback<rpc::GetWorkerLivenessReply> &callback) {
+  rpc::GetWorkerLivenessRequest request;
+  request.set_worker_id(worker_id.Binary());
+  INVOKE_RPC_CALL(NodeManagerService,
+                  GetWorkerLiveness,
+                  request,
+                  callback,
+                  grpc_client_,
+                  /*method_timeout_ms*/ -1);
+}
+
 void RayletClient::GlobalGC(const rpc::ClientCallback<rpc::GlobalGCReply> &callback) {
   rpc::GlobalGCRequest request;
   INVOKE_RPC_CALL(NodeManagerService,

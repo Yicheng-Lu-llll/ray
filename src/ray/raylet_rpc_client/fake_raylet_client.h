@@ -295,6 +295,30 @@ class FakeRayletClient : public RayletClientInterface {
       const WorkerID &worker_id,
       const ClientCallback<IsLocalWorkerDeadReply> &callback) override {}
 
+  void GetWorkerLiveness(
+      const WorkerID &worker_id,
+      const ClientCallback<GetWorkerLivenessReply> &callback) override {
+    liveness_callbacks.push_back(callback);
+  }
+
+  bool ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::Status status,
+                              rpc::GetWorkerLivenessReply::Grade grade =
+                                  rpc::GetWorkerLivenessReply::GRADE_UNSPECIFIED,
+                              ray::Status rpc_status = ray::Status::OK()) {
+    if (liveness_callbacks.empty()) {
+      return false;
+    }
+    auto callback = liveness_callbacks.front();
+    liveness_callbacks.pop_front();
+    GetWorkerLivenessReply reply;
+    reply.set_status(status);
+    reply.set_grade(grade);
+    callback(rpc_status, std::move(reply));
+    return true;
+  }
+
+  std::deque<ClientCallback<GetWorkerLivenessReply>> liveness_callbacks;
+
   std::shared_ptr<grpc::Channel> GetChannel() const override { return nullptr; }
 
   void GetNodeStats(const GetNodeStatsRequest &request,

@@ -209,6 +209,12 @@ class RayletClientInterface {
       const WorkerID &worker_id,
       const rpc::ClientCallback<rpc::IsLocalWorkerDeadReply> &callback) = 0;
 
+  /// Query the four-state liveness verdict for a worker that was (or may
+  /// have been) registered at this raylet (tombstone-backed).
+  virtual void GetWorkerLiveness(
+      const WorkerID &worker_id,
+      const rpc::ClientCallback<rpc::GetWorkerLivenessReply> &callback) = 0;
+
   virtual std::shared_ptr<grpc::Channel> GetChannel() const = 0;
 
   virtual void GetNodeStats(

@@ -1318,6 +1318,101 @@ TEST_F(OwnerManagedActorTest, OutOfScopeKillRetriesTransientFailure) {
   ASSERT_TRUE(worker_client_->ReplyKillActor(Status::OK()));
 }
 
+TEST_F(OwnerManagedActorTest, WorkerDeathRestartsWithinBudget) {
+  // Confirmed worker death restarts the actor: RESTARTING then a fresh
+  // creation, then ALIVE with the bumped restart count.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(7), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  auto spec = BuildCreationTaskSpec(actor_id);
+  spec.GetMutableMessage().mutable_actor_creation_task_spec()->set_max_actor_restarts(1);
+  submitter_.SubmitActorCreationTask(spec);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(notified_states.size(), 1u);
+
+  // The probe asks the actor node's raylet; the node is alive.
+  rpc::GcsNodeAddressAndLiveness node_info;
+  node_info.set_node_manager_address("127.0.0.1");
+  node_info.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillRepeatedly(Return(node_info));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(false));
+
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::DEAD,
+                                                     rpc::GetWorkerLivenessReply::EXIT));
+
+  // RESTARTING authored, then the new lease request is granted and pushed.
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::RESTARTING);
+  EXPECT_EQ(notified_states[1].second.num_restarts(), 1u);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9999, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+  ASSERT_EQ(notified_states.size(), 3u);
+  EXPECT_EQ(notified_states[2].second.state(), rpc::ActorTableData::ALIVE);
+  EXPECT_EQ(notified_states[2].second.num_restarts(), 1u);
+  EXPECT_EQ(notified_states[2].second.address().port(), 9999);
+}
+
+TEST_F(OwnerManagedActorTest, WorkerDeathBeyondBudgetIsFinalDead) {
+  // With the restart budget exhausted (max_restarts=0), a confirmed death is
+  // final: the owner authors DEAD with the probe's cause.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(8), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  rpc::GcsNodeAddressAndLiveness node_info;
+  node_info.set_node_manager_address("127.0.0.1");
+  node_info.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillRepeatedly(Return(node_info));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(false));
+
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::DEAD,
+                                                     rpc::GetWorkerLivenessReply::EXIT));
+
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::DEAD);
+  EXPECT_EQ(notified_states[1].second.death_cause().actor_died_error_context().reason(),
+            rpc::ActorDiedErrorContext::WORKER_DIED);
+}
+
+TEST_F(OwnerManagedActorTest, AliveProbeVerdictStopsProbing) {
+  // A transient push failure against a live worker must not restart it.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(9), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  submitter_.SubmitActorCreationTask(BuildCreationTaskSpec(actor_id));
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  rpc::GcsNodeAddressAndLiveness node_info;
+  node_info.set_node_manager_address("127.0.0.1");
+  node_info.set_node_manager_port(7000);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillRepeatedly(Return(node_info));
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeDead(_))
+      .WillRepeatedly(Return(false));
+
+  submitter_.MaybeStartOwnerManagedLivenessProbe(actor_id);
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::ALIVE));
+  EXPECT_EQ(notified_states.size(), 1u);
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

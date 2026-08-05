@@ -2033,6 +2033,35 @@ TEST_F(OwnerManagedActorTest, ProbeOnUnknownActorIsNoOp) {
   EXPECT_TRUE(notified_states.empty());
 }
 
+TEST_F(OwnerManagedActorTest, ReconciliationSweepCatchesLostDeath) {
+  // A lost raylet death notification is backstopped by the periodic sweep:
+  // every granted actor gets probed; ALIVE verdicts stop immediately, a DEAD
+  // verdict restarts.
+  ActorID actor_id = ActorID::Of(JobID::FromInt(26), TaskID::Nil(), 1);
+  OwnHandle(actor_id);
+  EXPECT_CALL(*task_manager_, MarkDependenciesResolved(_)).Times(1);
+  EXPECT_CALL(*task_manager_, CompletePendingTask(_, _, _, _)).Times(1);
+  auto spec = BuildCreationTaskSpec(actor_id);
+  spec.GetMutableMessage().mutable_actor_creation_task_spec()->set_max_actor_restarts(1);
+  submitter_.SubmitActorCreationTask(spec);
+  ASSERT_TRUE(raylet_client_->GrantWorkerLease(
+      "127.0.0.1", 9998, WorkerID::FromRandom(), NodeID::FromRandom(), NodeID::Nil()));
+  ASSERT_TRUE(worker_client_->ReplyPushTask());
+
+  // First sweep: the worker is fine, the probe stops.
+  submitter_.SweepOwnerManagedActors();
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::ALIVE));
+  EXPECT_EQ(notified_states.size(), 1u);
+
+  // Second sweep: the worker died and the notification was lost; the sweep
+  // finds it.
+  submitter_.SweepOwnerManagedActors();
+  ASSERT_TRUE(raylet_client_->ReplyGetWorkerLiveness(rpc::GetWorkerLivenessReply::DEAD,
+                                                     rpc::GetWorkerLivenessReply::EXIT));
+  ASSERT_EQ(notified_states.size(), 2u);
+  EXPECT_EQ(notified_states[1].second.state(), rpc::ActorTableData::RESTARTING);
+}
+
 INSTANTIATE_TEST_SUITE_P(AllowOutOfOrderExecution,
                          ActorTaskSubmitterTest,
                          ::testing::Values(true, false));

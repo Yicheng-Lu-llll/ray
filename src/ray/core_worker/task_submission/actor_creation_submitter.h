@@ -117,6 +117,9 @@ class ActorCreationSubmitter {
   /// Actors whose granted worker lives on the given node.
   std::vector<ActorID> GetActorsOnNode(const NodeID &node_id) const;
 
+  /// All actors currently holding a granted worker (kAlive).
+  std::vector<ActorID> GetGrantedActors() const;
+
   /// The retained creation spec (present while the entry lives, including
   /// permanently held kAlive entries); the restart path resubmits it.
   std::optional<TaskSpecification> GetCreationSpec(const ActorID &actor_id) const;

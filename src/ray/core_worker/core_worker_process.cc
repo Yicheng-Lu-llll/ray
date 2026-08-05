@@ -601,7 +601,9 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
       reference_counter,
       /*clock=*/clock_,
       std::move(actor_creation_submitter),
-      std::move(owner_state_notifier));
+      std::move(owner_state_notifier),
+      /*kill_retry_delay_ms=*/1000,
+      RayConfig::instance().owner_actor_reconciliation_period_ms());
 
   auto node_addr_factory = [this](const NodeID &node_id) {
     auto core_worker = GetCoreWorker();

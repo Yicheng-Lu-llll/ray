@@ -485,6 +485,22 @@ void ActorTaskSubmitter::MaybeStartOwnerManagedLivenessProbe(const ActorID &acto
   ProbeOwnerManagedActorLiveness(actor_id);
 }
 
+void ActorTaskSubmitter::SweepOwnerManagedActors() {
+  for (const auto &actor_id : creation_submitter_->GetGrantedActors()) {
+    MaybeStartOwnerManagedLivenessProbe(actor_id);
+  }
+}
+
+void ActorTaskSubmitter::ScheduleOwnerManagedReconciliation() {
+  execute_after(
+      io_service_,
+      [this]() {
+        SweepOwnerManagedActors();
+        ScheduleOwnerManagedReconciliation();
+      },
+      std::chrono::milliseconds(reconciliation_period_ms_));
+}
+
 void ActorTaskSubmitter::HandleNodeDead(const NodeID &node_id) {
   if (creation_submitter_ == nullptr) {
     return;

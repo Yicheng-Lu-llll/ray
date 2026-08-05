@@ -394,6 +394,17 @@ std::vector<ActorID> ActorCreationSubmitter::GetActorsOnNode(
   return actors;
 }
 
+std::vector<ActorID> ActorCreationSubmitter::GetGrantedActors() const {
+  RAY_CHECK(thread_checker_.IsOnSameThread());
+  std::vector<ActorID> actors;
+  for (const auto &[actor_id, entry] : creations_) {
+    if (entry.state == CreationState::kAlive) {
+      actors.push_back(actor_id);
+    }
+  }
+  return actors;
+}
+
 bool ActorCreationSubmitter::IsCreationPushInFlight(const ActorID &actor_id) const {
   RAY_CHECK(thread_checker_.IsOnSameThread());
   auto it = creations_.find(actor_id);

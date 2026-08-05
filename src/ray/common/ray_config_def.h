@@ -322,6 +322,11 @@ RAY_CONFIG(size_t, worker_tombstone_capacity, 10000)
 /// Period of the raylet's pending-tombstone exit scan.
 RAY_CONFIG(int64_t, worker_tombstone_scan_period_ms, 100)
 
+/// Period of the owner's reconciliation sweep over its owner-managed
+/// actors' liveness (backstops a lost raylet death notification). 0
+/// disables.
+RAY_CONFIG(int64_t, owner_actor_reconciliation_period_ms, 30000)
+
 /// Deadline for a self-exiting worker's shutdown before the raylet escalates
 /// to SIGKILL and records a deadline-grade tombstone. Must exceed the
 /// worker-side graceful teardown budget (~30s of flushing after disconnect).

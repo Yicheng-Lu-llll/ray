@@ -90,7 +90,8 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
                      std::unique_ptr<ActorCreationSubmitter> creation_submitter = nullptr,
                      std::function<void(const ActorID &, const rpc::ActorTableData &)>
                          owner_state_notifier = nullptr,
-                     int64_t kill_retry_delay_ms = 1000)
+                     int64_t kill_retry_delay_ms = 1000,
+                     int64_t reconciliation_period_ms = 0)
       : core_worker_client_pool_(core_worker_client_pool),
         raylet_client_pool_(raylet_client_pool),
         gcs_client_(std::move(gcs_client)),
@@ -105,9 +106,13 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
         clock_(clock),
         creation_submitter_(std::move(creation_submitter)),
         owner_state_notifier_(std::move(owner_state_notifier)),
-        kill_retry_delay_ms_(kill_retry_delay_ms) {
+        kill_retry_delay_ms_(kill_retry_delay_ms),
+        reconciliation_period_ms_(reconciliation_period_ms) {
     RAY_CHECK(creation_submitter_ == nullptr || owner_state_notifier_ != nullptr)
         << "owner_state_notifier is required with a creation submitter.";
+    if (creation_submitter_ != nullptr && reconciliation_period_ms_ > 0) {
+      ScheduleOwnerManagedReconciliation();
+    }
   }
 
   void SetPreempted(const ActorID &actor_id) override {
@@ -149,6 +154,12 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   /// A node died: probe every owner-managed actor granted on it (the node's
   /// raylet can no longer notify anyone). Safe from any thread.
   void HandleNodeDead(const NodeID &node_id);
+
+  /// Probe every granted owner-managed actor: the periodic backstop for a
+  /// lost raylet death notification (design doc §9.6, owner half). An ALIVE
+  /// verdict stops each probe immediately, so a quiet sweep costs one RPC
+  /// per actor per period. io thread only.
+  void SweepOwnerManagedActors();
 
   /// Terminate an owner-managed actor: cancel an ungranted creation or kill
   /// the granted worker, then dispatch the owner-authored DEAD state. While
@@ -510,6 +521,10 @@ class ActorTaskSubmitter : public ActorTaskSubmitterInterface {
   absl::flat_hash_set<ActorID> pending_terminations_;
   /// Backoff between out-of-scope kill retries (injectable for tests).
   const int64_t kill_retry_delay_ms_;
+  /// Period of the reconciliation sweep (0 disables).
+  const int64_t reconciliation_period_ms_;
+
+  void ScheduleOwnerManagedReconciliation();
 
   /// Deliver an out-of-scope kill through the worker's raylet (authoritative
   /// dead-or-killed answer, design doc §5.3), retrying transient transport

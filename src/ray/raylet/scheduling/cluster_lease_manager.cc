@@ -58,6 +58,16 @@ void ClusterLeaseManager::QueueAndScheduleLease(
   // directly.
   auto infeasible_leases_iter = infeasible_leases_.find(scheduling_class);
   if (infeasible_leases_iter != infeasible_leases_.end()) {
+    if (work->grant_or_reject_) {
+      // SYNCHEAD2: bounce instead of joining the infeasible queue.
+      RAY_LOG(INFO) << "SYNCHEAD2 reject-infeasible lease "
+                    << work->lease_.GetLeaseSpecification().LeaseId();
+      for (const auto &reply_callback : work->reply_callbacks_) {
+        reply_callback.reply_->set_rejected(true);
+        reply_callback.send_reply_callback_(Status::OK(), nullptr, nullptr);
+      }
+      return;
+    }
     infeasible_leases_iter->second.emplace_back(std::move(work));
   } else {
     leases_to_schedule_[scheduling_class].emplace_back(std::move(work));
@@ -263,6 +273,26 @@ void ClusterLeaseManager::ScheduleAndGrantLeases() {
 
     if (is_infeasible) {
       RAY_CHECK(!work_queue.empty());
+      // SYNCHEAD2: bounce grant_or_reject leases instead of parking them
+      // infeasible on this node.
+      auto &filter_queue = shapes_it->second;
+      for (auto it = filter_queue.begin(); it != filter_queue.end();) {
+        if ((*it)->grant_or_reject_) {
+          RAY_LOG(INFO) << "SYNCHEAD2 reject-infeasible lease "
+                        << (*it)->lease_.GetLeaseSpecification().LeaseId();
+          for (const auto &reply_callback : (*it)->reply_callbacks_) {
+            reply_callback.reply_->set_rejected(true);
+            reply_callback.send_reply_callback_(Status::OK(), nullptr, nullptr);
+          }
+          it = filter_queue.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (filter_queue.empty()) {
+        leases_to_schedule_.erase(shapes_it++);
+        continue;
+      }
       // Only announce the first item as infeasible.
       auto &cur_work_queue = shapes_it->second;
       const auto &work = cur_work_queue[0];

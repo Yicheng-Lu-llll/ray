@@ -373,6 +373,9 @@ void LocalLeaseManager::GrantScheduledLeasesToWorkers() {
             // receives; the scheduler (head) re-places it with a fresh view.
             RAY_LOG(INFO) << "SYNCHEAD2 reject-instead-of-park lease "
                           << spec.LeaseId();
+            if (!spec.GetDependencies().empty()) {
+              lease_dependency_manager_.RemoveLeaseDependencies(spec.LeaseId());
+            }
             for (const auto &reply_callback : work->reply_callbacks_) {
               reply_callback.reply_->set_rejected(true);
               reply_callback.send_reply_callback_(Status::OK(), nullptr, nullptr);
@@ -429,7 +432,7 @@ void LocalLeaseManager::GrantScheduledLeasesToWorkers() {
     if (sched_cls_info.granted_leases.size() == 0) {
       info_by_sched_cls_.erase(scheduling_class);
     }
-    if (is_infeasible) {
+    if (is_infeasible && !leases_to_grant_queue.empty()) {
       const auto &front_lease =
           leases_to_grant_queue.front()->lease_.GetLeaseSpecification();
       RAY_LOG(ERROR) << "A lease got granted to a node even though it was infeasible. "

@@ -41,6 +41,11 @@ using ray::rpc::syncer::RaySyncMessage;
 using ray::rpc::syncer::RaySyncMessageBatch;
 using ray::rpc::syncer::ResourceViewSyncMessage;
 
+/// EXPERIMENT(SYNCHEAD): restrict RESOURCE_VIEW fan-out to a single node
+/// (the head raylet). Set once when the head node registers; empty = fan out
+/// to everyone (default, and always the case on raylets).
+void SetResourceViewFanoutTarget(const std::string &node_id);
+
 /// The interface for a reporter. Reporter is defined to be a local module which would
 /// like to let the other nodes know its state. For example, local cluster resource
 /// manager.

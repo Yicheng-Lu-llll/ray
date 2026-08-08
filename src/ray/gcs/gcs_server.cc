@@ -989,6 +989,9 @@ void GcsServer::InstallEventListeners() {
         // Because a new node has been added, we need to try to schedule the pending
         // placement groups and the pending actors.
         auto node_id = NodeID::FromBinary(node->node_id());
+        if (node->is_head_node()) {
+          syncer::SetResourceViewFanoutTarget(node->node_id());
+        }
         gcs_resource_manager_->OnNodeAdd(*node);
         gcs_placement_group_manager_->OnNodeAdd(node_id);
         gcs_actor_manager_->SchedulePendingActors();

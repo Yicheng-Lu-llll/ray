@@ -25,8 +25,30 @@
 #include "ray/ray_syncer/node_state.h"
 #include "ray/ray_syncer/ray_syncer_client.h"
 #include "ray/ray_syncer/ray_syncer_server.h"
+#include "absl/synchronization/mutex.h"
 
 namespace ray::syncer {
+
+namespace {
+absl::Mutex g_synchead_mu;
+std::string g_synchead_id;  // binary head-raylet node id; empty = allow all
+
+bool SyncheadAllows(const RaySyncMessage &msg, const std::string &remote_node_id) {
+  if (msg.message_type() != MessageType::RESOURCE_VIEW) {
+    return true;
+  }
+  absl::MutexLock lock(&g_synchead_mu);
+  return g_synchead_id.empty() || g_synchead_id == remote_node_id;
+}
+}  // namespace
+
+void SetResourceViewFanoutTarget(const std::string &node_id) {
+  absl::MutexLock lock(&g_synchead_mu);
+  g_synchead_id = node_id;
+  RAY_LOG(INFO) << "SYNCHEAD: RESOURCE_VIEW fan-out restricted to head raylet "
+                << NodeID::FromBinary(node_id);
+}
+
 
 RaySyncer::RaySyncer(instrumented_io_context &io_context,
                      std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
@@ -145,6 +167,9 @@ void RaySyncer::Connect(std::shared_ptr<RaySyncerBidiReactor> reactor) {
                            << NodeID::FromBinary(GetLocalNodeID()) << " to "
                            << NodeID::FromBinary(reactor->GetRemoteNodeID()) << " about "
                            << NodeID::FromBinary(message->node_id());
+            if (!SyncheadAllows(*message, reactor->GetRemoteNodeID())) {
+              continue;  // SYNCHEAD: initial view snapshot is head-only too.
+            }
             reactor->PushToSendingQueue(message);
           }
         }
@@ -218,6 +243,9 @@ void RaySyncer::BroadcastMessage(std::shared_ptr<const RaySyncMessage> message) 
           return;
         }
         for (auto &reactor : sync_reactors_) {
+          if (!SyncheadAllows(*message, reactor.first)) {
+            continue;  // SYNCHEAD: workers no longer receive the resource view.
+          }
           reactor.second->PushToSendingQueue(message);
         }
       },

@@ -367,6 +367,19 @@ void LocalLeaseManager::GrantScheduledLeasesToWorkers() {
         // should try spilling to another node.
         bool did_spill = TrySpillback(work, is_infeasible);
         if (!did_spill) {
+          if (work->grant_or_reject_) {
+            // SYNCHEAD2: an executor that cannot serve a grant_or_reject lease
+            // bounces it back instead of parking on a remote view it no longer
+            // receives; the scheduler (head) re-places it with a fresh view.
+            RAY_LOG(INFO) << "SYNCHEAD2 reject-instead-of-park lease "
+                          << spec.LeaseId();
+            for (const auto &reply_callback : work->reply_callbacks_) {
+              reply_callback.reply_->set_rejected(true);
+              reply_callback.send_reply_callback_(Status::OK(), nullptr, nullptr);
+            }
+            work_it = leases_to_grant_queue.erase(work_it);
+            continue;
+          }
           // There must not be any other available nodes in the cluster, so the lease
           // should stay on this node. We can skip the rest of the shape because the
           // scheduler will make the same decision.

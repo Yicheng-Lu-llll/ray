@@ -30,12 +30,15 @@ namespace ray::syncer {
 
 using ServerBidiReactor =
     grpc::ServerBidiReactor<RaySyncMessageBatch, RaySyncMessageBatch>;
+using RawServerBidiReactor = grpc::ServerBidiReactor<grpc::ByteBuffer, grpc::ByteBuffer>;
 
 /// Reactor for gRPC server side. It defines the server's specific behavior for a
-/// streaming call.
-class RayServerBidiReactor : public RaySyncerBidiReactorBase<ServerBidiReactor> {
+/// streaming call. Instantiated with the typed wire (RaySyncMessageBatch) or the raw
+/// wire (grpc::ByteBuffer, serialize-once fan-out); bytes on the wire are identical.
+template <typename GrpcReactor, typename WireT>
+class RayServerBidiReactorT : public RaySyncerBidiReactorBase<GrpcReactor, WireT> {
  public:
-  RayServerBidiReactor(
+  RayServerBidiReactorT(
       grpc::CallbackServerContext *server_context,
       instrumented_io_context &io_context,
       const std::string &local_node_id,
@@ -46,7 +49,7 @@ class RayServerBidiReactor : public RaySyncerBidiReactorBase<ServerBidiReactor> 
       size_t max_batch_size,
       uint64_t max_batch_delay_ms);
 
-  ~RayServerBidiReactor() override = default;
+  ~RayServerBidiReactorT() override = default;
 
   bool IsFinished() const { return finished_.load(); }
 
@@ -57,7 +60,7 @@ class RayServerBidiReactor : public RaySyncerBidiReactorBase<ServerBidiReactor> 
 
   void Finish(grpc::Status status) {
     finished_.store(true);
-    ServerBidiReactor::Finish(status);
+    GrpcReactor::Finish(status);
   }
 
   /// Cleanup callback when the call ends.
@@ -78,5 +81,9 @@ class RayServerBidiReactor : public RaySyncerBidiReactorBase<ServerBidiReactor> 
 
   FRIEND_TEST(SyncerReactorTest, TestReactorFailure);
 };
+
+using RayServerBidiReactor = RayServerBidiReactorT<ServerBidiReactor, RaySyncMessageBatch>;
+using RayServerBidiReactorRaw =
+    RayServerBidiReactorT<RawServerBidiReactor, grpc::ByteBuffer>;
 
 }  // namespace ray::syncer

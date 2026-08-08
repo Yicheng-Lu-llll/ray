@@ -103,7 +103,8 @@ class RaySyncer {
             const std::string &node_id,
             size_t max_batch_size,
             uint64_t max_batch_delay_ms,
-            RpcCompletionCallback on_rpc_completion = {});
+            RpcCompletionCallback on_rpc_completion = {},
+            bool serialize_frames = false);
   ~RaySyncer();
 
   /// Connect to a node.
@@ -194,7 +195,17 @@ class RaySyncer {
   /// [RaySyncerBidiReactor], so should be passed to each of them.
   RpcCompletionCallback on_rpc_completion_;
 
+  /// If true, pre-serialize each broadcast message once into its wire frame so
+  /// raw-wire reactors can fan it out as zero-copy slices (hub/GCS mode).
+  const bool serialize_frames_ = false;
+
+  /// Shared outbound frame log for raw-wire fan-out (only used when
+  /// serialize_frames_): reactors consume it by cursor instead of receiving a
+  /// per-connection copy of every message.
+  OutboundLog outbound_log_;
+
   friend class RaySyncerService;
+  friend class RaySyncerServiceRaw;
   /// Test purpose
   friend struct SyncerServerTest;
   FRIEND_TEST(SyncerTest, Broadcast);
@@ -210,6 +221,31 @@ class RaySyncer {
 /// Right now only raylet needs to setup this service. But in the future,
 /// we can use this to construct more complicated resource reporting algorithm,
 /// like tree-based one.
+/// Raw-wire flavor of RaySyncerService: identical protocol bytes, but the server
+/// exchanges grpc::ByteBuffer so outgoing fan-out reuses each message's cached
+/// frame (serialize-once). Clients (raylets) need no change.
+class RaySyncerServiceRaw
+    : public ray::rpc::syncer::RaySyncer::WithRawCallbackMethod_StartSync<
+          ray::rpc::syncer::RaySyncer::Service> {
+ public:
+  explicit RaySyncerServiceRaw(
+      RaySyncer &syncer,
+      std::shared_ptr<const ray::rpc::AuthenticationToken> auth_token = nullptr,
+      ray::rpc::AuthenticationTokenValidator &auth_token_validator =
+          ray::rpc::AuthenticationTokenValidator::instance())
+      : syncer_(syncer),
+        auth_token_(std::move(auth_token)),
+        auth_token_validator_(auth_token_validator) {}
+
+  grpc::ServerBidiReactor<grpc::ByteBuffer, grpc::ByteBuffer> *StartSync(
+      grpc::CallbackServerContext *context) override;
+
+ private:
+  RaySyncer &syncer_;
+  std::shared_ptr<const ray::rpc::AuthenticationToken> auth_token_;
+  ray::rpc::AuthenticationTokenValidator &auth_token_validator_;
+};
+
 class RaySyncerService : public ray::rpc::syncer::RaySyncer::CallbackService {
  public:
   explicit RaySyncerService(

@@ -25,6 +25,16 @@ ray_cc_test(
 )
 
 ray_cc_binary(
+    name = "syncer_delivery_bench",
+    srcs = ["syncer_delivery_bench.cc"],
+    deps = [
+        "//src/ray/asio:periodical_runner",
+        "//src/ray/ray_syncer",
+        "//src/ray/util:network_util",
+    ],
+)
+
+ray_cc_binary(
     name = "syncer_service_e2e_test",
     srcs = ["syncer_service_e2e_test.cc"],
     deps = [

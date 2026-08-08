@@ -33,7 +33,8 @@ std::string GetNodeIDFromServerContext(grpc::CallbackServerContext *server_conte
 
 }  // namespace
 
-RayServerBidiReactor::RayServerBidiReactor(
+template <typename GrpcReactor, typename WireT>
+RayServerBidiReactorT<GrpcReactor, WireT>::RayServerBidiReactorT(
     grpc::CallbackServerContext *server_context,
     instrumented_io_context &io_context,
     const std::string &local_node_id,
@@ -43,7 +44,7 @@ RayServerBidiReactor::RayServerBidiReactor(
     ray::rpc::AuthenticationTokenValidator &auth_token_validator,
     size_t max_batch_size,
     uint64_t max_batch_delay_ms)
-    : RaySyncerBidiReactorBase<ServerBidiReactor>(
+    : RaySyncerBidiReactorBase<GrpcReactor, WireT>(
           io_context,
           GetNodeIDFromServerContext(server_context),
           std::move(message_processor),
@@ -59,7 +60,7 @@ RayServerBidiReactor::RayServerBidiReactor(
     auto it = metadata.find(kAuthTokenKey);
     if (it == metadata.end()) {
       RAY_LOG(WARNING) << "Missing authorization header in syncer connection from node "
-                       << NodeID::FromBinary(GetRemoteNodeID());
+                       << NodeID::FromBinary(this->GetRemoteNodeID());
       Finish(grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
                           "Missing authorization header"));
       return;
@@ -69,7 +70,7 @@ RayServerBidiReactor::RayServerBidiReactor(
 
     if (!auth_token_validator_.ValidateToken(auth_token_, header)) {
       RAY_LOG(WARNING) << "Invalid bearer token in syncer connection from node "
-                       << NodeID::FromBinary(GetRemoteNodeID());
+                       << NodeID::FromBinary(this->GetRemoteNodeID());
       Finish(grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "Invalid bearer token"));
       return;
     }
@@ -77,27 +78,33 @@ RayServerBidiReactor::RayServerBidiReactor(
 
   // Send the local node id to the remote
   server_context_->AddInitialMetadata("node_id", NodeID::FromBinary(local_node_id).Hex());
-  StartSendInitialMetadata();
+  this->StartSendInitialMetadata();
 
   // Start pulling from remote
-  StartPull();
+  this->StartPull();
 }
 
-void RayServerBidiReactor::DoDisconnect() {
-  io_context_.dispatch([this]() { Finish(grpc::Status::OK); }, "");
+template <typename GrpcReactor, typename WireT>
+void RayServerBidiReactorT<GrpcReactor, WireT>::DoDisconnect() {
+  this->io_context_.dispatch([this]() { Finish(grpc::Status::OK); }, "");
 }
 
-void RayServerBidiReactor::OnCancel() {
-  io_context_.dispatch([this]() { Disconnect(); }, "");
+template <typename GrpcReactor, typename WireT>
+void RayServerBidiReactorT<GrpcReactor, WireT>::OnCancel() {
+  this->io_context_.dispatch([this]() { this->Disconnect(); }, "");
 }
 
-void RayServerBidiReactor::OnDone() {
-  io_context_.dispatch(
-      [this, cleanup_cb = cleanup_cb_, remote_node_id = GetRemoteNodeID()]() {
+template <typename GrpcReactor, typename WireT>
+void RayServerBidiReactorT<GrpcReactor, WireT>::OnDone() {
+  this->io_context_.dispatch(
+      [this, cleanup_cb = cleanup_cb_, remote_node_id = this->GetRemoteNodeID()]() {
         cleanup_cb(this, false);
-        self_ref_.reset();
+        this->self_ref_.reset();
       },
       "");
 }
+
+template class RayServerBidiReactorT<ServerBidiReactor, RaySyncMessageBatch>;
+template class RayServerBidiReactorT<RawServerBidiReactor, grpc::ByteBuffer>;
 
 }  // namespace ray::syncer

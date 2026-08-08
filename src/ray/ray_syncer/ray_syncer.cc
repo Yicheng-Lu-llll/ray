@@ -14,6 +14,7 @@
 
 #include "ray/ray_syncer/ray_syncer.h"
 
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -28,19 +29,58 @@
 
 namespace ray::syncer {
 
+void AppendSyncMessageFrame(const RaySyncMessage &msg, std::string *out) {
+  const size_t n = msg.ByteSizeLong();
+  // Length-delimited element of RaySyncMessageBatch.messages (field 1, wire type 2):
+  // tag byte 0x0A + varint(n) + serialized message bytes.
+  uint8_t hdr[10];
+  size_t h = 0;
+  hdr[h++] = 0x0A;
+  size_t v = n;
+  while (v >= 0x80) {
+    hdr[h++] = static_cast<uint8_t>(v) | 0x80;
+    v >>= 7;
+  }
+  hdr[h++] = static_cast<uint8_t>(v);
+  const size_t base = out->size();
+  out->resize(base + h + n);
+  memcpy(out->data() + base, hdr, h);
+  RAY_CHECK(msg.SerializeToArray(out->data() + base + h, static_cast<int>(n)));
+}
+
+grpc::Slice MakeSyncMessageFrame(const RaySyncMessage &msg) {
+  std::string buf;
+  AppendSyncMessageFrame(msg, &buf);
+  return grpc::Slice(buf.data(), buf.size());
+}
+
+grpc::Slice MakeBlockSlice(const std::shared_ptr<std::string> &block,
+                           size_t off,
+                           size_t len) {
+  auto *holder = new std::shared_ptr<std::string>(block);
+  grpc_slice s = grpc_slice_new_with_user_data(
+      const_cast<char *>(block->data()) + off,
+      len,
+      [](void *p) { delete static_cast<std::shared_ptr<std::string> *>(p); },
+      holder);
+  return grpc::Slice(s, grpc::Slice::STEAL_REF);
+}
+
 RaySyncer::RaySyncer(instrumented_io_context &io_context,
                      std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
                      const std::string &local_node_id,
                      size_t max_batch_size,
                      uint64_t max_batch_delay_ms,
-                     RpcCompletionCallback on_rpc_completion)
+                     RpcCompletionCallback on_rpc_completion,
+                     bool serialize_frames)
     : io_context_(io_context),
       local_node_id_(local_node_id),
       node_state_(std::make_unique<NodeState>()),
       periodical_runner_(std::move(periodical_runner)),
       max_batch_size_(max_batch_size),
       max_batch_delay_ms_(max_batch_delay_ms),
-      on_rpc_completion_(std::move(on_rpc_completion)) {
+      on_rpc_completion_(std::move(on_rpc_completion)),
+      serialize_frames_(serialize_frames) {
   stopped_ = std::make_shared<bool>(false);
 }
 
@@ -145,8 +185,16 @@ void RaySyncer::Connect(std::shared_ptr<RaySyncerBidiReactor> reactor) {
                            << NodeID::FromBinary(GetLocalNodeID()) << " to "
                            << NodeID::FromBinary(reactor->GetRemoteNodeID()) << " about "
                            << NodeID::FromBinary(message->node_id());
-            reactor->PushToSendingQueue(message);
+            reactor->PushToSendingQueue(std::make_shared<const CachedSyncMessage>(
+                CachedSyncMessage{message,
+                                  serialize_frames_ ? MakeSyncMessageFrame(*message)
+                                                    : grpc::Slice()}));
           }
+        }
+        if (serialize_frames_) {
+          // The initial view snapshot above covers everything before this point;
+          // future frames are consumed from the shared log.
+          reactor->SetOutboundLog(&outbound_log_, outbound_log_.entries.size());
         }
       }))
       .get();
@@ -217,8 +265,22 @@ void RaySyncer::BroadcastMessage(std::shared_ptr<const RaySyncMessage> message) 
         if (!node_state_->ConsumeSyncMessage(message)) {
           return;
         }
-        for (auto &reactor : sync_reactors_) {
-          reactor.second->PushToSendingQueue(message);
+        if (serialize_frames_) {
+          // Serialize once into the arena, append to the shared log; connections
+          // consume it by cursor. Busy connections pick it up on their next write
+          // completion, so the kick only matters for idle ones.
+          std::string frame;
+          AppendSyncMessageFrame(*message, &frame);
+          outbound_log_.Append(message, frame);
+          for (auto &reactor : sync_reactors_) {
+            reactor.second->KickSend();
+          }
+        } else {
+          auto cached = std::make_shared<const CachedSyncMessage>(
+              CachedSyncMessage{message, grpc::Slice()});
+          for (auto &reactor : sync_reactors_) {
+            reactor.second->PushToSendingQueue(cached);
+          }
         }
       },
       "RaySyncer.BroadcastMessage");
@@ -272,6 +334,41 @@ ServerBidiReactor *RaySyncerService::StartSync(grpc::CallbackServerContext *cont
   // Disconnect exiting connection if there is any.
   // This can happen when there is transient network error
   // and the client reconnects.
+  syncer_.Disconnect(reactor->GetRemoteNodeID());
+  syncer_.Connect(reactor);
+  return reactor.get();
+}
+
+grpc::ServerBidiReactor<grpc::ByteBuffer, grpc::ByteBuffer> *RaySyncerServiceRaw::
+    StartSync(grpc::CallbackServerContext *context) {
+  auto reactor = std::make_shared<RayServerBidiReactorRaw>(
+      context,
+      syncer_.GetIOContext(),
+      syncer_.GetLocalNodeID(),
+      /*message_processor=*/
+      [this](auto msg) mutable { syncer_.BroadcastMessage(msg); },
+      /*cleanup_cb=*/
+      [this](RaySyncerBidiReactor *bidi_reactor, bool reconnect) mutable {
+        RAY_CHECK(!reconnect);
+        const auto &node_id = bidi_reactor->GetRemoteNodeID();
+        auto iter = syncer_.sync_reactors_.find(node_id);
+        if (iter != syncer_.sync_reactors_.end()) {
+          if (iter->second.get() != bidi_reactor) {
+            return;
+          }
+          syncer_.sync_reactors_.erase(iter);
+        }
+        RAY_LOG(INFO).WithField(NodeID::FromBinary(node_id)) << "Connection is broken.";
+        syncer_.node_state_->RemoveNode(node_id);
+      },
+      /*auth_token=*/auth_token_,
+      /*auth_token_validator=*/auth_token_validator_,
+      /*max_batch_size=*/syncer_.max_batch_size_,
+      /*max_batch_delay_ms=*/syncer_.max_batch_delay_ms_);
+  reactor->SetSelfRef(reactor);
+  if (reactor->IsFinished()) {
+    return reactor.get();
+  }
   syncer_.Disconnect(reactor->GetRemoteNodeID());
   syncer_.Connect(reactor);
   return reactor.get();

@@ -79,10 +79,17 @@ class RaySyncerBidiReactor {
   /// information. Usually it'll happen when the message has the source node id
   /// as the target or the message is sent from the remote node.
   ///
-  /// \param message The message to be sent.
+  /// \param message The message (with optional cached wire frame) to be sent.
   ///
   /// \return true if push to queue successfully.
-  virtual bool PushToSendingQueue(std::shared_ptr<const RaySyncMessage> message) = 0;
+  virtual bool PushToSendingQueue(CachedSyncMessagePtr message) = 0;
+
+  /// Attach the shared outbound log (raw-wire fan-out); the reactor starts
+  /// consuming at `start_cursor`. No-op for typed reactors.
+  virtual void SetOutboundLog(const OutboundLog *log, size_t start_cursor) {}
+
+  /// Nudge the reactor to send pending data (e.g. the shared log advanced).
+  virtual void KickSend() {}
 
   /// Return the remote node id of this connection.
   const std::string &GetRemoteNodeID() const { return remote_node_id_; }

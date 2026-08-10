@@ -14,6 +14,7 @@
 
 #include "ray/gcs/gcs_server.h"
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -990,7 +991,21 @@ void GcsServer::InstallEventListeners() {
         // placement groups and the pending actors.
         auto node_id = NodeID::FromBinary(node->node_id());
         if (node->is_head_node()) {
-          syncer::SetResourceViewFanoutTarget(node->node_id());
+          syncer::AddResourceViewFanoutTarget(node->node_id());
+        } else {
+          // EXPERIMENT(SYNCHEAD5): the first N-1 workers to register join the head
+          // as view-holding deciders; actor leases are sharded across all N. The
+          // listener runs on the GCS main io_context, so plain statics are fine.
+          static const int synchead_extra_targets = []() {
+            const char *env = std::getenv("RAY_SYNCHEAD_N");
+            const int n = env == nullptr ? 0 : std::atoi(env);
+            return n > 1 ? n - 1 : 0;
+          }();
+          static int synchead_workers_added = 0;
+          if (synchead_workers_added < synchead_extra_targets) {
+            ++synchead_workers_added;
+            syncer::AddResourceViewFanoutTarget(node->node_id());
+          }
         }
         gcs_resource_manager_->OnNodeAdd(*node);
         gcs_placement_group_manager_->OnNodeAdd(node_id);

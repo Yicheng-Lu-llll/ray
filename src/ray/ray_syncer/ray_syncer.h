@@ -41,10 +41,14 @@ using ray::rpc::syncer::RaySyncMessage;
 using ray::rpc::syncer::RaySyncMessageBatch;
 using ray::rpc::syncer::ResourceViewSyncMessage;
 
-/// EXPERIMENT(SYNCHEAD): restrict RESOURCE_VIEW fan-out to a single node
-/// (the head raylet). Set once when the head node registers; empty = fan out
-/// to everyone (default, and always the case on raylets).
-void SetResourceViewFanoutTarget(const std::string &node_id);
+/// EXPERIMENT(SYNCHEAD): restrict RESOURCE_VIEW fan-out to the N designated
+/// view-holder raylets (the head plus the first N-1 workers to register).
+/// Empty = fan out to everyone (default, and always the case on raylets).
+void AddResourceViewFanoutTarget(const std::string &node_id);
+
+/// The designated view-holder raylets, in registration order ([0] = head when it
+/// has registered). Used by the GCS actor scheduler to shard lease forwarding.
+std::vector<std::string> GetResourceViewFanoutTargets();
 
 /// The interface for a reporter. Reporter is defined to be a local module which would
 /// like to let the other nodes know its state. For example, local cluster resource

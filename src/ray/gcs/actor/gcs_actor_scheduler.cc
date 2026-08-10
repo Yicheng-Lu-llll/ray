@@ -14,6 +14,7 @@
 
 #include "ray/gcs/actor/gcs_actor_scheduler.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -21,6 +22,7 @@
 
 #include "ray/asio/asio_util.h"
 #include "ray/common/ray_config.h"
+#include "ray/ray_syncer/ray_syncer.h"
 
 namespace ray {
 namespace gcs {
@@ -85,9 +87,42 @@ NodeID GcsActorScheduler::SelectForwardingNode(std::shared_ptr<GcsActor> actor) 
   // Select a node to lease worker for the actor.
   std::shared_ptr<const rpc::GcsNodeInfo> node;
 
+  const auto &lease_spec = actor->GetLeaseSpecification();
+
+  // EXPERIMENT(SYNCHEAD5): when N > 1 view-holding raylets are designated, shard
+  // actor leases across them instead of funneling everything to the owner's node.
+  // Same placement group -> same decider, so decision domains stay disjoint and a
+  // rejected lease is re-decided by the raylet whose view already reflects it.
+  {
+    const auto targets = syncer::GetResourceViewFanoutTargets();
+    if (targets.size() > 1) {
+      const auto bundle_id = lease_spec.PlacementGroupBundleId();
+      const std::string &shard_key = !bundle_id.first.IsNil()
+                                         ? bundle_id.first.Binary()
+                                         : actor->GetActorID().Binary();
+      const auto target_node_id =
+          NodeID::FromBinary(targets[std::hash<std::string>{}(shard_key) %
+                                     targets.size()]);
+      if (gcs_node_manager_.GetAliveNode(target_node_id).has_value()) {
+        // Scheduling runs on one io_context thread, so a plain static is fine.
+        // One line per placement group gives the shard-evenness evidence.
+        static absl::flat_hash_set<std::string> logged_shard_keys;
+        if (logged_shard_keys.insert(shard_key).second) {
+          if (!bundle_id.first.IsNil()) {
+            RAY_LOG(INFO) << "SYNCHEAD5 shard pg=" << bundle_id.first << " -> "
+                          << target_node_id;
+          } else {
+            RAY_LOG(INFO) << "SYNCHEAD5 shard actor=" << actor->GetActorID() << " -> "
+                          << target_node_id;
+          }
+        }
+        return target_node_id;
+      }
+    }
+  }
+
   // If an actor has resource requirements, we will try to schedule it on the same node as
   // the owner if possible.
-  const auto &lease_spec = actor->GetLeaseSpecification();
   if (!lease_spec.GetRequiredResources().IsEmpty()) {
     auto maybe_node = gcs_node_manager_.GetAliveNode(actor->GetOwnerNodeID());
     node = maybe_node.has_value() ? maybe_node.value()

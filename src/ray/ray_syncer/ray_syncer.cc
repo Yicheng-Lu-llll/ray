@@ -14,6 +14,7 @@
 
 #include "ray/ray_syncer/ray_syncer.h"
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <string>
@@ -31,22 +32,38 @@ namespace ray::syncer {
 
 namespace {
 absl::Mutex g_synchead_mu;
-std::string g_synchead_id;  // binary head-raylet node id; empty = allow all
+// Binary node ids of the raylets that receive RESOURCE_VIEW fan-out; empty = fan out
+// to everyone (default, and always the case on raylets). [0] is the head raylet.
+std::vector<std::string> g_synchead_targets;
 
 bool SyncheadAllows(const RaySyncMessage &msg, const std::string &remote_node_id) {
   if (msg.message_type() != MessageType::RESOURCE_VIEW) {
     return true;
   }
   absl::MutexLock lock(&g_synchead_mu);
-  return g_synchead_id.empty() || g_synchead_id == remote_node_id;
+  if (g_synchead_targets.empty()) {
+    return true;
+  }
+  return std::find(g_synchead_targets.begin(),
+                   g_synchead_targets.end(),
+                   remote_node_id) != g_synchead_targets.end();
 }
 }  // namespace
 
-void SetResourceViewFanoutTarget(const std::string &node_id) {
+void AddResourceViewFanoutTarget(const std::string &node_id) {
   absl::MutexLock lock(&g_synchead_mu);
-  g_synchead_id = node_id;
-  RAY_LOG(INFO) << "SYNCHEAD: RESOURCE_VIEW fan-out restricted to head raylet "
-                << NodeID::FromBinary(node_id);
+  if (std::find(g_synchead_targets.begin(), g_synchead_targets.end(), node_id) !=
+      g_synchead_targets.end()) {
+    return;
+  }
+  g_synchead_targets.push_back(node_id);
+  RAY_LOG(INFO) << "SYNCHEAD5: RESOURCE_VIEW fan-out target added "
+                << NodeID::FromBinary(node_id) << " n=" << g_synchead_targets.size();
+}
+
+std::vector<std::string> GetResourceViewFanoutTargets() {
+  absl::MutexLock lock(&g_synchead_mu);
+  return g_synchead_targets;
 }
 
 

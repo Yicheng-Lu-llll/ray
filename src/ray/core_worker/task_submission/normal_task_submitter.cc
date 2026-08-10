@@ -213,23 +213,23 @@ void NormalTaskSubmitter::CancelWorkerLeaseIfNeeded(const SchedulingKey &schedul
     RAY_LOG(DEBUG) << "Canceling lease request " << lease_id;
     raylet_client->CancelWorkerLease(
         lease_id,
-        [this, scheduling_key](const Status &status,
-                               const rpc::CancelWorkerLeaseReply &reply) {
-          absl::MutexLock lock(&mu_);
-          if (status.ok() && !reply.success()) {
-            // The cancellation request can fail if the raylet does not have
-            // the request queued. This can happen if: a) due to message
-            // reordering, the raylet has not yet received the worker lease
-            // request, b) we have already returned the worker lease
-            // request, or c) the current request is a retry and the server response to
-            // the initial request was lost after cancelling the lease. In case a), we
-            // should try the cancellation request again. In case b), the in-flight lease
-            // request should already have been removed from our local state, so we no
-            // longer need to cancel. In case c), the response for ReturnWorkerLease
-            // should have already been triggered and the pending lease request will be
-            // cleaned up.
-            CancelWorkerLeaseIfNeeded(scheduling_key);
-          }
+        [lease_id](const Status &status, const rpc::CancelWorkerLeaseReply & /*reply*/) {
+          // `success=false` means the raylet no longer has the request queued:
+          // the lease was already granted, spilled, or rejected (a terminal
+          // reply is in flight and will clear it from `pending_lease_requests`;
+          // a granted worker is returned via `ReturnWorkerLease` once the
+          // reply is processed), or the request itself has not reached the
+          // raylet yet due to reordering (it will be granted later and then
+          // returned, and any remaining pending requests are re-canceled the
+          // next time the task queue drains). Every case resolves through the
+          // lease request's own reply, so there is nothing to retry here.
+          // Retrying eagerly amplifies into a cancellation storm whenever the
+          // terminal reply is delayed (e.g. a backlogged owner event loop):
+          // each failed cancellation would re-cancel every pending request of
+          // the scheduling key once per RTT.
+          RAY_LOG(DEBUG) << "Lease cancellation found nothing to cancel for " << lease_id
+                         << ", status=" << status
+                         << "; waiting for the lease request's own reply";
         });
   }
 }

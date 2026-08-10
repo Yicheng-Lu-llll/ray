@@ -1157,7 +1157,7 @@ TEST_F(NormalTaskSubmitterTest, TestReuseWorkerLease) {
   ASSERT_TRUE(submitter.CheckNoSchedulingKeyEntriesPublic());
 }
 
-TEST_F(NormalTaskSubmitterTest, TestRetryLeaseCancellation) {
+TEST_F(NormalTaskSubmitterTest, TestNoRetryOnFailedLeaseCancellation) {
   auto submitter =
       CreateNormalTaskSubmitter(std::make_shared<StaticLeaseRequestRateLimiter>(1));
   TaskSpecification task1 = BuildEmptyTaskSpec();
@@ -1175,23 +1175,20 @@ TEST_F(NormalTaskSubmitterTest, TestRetryLeaseCancellation) {
   ASSERT_TRUE(worker_client->ReplyPushTask());
   // Task 2 finishes, Task 3 is scheduled on the same worker.
   ASSERT_TRUE(worker_client->ReplyPushTask());
-  // Task 3 finishes, the worker is returned.
+  // Task 3 finishes, the worker is returned and the second lease request is
+  // canceled.
   ASSERT_TRUE(worker_client->ReplyPushTask());
   ASSERT_EQ(raylet_client->num_workers_returned, 1);
+  ASSERT_EQ(raylet_client->num_leases_canceled, 1);
 
-  // Simulate the lease cancellation request failing because it arrives at the
-  // raylet before the last worker lease request has been received.
-  int i = 1;
-  for (; i <= 3; i++) {
-    ASSERT_EQ(raylet_client->num_leases_canceled, i);
-    ASSERT_TRUE(raylet_client->ReplyCancelWorkerLease(false));
-  }
-
-  // Simulate the lease cancellation request succeeding.
-  ASSERT_TRUE(raylet_client->ReplyCancelWorkerLease());
-  ASSERT_EQ(raylet_client->num_leases_canceled, i);
+  // The cancellation fails because the lease request is no longer queued at the
+  // raylet (e.g. its reply is already in flight). The owner must not re-send the
+  // cancellation; the pending request is resolved by its own reply below.
+  ASSERT_TRUE(raylet_client->ReplyCancelWorkerLease(false));
+  ASSERT_EQ(raylet_client->num_leases_canceled, 1);
   ASSERT_FALSE(raylet_client->ReplyCancelWorkerLease());
-  ASSERT_EQ(raylet_client->num_leases_canceled, i);
+
+  // The lease request's own terminal reply cleans up the owner's state.
   ASSERT_TRUE(raylet_client->GrantWorkerLease(
       "", 0, local_node_id, NodeID::Nil(), /*cancel=*/true));
   ASSERT_EQ(worker_client->callbacks.size(), 0);
@@ -1203,6 +1200,42 @@ TEST_F(NormalTaskSubmitterTest, TestRetryLeaseCancellation) {
 
   // Check that there are no entries left in the scheduling_key_entries_ hashmap. These
   // would otherwise cause a memory leak.
+  ASSERT_TRUE(submitter.CheckNoSchedulingKeyEntriesPublic());
+}
+
+TEST_F(NormalTaskSubmitterTest, TestFailedLeaseCancellationResolvedByGrant) {
+  // Same setup as above, but the raced lease request was already granted when the
+  // cancellation arrived: the owner receives the granted reply after the failed
+  // cancellation and returns the worker immediately since the task queue is empty.
+  auto submitter =
+      CreateNormalTaskSubmitter(std::make_shared<StaticLeaseRequestRateLimiter>(1));
+  TaskSpecification task1 = BuildEmptyTaskSpec();
+  TaskSpecification task2 = BuildEmptyTaskSpec();
+  TaskSpecification task3 = BuildEmptyTaskSpec();
+
+  submitter.SubmitTask(task1);
+  submitter.SubmitTask(task2);
+  submitter.SubmitTask(task3);
+
+  ASSERT_TRUE(raylet_client->GrantWorkerLease("localhost", 1000, local_node_id));
+  ASSERT_TRUE(worker_client->ReplyPushTask());
+  ASSERT_TRUE(worker_client->ReplyPushTask());
+  ASSERT_TRUE(worker_client->ReplyPushTask());
+  ASSERT_EQ(raylet_client->num_workers_returned, 1);
+  ASSERT_EQ(raylet_client->num_leases_canceled, 1);
+
+  ASSERT_TRUE(raylet_client->ReplyCancelWorkerLease(false));
+  ASSERT_EQ(raylet_client->num_leases_canceled, 1);
+  ASSERT_FALSE(raylet_client->ReplyCancelWorkerLease());
+
+  // The lease request's own terminal reply is a grant; the queue is empty so the
+  // worker is returned right away.
+  ASSERT_TRUE(raylet_client->GrantWorkerLease("localhost", 1001, local_node_id));
+  ASSERT_EQ(worker_client->callbacks.size(), 0);
+  ASSERT_EQ(raylet_client->num_workers_returned, 2);
+  ASSERT_EQ(raylet_client->num_workers_disconnected, 0);
+  ASSERT_EQ(task_manager->num_tasks_complete, 3);
+  ASSERT_EQ(task_manager->num_tasks_failed, 0);
   ASSERT_TRUE(submitter.CheckNoSchedulingKeyEntriesPublic());
 }
 

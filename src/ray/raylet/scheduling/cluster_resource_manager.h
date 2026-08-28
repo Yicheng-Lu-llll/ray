@@ -56,12 +56,39 @@ class ClusterResourceManager {
   /// Get the resource view of the cluster.
   const absl::flat_hash_map<scheduling::NodeID, Node> &GetResourceView() const;
 
+  /// What applying a resource view sync message changed in a node's stored view,
+  /// relative to the values stored before. Callers use this to decide which
+  /// scheduling queues (if any) need to be rescanned.
+  struct NodeViewChanges {
+    /// Inputs to feasibility ("could any node ever fit this request"): resource
+    /// totals or node labels changed. Only these changes can turn a lease that
+    /// was infeasible into a feasible one.
+    bool capacity_changed = false;
+    /// Inputs to availability ("does the node have room right now"): available
+    /// resources, object_pulls_queued, or draining state changed.
+    /// idle_duration_ms is deliberately excluded from both fields: it is
+    /// autoscaler reporting data, not an input to any scheduling decision, and
+    /// it differs on nearly every message because it is recomputed at
+    /// serialization time.
+    bool usage_changed = false;
+  };
+
   /// Update node resources. This happens when a node resource usage updated.
   ///
   /// \param node_id ID of the node which resources need to be updated.
   /// \param resource_view_sync_message The node resource usage data.
+  /// \param[out] changes If non-null, filled with what the message changed
+  /// relative to the previously stored view.
+  /// \return false if the node is unknown, in which case nothing is updated.
   bool UpdateNode(scheduling::NodeID node_id,
-                  const syncer::ResourceViewSyncMessage &resource_view_sync_message);
+                  const syncer::ResourceViewSyncMessage &resource_view_sync_message,
+                  NodeViewChanges *changes = nullptr);
+
+  /// Same as UpdateNode() but adds the node to the view first if it is unknown.
+  /// A newly added node is reported as both capacity_changed and usage_changed.
+  void AddOrUpdateNode(scheduling::NodeID node_id,
+                       const syncer::ResourceViewSyncMessage &resource_view_sync_message,
+                       NodeViewChanges *changes = nullptr);
 
   /// Remove node from the cluster data structure. This happens
   /// when a node fails or it is removed from the cluster.

@@ -79,7 +79,8 @@ void ClusterResourceManager::AddOrUpdateNode(scheduling::NodeID node_id,
 
 bool ClusterResourceManager::UpdateNode(
     scheduling::NodeID node_id,
-    const syncer::ResourceViewSyncMessage &resource_view_sync_message) {
+    const syncer::ResourceViewSyncMessage &resource_view_sync_message,
+    NodeViewChanges *changes) {
   if (!nodes_.contains(node_id)) {
     return false;
   }
@@ -93,6 +94,19 @@ bool ClusterResourceManager::UpdateNode(
       ResourceMapToNodeResources(resources_total, resources_available);
   NodeResources local_view;
   RAY_CHECK(GetNodeResources(node_id, &local_view));
+
+  if (changes != nullptr) {
+    changes->capacity_changed |=
+        !(local_view.total == node_resources.total) || local_view.labels != node_labels;
+    // Draining is one-way here: a message can start draining a node but never
+    // clears it (see the is_draining assignment below), so only the false ->
+    // true transition can be a change.
+    changes->usage_changed |=
+        !(local_view.available == node_resources.available) ||
+        local_view.object_pulls_queued !=
+            resource_view_sync_message.object_pulls_queued() ||
+        (!local_view.is_draining && resource_view_sync_message.is_draining());
+  }
 
   local_view.total = std::move(node_resources.total);
   local_view.available = std::move(node_resources.available);
@@ -114,6 +128,19 @@ bool ClusterResourceManager::UpdateNode(
   AddOrUpdateNode(node_id, local_view);
   received_node_resources_[node_id] = std::move(local_view);
   return true;
+}
+
+void ClusterResourceManager::AddOrUpdateNode(
+    scheduling::NodeID node_id,
+    const syncer::ResourceViewSyncMessage &resource_view_sync_message,
+    NodeViewChanges *changes) {
+  // Inserting an empty entry (a no-op if the node is already known) and then
+  // applying the message on top keeps the snapshot-to-view logic in one place
+  // and makes UpdateNode() report everything in a new node's first message as
+  // changed: every node has at least its node:<ip> resource, so its totals
+  // always differ from the empty entry.
+  nodes_.try_emplace(node_id, NodeResources());
+  RAY_CHECK(UpdateNode(node_id, resource_view_sync_message, changes));
 }
 
 bool ClusterResourceManager::RemoveNode(scheduling::NodeID node_id) {

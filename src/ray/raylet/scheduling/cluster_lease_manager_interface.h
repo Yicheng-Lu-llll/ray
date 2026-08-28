@@ -30,6 +30,12 @@ class ClusterLeaseManagerInterface {
   // Schedule and dispatch leases.
   virtual void ScheduleAndGrantLeases() = 0;
 
+  /// Same as ScheduleAndGrantLeases() but skips rescanning the infeasible
+  /// queue. Sufficient when only resource availability changed: availability
+  /// can never turn an infeasible lease feasible, because feasibility depends
+  /// only on node totals, labels and cluster membership.
+  virtual void ScheduleAndGrantPendingLeases() = 0;
+
   /// Populate the relevant parts of the heartbeat table. This is intended for
   /// sending raylet <-> gcs heartbeats. In particular, this should fill in
   /// resource_load and resource_load_by_shape.

@@ -1610,6 +1610,48 @@ TEST_F(ClusterLeaseManagerTest, TaskCancelInfeasibleTask) {
   AssertNoLeaks();
 }
 
+TEST_F(ClusterLeaseManagerTest, SchedulePendingLeasesSkipsInfeasibleQueue) {
+  /* ScheduleAndGrantPendingLeases must not rescan the infeasible queue, while
+     ScheduleAndGrantLeases must. */
+  std::shared_ptr<MockWorker> worker =
+      std::make_shared<MockWorker>(WorkerID::FromRandom(), 1234, clock_);
+  pool_.PushWorker(std::static_pointer_cast<WorkerInterface>(worker));
+
+  RayLease lease = CreateLease({{ray::kCPU_ResourceLabel, 12}});
+  rpc::RequestWorkerLeaseReply reply;
+
+  bool callback_called = false;
+  bool *callback_called_ptr = &callback_called;
+  auto callback = [callback_called_ptr](
+                      Status, std::function<void()>, std::function<void()>) {
+    *callback_called_ptr = true;
+  };
+
+  lease_manager_.QueueAndScheduleLease(
+      lease,
+      false,
+      false,
+      std::vector<internal::ReplyCallback>{internal::ReplyCallback(callback, &reply)});
+  pool_.TriggerCallbacks();
+  ASSERT_EQ(lease_manager_.GetInfeasibleQueueSize(), 1);
+
+  // The lease becomes feasible, but only entries that rescan the infeasible
+  // queue may notice.
+  auto remote_node_id = NodeID::FromRandom();
+  AddNode(remote_node_id, 12);
+
+  lease_manager_.ScheduleAndGrantPendingLeases();
+  pool_.TriggerCallbacks();
+  ASSERT_EQ(lease_manager_.GetInfeasibleQueueSize(), 1);
+  ASSERT_FALSE(callback_called);
+
+  lease_manager_.ScheduleAndGrantLeases();
+  pool_.TriggerCallbacks();
+  ASSERT_EQ(lease_manager_.GetInfeasibleQueueSize(), 0);
+  ASSERT_TRUE(callback_called);
+  AssertNoLeaks();
+}
+
 TEST_F(ClusterLeaseManagerTest, TaskCancelWithResourceShape) {
   // lease1 doesn't match the resource shape so shouldn't be cancelled
   // lease2 matches the resource shape and should be cancelled

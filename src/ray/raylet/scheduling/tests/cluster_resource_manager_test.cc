@@ -87,6 +87,95 @@ TEST_F(ClusterResourceManagerTest, UpdateNode) {
   ASSERT_TRUE(node_resources.last_resource_update_time.has_value());
 }
 
+TEST_F(ClusterResourceManagerTest, UpdateNodeReportsViewChanges) {
+  syncer::ResourceViewSyncMessage payload;
+  payload.mutable_resources_total()->insert({"CPU", 10.0});
+  payload.mutable_resources_available()->insert({"CPU", 5.0});
+  payload.mutable_labels()->insert({"zone", "a"});
+
+  ClusterResourceManager::NodeViewChanges changes;
+  ASSERT_TRUE(manager->UpdateNode(node0, payload, &changes));
+  ASSERT_TRUE(changes.capacity_changed);
+  ASSERT_TRUE(changes.usage_changed);
+
+  // Re-applying a snapshot identical to the stored view changes nothing, even
+  // if its idle duration differs: idle time is not a scheduling input and it
+  // differs on nearly every message.
+  payload.set_idle_duration_ms(42);
+  changes = {};
+  ASSERT_TRUE(manager->UpdateNode(node0, payload, &changes));
+  ASSERT_FALSE(changes.capacity_changed);
+  ASSERT_FALSE(changes.usage_changed);
+
+  // Only availability changed.
+  (*payload.mutable_resources_available())["CPU"] = 3.0;
+  changes = {};
+  ASSERT_TRUE(manager->UpdateNode(node0, payload, &changes));
+  ASSERT_FALSE(changes.capacity_changed);
+  ASSERT_TRUE(changes.usage_changed);
+
+  // A new resource kind in the totals is a capacity change.
+  (*payload.mutable_resources_total())["FOO"] = 1.0;
+  (*payload.mutable_resources_available())["FOO"] = 1.0;
+  changes = {};
+  ASSERT_TRUE(manager->UpdateNode(node0, payload, &changes));
+  ASSERT_TRUE(changes.capacity_changed);
+  ASSERT_TRUE(changes.usage_changed);
+
+  // A label change is a capacity change: labels gate feasibility through
+  // label selectors.
+  (*payload.mutable_labels())["zone"] = "b";
+  changes = {};
+  ASSERT_TRUE(manager->UpdateNode(node0, payload, &changes));
+  ASSERT_TRUE(changes.capacity_changed);
+  ASSERT_FALSE(changes.usage_changed);
+
+  // Starting to drain is a usage change.
+  payload.set_is_draining(true);
+  payload.set_draining_deadline_timestamp_ms(123);
+  changes = {};
+  ASSERT_TRUE(manager->UpdateNode(node0, payload, &changes));
+  ASSERT_FALSE(changes.capacity_changed);
+  ASSERT_TRUE(changes.usage_changed);
+
+  // Draining is one-way: a message cannot clear it, so this is not a change.
+  payload.set_is_draining(false);
+  changes = {};
+  ASSERT_TRUE(manager->UpdateNode(node0, payload, &changes));
+  ASSERT_FALSE(changes.capacity_changed);
+  ASSERT_FALSE(changes.usage_changed);
+  ASSERT_TRUE(manager->GetNodeResources(node0).is_draining);
+
+  // object_pulls_queued is a usage change.
+  payload.set_object_pulls_queued(true);
+  changes = {};
+  ASSERT_TRUE(manager->UpdateNode(node0, payload, &changes));
+  ASSERT_FALSE(changes.capacity_changed);
+  ASSERT_TRUE(changes.usage_changed);
+}
+
+TEST_F(ClusterResourceManagerTest, AddOrUpdateNodeFromSyncMessage) {
+  scheduling::NodeID new_node(42);
+  syncer::ResourceViewSyncMessage payload;
+  payload.mutable_resources_total()->insert({"CPU", 4.0});
+  payload.mutable_resources_available()->insert({"CPU", 4.0});
+
+  // UpdateNode refuses unknown nodes; AddOrUpdateNode adds them and reports
+  // the first snapshot as changing both capacity and usage.
+  ASSERT_FALSE(manager->UpdateNode(new_node, payload));
+  ClusterResourceManager::NodeViewChanges changes;
+  manager->AddOrUpdateNode(new_node, payload, &changes);
+  ASSERT_TRUE(changes.capacity_changed);
+  ASSERT_TRUE(changes.usage_changed);
+  ASSERT_EQ(manager->GetNodeResources(new_node).total.Get(ResourceID::CPU()), 4);
+
+  // On a known node it behaves exactly like UpdateNode.
+  changes = {};
+  manager->AddOrUpdateNode(new_node, payload, &changes);
+  ASSERT_FALSE(changes.capacity_changed);
+  ASSERT_FALSE(changes.usage_changed);
+}
+
 TEST_F(ClusterResourceManagerTest, DebugStringTest) {
   // Test max_num_nodes_to_include parameter is working.
   ASSERT_EQ(std::vector<std::string>(absl::StrSplit(manager->DebugString(), "node id:"))

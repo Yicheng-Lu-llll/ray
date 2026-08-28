@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <queue>
 #include <string>
@@ -810,6 +811,89 @@ TEST_F(NodeManagerTest, TestConsumeSyncMessage) {
             kTestTotalCpuResource);
   EXPECT_EQ(node_resources.available.Get(scheduling::ResourceID("CPU")).Double(),
             kTestTotalCpuResource);
+}
+
+TEST_F(NodeManagerTest, TestResourceViewSyncMessageGatesLeaseRescan) {
+  // A parked infeasible lease must be revisited only when some node's capacity
+  // (totals / labels / membership) changes; messages that only change
+  // availability must not trigger the infeasible queue rescan. The rescan runs
+  // deferred on the event loop so that a burst of messages is paid for with a
+  // single rescan.
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, IsNodeAlive(_))
+      .WillRepeatedly(Return(true));
+  auto remote_x = NodeID::FromRandom();
+  auto remote_y = NodeID::FromRandom();
+  rpc::GcsNodeAddressAndLiveness remote_node_info;
+  remote_node_info.set_node_manager_address("1.2.3.4");
+  remote_node_info.set_node_manager_port(1234);
+  EXPECT_CALL(*mock_gcs_client_->mock_node_accessor, GetNodeAddressAndLiveness(_, _))
+      .WillRepeatedly(Return(remote_node_info));
+
+  auto consume = [&](const NodeID &node_id,
+                     const std::map<std::string, double> &total,
+                     const std::map<std::string, double> &available) {
+    syncer::ResourceViewSyncMessage payload;
+    for (const auto &[name, value] : total) {
+      (*payload.mutable_resources_total())[name] = value;
+    }
+    for (const auto &[name, value] : available) {
+      (*payload.mutable_resources_available())[name] = value;
+    }
+    std::string serialized;
+    ASSERT_TRUE(payload.SerializeToString(&serialized));
+    syncer::RaySyncMessage msg;
+    msg.set_node_id(node_id.Binary());
+    msg.set_message_type(syncer::MessageType::RESOURCE_VIEW);
+    msg.set_sync_message(serialized);
+    node_manager_->ConsumeSyncMessage(std::make_shared<syncer::RaySyncMessage>(msg));
+  };
+  auto drain_io = [&]() {
+    io_service_.restart();
+    io_service_.poll();
+  };
+
+  // Park a lease that no node can fit: the resource kind FOO does not exist.
+  auto lease_spec = BuildLeaseSpec({{"FOO", 1}});
+  rpc::RequestWorkerLeaseRequest request;
+  request.mutable_lease_spec()->CopyFrom(lease_spec.GetMessage());
+  rpc::RequestWorkerLeaseReply reply;
+  bool callback_called = false;
+  node_manager_->HandleRequestWorkerLease(
+      request,
+      &reply,
+      [&callback_called](Status s, std::function<void()>, std::function<void()>) {
+        callback_called = true;
+      });
+  ASSERT_EQ(cluster_lease_manager_->GetInfeasibleQueueSize(), 1);
+
+  // Two remote nodes join (capacity changes): the deferred rescan runs but FOO
+  // still exists nowhere, so the lease stays parked.
+  consume(remote_x, {{"CPU", 4}}, {{"CPU", 4}});
+  consume(remote_y, {{"CPU", 4}}, {{"CPU", 4}});
+  drain_io();
+  ASSERT_EQ(cluster_lease_manager_->GetInfeasibleQueueSize(), 1);
+  ASSERT_FALSE(callback_called);
+
+  // Out of band, node Y gains the FOO resource. The lease is now feasible, but
+  // nothing has kicked scheduling yet.
+  cluster_resource_scheduler_->GetClusterResourceManager().UpdateResourceCapacity(
+      scheduling::NodeID(remote_y.Binary()), scheduling::ResourceID("FOO"), 1);
+
+  // A message that only changes node X's availability must not rescan the
+  // infeasible queue.
+  consume(remote_x, {{"CPU", 4}}, {{"CPU", 2}});
+  drain_io();
+  ASSERT_EQ(cluster_lease_manager_->GetInfeasibleQueueSize(), 1);
+  ASSERT_FALSE(callback_called);
+
+  // A capacity change on any node revisits the infeasible queue. The rescan is
+  // deferred to the event loop, not run inline with the message.
+  consume(remote_x, {{"CPU", 4}, {"BAR", 1}}, {{"CPU", 2}, {"BAR", 1}});
+  ASSERT_EQ(cluster_lease_manager_->GetInfeasibleQueueSize(), 1);
+  drain_io();
+  ASSERT_EQ(cluster_lease_manager_->GetInfeasibleQueueSize(), 0);
+  // The lease was spilled back to node Y, which replies to the owner.
+  ASSERT_TRUE(callback_called);
 }
 
 TEST_F(NodeManagerTest, TestResizeLocalResourceInstancesSuccessful) {

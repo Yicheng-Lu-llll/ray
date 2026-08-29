@@ -406,6 +406,17 @@ scheduling::NodeID ClusterResourceScheduler::GetBestSchedulableNode(
     return scheduling::NodeID::Nil();
   }
 
+  // A placement-group lease whose bundle nodes all look busy: redirecting to a
+  // node we already believe is full can only produce a guaranteed reject (the
+  // spillback retry is grant-or-reject, so it cannot wait at the target), and
+  // the reply does not refresh this view, so the lease would bounce until the
+  // view changes anyway. Keep it in the schedule queue instead (is_infeasible
+  // stays false): the next resource-view change — a bundle node's totals
+  // arriving, or capacity freed on one of them — reschedules it.
+  if (IsAffinityWithBundleSchedule(lease_spec.GetMessage().scheduling_strategy())) {
+    return scheduling::NodeID::Nil();
+  }
+
   return highest_priority_unavailable_node;
 }
 

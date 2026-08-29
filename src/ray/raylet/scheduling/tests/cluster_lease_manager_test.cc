@@ -15,6 +15,7 @@
 
 // clang-format off
 #include "ray/raylet/scheduling/cluster_lease_manager.h"
+#include "ray/common/bundle_spec.h"
 
 #include <memory>
 #include <string>
@@ -472,6 +473,15 @@ class ClusterLeaseManagerTest : public ::testing::Test {
   }
 
   void Shutdown() {}
+
+  void AddNodeWithResources(const NodeID &id,
+                            const absl::flat_hash_map<std::string, double> &total,
+                            const absl::flat_hash_map<std::string, double> &available) {
+    scheduler_->GetClusterResourceManager().AddOrUpdateNode(
+        scheduling::NodeID(id.Binary()), total, available);
+    rpc::GcsNodeAddressAndLiveness info;
+    node_info_[id] = info;
+  }
 
   void AddNode(const NodeID &id,
                double num_cpus,
@@ -3467,6 +3477,112 @@ TEST_F(ClusterLeaseManagerTestWithoutCPUsAtHead, OneCpuInfeasibleLease) {
     }
     ASSERT_TRUE(one_cpu_found);
   }
+}
+
+TEST_F(ClusterLeaseManagerTest, PgLeaseParksWhenBundleNodesLookBusy) {
+  // A placement-group lease whose bundle nodes all look busy in the view
+  // stays in the schedule queue -- no spillback to a node known to be full,
+  // and no misclassification as infeasible -- and is rescheduled when the
+  // view shows capacity again.
+  auto pg = PlacementGroupID::Of(JobID::FromInt(9));
+  NodeID bundle_node = NodeID::FromRandom();
+  auto to_map = [](const std::unordered_map<std::string, double> &m) {
+    return absl::flat_hash_map<std::string, double>(m.begin(), m.end());
+  };
+  auto zeroed = [](absl::flat_hash_map<std::string, double> m) {
+    for (auto &entry : m) {
+      entry.second = 0.0;
+    }
+    return m;
+  };
+  auto total = to_map(AddPlacementGroupConstraint({{"CPU", 2.0}}, pg, 0));
+  AddNodeWithResources(bundle_node, total, zeroed(total));
+
+  rpc::SchedulingStrategy strategy;
+  strategy.mutable_placement_group_scheduling_strategy()->set_placement_group_id(
+      pg.Binary());
+  strategy.mutable_placement_group_scheduling_strategy()
+      ->set_placement_group_bundle_index(-1);
+  RayLease lease = CreateLease(
+      AddPlacementGroupConstraint({{"CPU", 1.0}}, pg, -1), 0, {}, nullptr, strategy);
+  rpc::RequestWorkerLeaseReply reply;
+  bool callback_occurred = false;
+  auto callback = [&callback_occurred](
+                      Status, std::function<void()>, std::function<void()>) {
+    callback_occurred = true;
+  };
+  lease_manager_.QueueAndScheduleLease(
+      lease,
+      false,
+      false,
+      std::vector<internal::ReplyCallback>{internal::ReplyCallback(callback, &reply)});
+  pool_.TriggerCallbacks();
+
+  // Parked: no reply yet, waiting in the schedule queue, not infeasible.
+  ASSERT_FALSE(callback_occurred);
+  ASSERT_EQ(lease_manager_.GetPendingQueueSize(), 1);
+  ASSERT_EQ(lease_manager_.GetInfeasibleQueueSize(), 0);
+
+  // Capacity frees up on the bundle node: the next scheduling round sends the
+  // lease there.
+  AddNodeWithResources(bundle_node, total, total);
+  lease_manager_.ScheduleAndGrantLeases();
+  pool_.TriggerCallbacks();
+  ASSERT_TRUE(callback_occurred);
+  ASSERT_EQ(reply.retry_at_raylet_address().node_id(), bundle_node.Binary());
+  ASSERT_EQ(lease_manager_.GetPendingQueueSize(), 0);
+}
+
+TEST_F(ClusterLeaseManagerTest, PgLeaseParksUntilHiddenBundleNodeAppears) {
+  // The known bundle node is truly full, and the bundle node with the free
+  // slot has not reached this raylet's view yet: the lease parks, and the
+  // arrival of the hidden node's totals (a capacity change) reschedules it
+  // straight to that node.
+  auto pg = PlacementGroupID::Of(JobID::FromInt(10));
+  NodeID known_full = NodeID::FromRandom();
+  auto to_map = [](const std::unordered_map<std::string, double> &m) {
+    return absl::flat_hash_map<std::string, double>(m.begin(), m.end());
+  };
+  auto zeroed = [](absl::flat_hash_map<std::string, double> m) {
+    for (auto &entry : m) {
+      entry.second = 0.0;
+    }
+    return m;
+  };
+  auto total0 = to_map(AddPlacementGroupConstraint({{"CPU", 2.0}}, pg, 0));
+  AddNodeWithResources(known_full, total0, zeroed(total0));
+
+  rpc::SchedulingStrategy strategy;
+  strategy.mutable_placement_group_scheduling_strategy()->set_placement_group_id(
+      pg.Binary());
+  strategy.mutable_placement_group_scheduling_strategy()
+      ->set_placement_group_bundle_index(-1);
+  RayLease lease = CreateLease(
+      AddPlacementGroupConstraint({{"CPU", 1.0}}, pg, -1), 0, {}, nullptr, strategy);
+  rpc::RequestWorkerLeaseReply reply;
+  bool callback_occurred = false;
+  auto callback = [&callback_occurred](
+                      Status, std::function<void()>, std::function<void()>) {
+    callback_occurred = true;
+  };
+  lease_manager_.QueueAndScheduleLease(
+      lease,
+      false,
+      false,
+      std::vector<internal::ReplyCallback>{internal::ReplyCallback(callback, &reply)});
+  pool_.TriggerCallbacks();
+  ASSERT_FALSE(callback_occurred);
+  ASSERT_EQ(lease_manager_.GetPendingQueueSize(), 1);
+  ASSERT_EQ(lease_manager_.GetInfeasibleQueueSize(), 0);
+
+  // The hidden bundle node's totals arrive with free capacity.
+  NodeID hidden = NodeID::FromRandom();
+  auto total1 = to_map(AddPlacementGroupConstraint({{"CPU", 2.0}}, pg, 1));
+  AddNodeWithResources(hidden, total1, total1);
+  lease_manager_.ScheduleAndGrantLeases();
+  pool_.TriggerCallbacks();
+  ASSERT_TRUE(callback_occurred);
+  ASSERT_EQ(reply.retry_at_raylet_address().node_id(), hidden.Binary());
 }
 
 }  // namespace raylet

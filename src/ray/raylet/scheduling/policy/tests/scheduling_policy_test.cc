@@ -195,6 +195,32 @@ TEST_F(SchedulingPolicyTest, SpreadPolicyTest) {
   ASSERT_TRUE(to_schedule.IsNil());
 }
 
+TEST_F(SchedulingPolicyTest, SpreadPolicyCandidateNodesRestrictTheScan) {
+  // With candidate_nodes_ set, spread round-robins only over the candidate
+  // set; the availability-then-feasibility ladder within the set is unchanged.
+  ResourceRequest req = ResourceMapToResourceRequest({{"CPU", 1}}, false);
+  nodes.emplace(local_node, CreateNodeResources(20, 20, 0, 0, 0, 0));
+  nodes.emplace(remote_node, CreateNodeResources(20, 20, 0, 0, 0, 0));
+  nodes.emplace(remote_node_2, CreateNodeResources(20, 20, 0, 0, 0, 0));
+  auto cluster_resource_manager = MockClusterResourceManager(nodes);
+  raylet_scheduling_policy::CompositeSchedulingPolicy scheduling_policy(
+      local_node, *cluster_resource_manager, [](auto) { return true; });
+
+  auto restricted = SchedulingOptions::Spread(false, false);
+  restricted.candidate_nodes_ = std::make_shared<const std::vector<scheduling::NodeID>>(
+      std::vector<scheduling::NodeID>{remote_node_2});
+  for (int i = 0; i < 3; i++) {
+    ASSERT_EQ(scheduling_policy.Schedule(req, restricted), remote_node_2);
+  }
+
+  // An empty candidate set schedules nowhere instead of falling back to the
+  // whole cluster.
+  auto empty = SchedulingOptions::Spread(false, false);
+  empty.candidate_nodes_ =
+      std::make_shared<const std::vector<scheduling::NodeID>>();
+  ASSERT_TRUE(scheduling_policy.Schedule(req, empty).IsNil());
+}
+
 TEST_F(SchedulingPolicyTest, RandomPolicyTest) {
   ResourceRequest req = ResourceMapToResourceRequest({{"CPU", 1}}, false);
 

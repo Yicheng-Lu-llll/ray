@@ -151,19 +151,7 @@ scheduling::NodeID HybridSchedulingPolicy::ScheduleImpl(
       }
     }
   };
-  if (candidate_nodes != nullptr) {
-    for (const auto &node_id : *candidate_nodes) {
-      auto it = nodes_.find(node_id);
-      if (it == nodes_.end()) {
-        continue;
-      }
-      consider_node(it->first, it->second);
-    }
-  } else {
-    for (const auto &pair : nodes_) {
-      consider_node(pair.first, pair.second);
-    }
-  }
+  ForEachSchedulableNode(nodes_, candidate_nodes, consider_node);
 
   size_t num_candidate_nodes =
       std::max<int32_t>(schedule_top_k_absolute,

@@ -29,7 +29,8 @@ scheduling::NodeID NodeLabelSchedulingPolicy::Schedule(
   const auto &node_label_scheduling_strategy =
       scheduling_strategy.node_label_scheduling_strategy();
   // 1. Select feasible nodes
-  auto hard_match_nodes = SelectFeasibleNodes(resource_request);
+  auto hard_match_nodes =
+      SelectFeasibleNodes(resource_request, options.candidate_nodes_.get());
   if (hard_match_nodes.empty()) {
     return scheduling::NodeID::Nil();
   }
@@ -163,16 +164,16 @@ bool NodeLabelSchedulingPolicy::IsNodeLabelInValues(
 
 absl::flat_hash_map<scheduling::NodeID, const Node *>
 NodeLabelSchedulingPolicy::SelectFeasibleNodes(
-    const ResourceRequest &resource_request) const {
-  absl::flat_hash_map<scheduling::NodeID, const Node *> candidate_nodes;
-  for (const auto &pair : nodes_) {
-    const auto &node_id = pair.first;
-    const auto &node_resources = pair.second.GetLocalView();
-    if (is_node_alive_(node_id) && node_resources.IsFeasible(resource_request)) {
-      candidate_nodes.emplace(node_id, &pair.second);
-    }
-  }
-  return candidate_nodes;
+    const ResourceRequest &resource_request,
+    const std::vector<scheduling::NodeID> *candidate_nodes) const {
+  absl::flat_hash_map<scheduling::NodeID, const Node *> feasible_nodes;
+  ForEachSchedulableNode(
+      nodes_, candidate_nodes, [&](const scheduling::NodeID &node_id, const Node &node) {
+        if (is_node_alive_(node_id) && node.GetLocalView().IsFeasible(resource_request)) {
+          feasible_nodes.emplace(node_id, &node);
+        }
+      });
+  return feasible_nodes;
 }
 
 absl::flat_hash_map<scheduling::NodeID, const Node *>

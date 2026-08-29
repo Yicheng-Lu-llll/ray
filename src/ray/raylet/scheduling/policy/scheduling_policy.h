@@ -130,5 +130,29 @@ class ISchedulingPolicy {
   virtual scheduling::NodeID Schedule(const ResourceRequest &resource_request,
                                       SchedulingOptions options) = 0;
 };
+
+/// Iterate the nodes a scanning policy may consider: every node in `nodes`,
+/// or only `candidate_nodes` when the caller restricted the domain (e.g. a
+/// placement-group lease restricted to its bundle nodes, from
+/// `SchedulingOptions::candidate_nodes_`). Candidates missing from `nodes`
+/// are skipped. `fn` is called as fn(node_id, node).
+template <typename Fn>
+void ForEachSchedulableNode(const absl::flat_hash_map<scheduling::NodeID, Node> &nodes,
+                            const std::vector<scheduling::NodeID> *candidate_nodes,
+                            Fn &&fn) {
+  if (candidate_nodes != nullptr) {
+    for (const auto &node_id : *candidate_nodes) {
+      auto it = nodes.find(node_id);
+      if (it == nodes.end()) {
+        continue;
+      }
+      fn(it->first, it->second);
+    }
+  } else {
+    for (const auto &pair : nodes) {
+      fn(pair.first, pair.second);
+    }
+  }
+}
 }  // namespace raylet_scheduling_policy
 }  // namespace ray

@@ -29,8 +29,14 @@ scheduling::NodeID SpreadSchedulingPolicy::Schedule(
       << "SpreadPolicy policy requires spread_threshold = 0 and type = SPREAD";
   std::vector<scheduling::NodeID> round;
   round.reserve(nodes_.size());
-  for (const auto &pair : nodes_) {
-    round.emplace_back(pair.first);
+  ForEachSchedulableNode(
+      nodes_,
+      options.candidate_nodes_.get(),
+      [&round](const scheduling::NodeID &node_id, const Node &) {
+        round.emplace_back(node_id);
+      });
+  if (round.empty()) {
+    return scheduling::NodeID::Nil();
   }
   std::sort(round.begin(), round.end());
 

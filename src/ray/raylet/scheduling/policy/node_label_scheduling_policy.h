@@ -50,7 +50,8 @@ class NodeLabelSchedulingPolicy : public ISchedulingPolicy {
       const ResourceRequest &resource_request) const;
 
   absl::flat_hash_map<scheduling::NodeID, const Node *> SelectFeasibleNodes(
-      const ResourceRequest &resource_request) const;
+      const ResourceRequest &resource_request,
+      const std::vector<scheduling::NodeID> *candidate_nodes) const;
 
   absl::flat_hash_map<scheduling::NodeID, const Node *>
   FilterNodesByLabelMatchExpressions(

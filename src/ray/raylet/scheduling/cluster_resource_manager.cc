@@ -18,15 +18,19 @@
 #include <utility>
 #include <vector>
 
+#include "ray/common/bundle_spec.h"
 #include "ray/common/grpc_util.h"
 #include "ray/common/ray_config.h"
+#include "ray/common/scheduling/placement_group_util.h"
 #include "ray/raylet/metrics.h"
 
 namespace ray {
 
 ClusterResourceManager::ClusterResourceManager(
-    std::shared_ptr<PeriodicalRunnerInterface> periodical_runner)
-    : periodical_runner_(std::move(periodical_runner)),
+    std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
+    bool derive_bundle_index_from_totals)
+    : derive_bundle_index_from_totals_(derive_bundle_index_from_totals),
+      periodical_runner_(std::move(periodical_runner)),
       local_resource_view_node_count_gauge_(
           raylet::GetLocalResourceViewNodeCountGaugeMetric()) {
   if (periodical_runner_ == nullptr) {
@@ -71,9 +75,50 @@ void ClusterResourceManager::AddOrUpdateNode(scheduling::NodeID node_id,
   if (it == nodes_.end()) {
     // This node is new, so add it to the map.
     nodes_.emplace(node_id, node_resources);
+    RefreshBundleLocationIndex(node_id);
   } else {
+    const bool totals_changed =
+        derive_bundle_index_from_totals_ &&
+        !(it->second.GetLocalView().total == node_resources.total);
     // This node exists, so update its resources.
     it->second = Node(node_resources);
+    if (totals_changed) {
+      RefreshBundleLocationIndex(node_id);
+    }
+  }
+}
+
+void ClusterResourceManager::RefreshBundleLocationIndex(scheduling::NodeID node_id) {
+  if (!derive_bundle_index_from_totals_) {
+    return;
+  }
+  // Scheduling ids interned from integers (tests) are not valid NodeID binaries.
+  if (node_id.Binary().size() != NodeID::Size()) {
+    return;
+  }
+  const NodeID raylet_node_id = NodeID::FromBinary(node_id.Binary());
+  bundle_location_index_.Erase(raylet_node_id);
+  auto it = nodes_.find(node_id);
+  if (it == nodes_.end()) {
+    return;
+  }
+  // Every committed bundle puts an indexed bundle_group_<idx>_<pg> resource in
+  // the node's totals, so that one resource is a canonical marker per bundle.
+  static const std::string kBundleIndexedPrefix =
+      std::string(kBundle_ResourceLabel) + kGroupKeyword;
+  for (const auto &resource_id : it->second.GetLocalView().total.ExplicitResourceIds()) {
+    const std::string name = resource_id.Binary();
+    if (name.rfind(kBundleIndexedPrefix, 0) != 0) {
+      continue;
+    }
+    auto data = ParsePgFormattedResource(
+        name, /*for_wildcard_resource=*/false, /*for_indexed_resource=*/true);
+    if (!data) {
+      continue;
+    }
+    bundle_location_index_.AddOrUpdateBundleLocation(
+        BundleID(PlacementGroupID::FromHex(data->group_id), data->bundle_index),
+        raylet_node_id);
   }
 }
 
@@ -136,6 +181,10 @@ void ClusterResourceManager::AddOrUpdateNode(
 }
 
 bool ClusterResourceManager::RemoveNode(scheduling::NodeID node_id) {
+  if (derive_bundle_index_from_totals_ &&
+      node_id.Binary().size() == NodeID::Size()) {
+    bundle_location_index_.Erase(NodeID::FromBinary(node_id.Binary()));
+  }
   received_node_resources_.erase(node_id);
   return nodes_.erase(node_id) != 0;
 }
@@ -203,6 +252,7 @@ void ClusterResourceManager::UpdateResourceCapacity(scheduling::NodeID node_id,
   }
   local_view->total.Set(resource_id, total);
   local_view->available.Set(resource_id, available);
+  RefreshBundleLocationIndex(node_id);
 }
 
 bool ClusterResourceManager::DeleteResources(
@@ -217,6 +267,7 @@ bool ClusterResourceManager::DeleteResources(
     local_view->total.Set(resource_id, 0);
     local_view->available.Set(resource_id, 0);
   }
+  RefreshBundleLocationIndex(node_id);
   return true;
 }
 

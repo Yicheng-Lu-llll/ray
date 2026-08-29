@@ -87,6 +87,53 @@ TEST_F(ClusterResourceManagerTest, UpdateNode) {
   ASSERT_TRUE(node_resources.last_resource_update_time.has_value());
 }
 
+TEST_F(ClusterResourceManagerTest, DeriveBundleLocationIndexFromTotals) {
+  static instrumented_io_context io_context;
+  auto derive_manager = std::make_unique<ClusterResourceManager>(
+      PeriodicalRunner::Create(io_context), /*derive_bundle_index_from_totals=*/true);
+  auto pg = PlacementGroupID::Of(JobID::FromInt(7));
+  scheduling::NodeID node(NodeID::FromRandom().Binary());
+  const BundleID bundle(pg, 0);
+
+  auto bundle_total =
+      AddPlacementGroupConstraint({{"CPU", 4.0}}, pg, /*bundle_index=*/0);
+  absl::flat_hash_map<std::string, double> total(bundle_total.begin(),
+                                                 bundle_total.end());
+
+  auto bundle_in_index = [&](ClusterResourceManager &m) {
+    auto locs = m.GetBundleLocationIndex().GetBundleLocations(pg);
+    return locs.has_value() && (*locs.value()).count(bundle) == 1;
+  };
+  auto make_msg = [](const absl::flat_hash_map<std::string, double> &resources) {
+    syncer::ResourceViewSyncMessage msg;
+    for (const auto &[name, value] : resources) {
+      (*msg.mutable_resources_total())[name] = value;
+      (*msg.mutable_resources_available())[name] = value;
+    }
+    return msg;
+  };
+
+  // Committed-bundle resources appearing in a node's totals populate the index.
+  derive_manager->AddOrUpdateNode(node, make_msg(total));
+  ASSERT_TRUE(bundle_in_index(*derive_manager));
+
+  // Removing the bundle resources (e.g. the placement group was destroyed)
+  // removes the entry.
+  derive_manager->AddOrUpdateNode(node, make_msg({{"CPU", 4.0}}));
+  ASSERT_FALSE(bundle_in_index(*derive_manager));
+
+  // Node removal clears its entries.
+  derive_manager->AddOrUpdateNode(node, make_msg(total));
+  ASSERT_TRUE(bundle_in_index(*derive_manager));
+  derive_manager->RemoveNode(node);
+  ASSERT_FALSE(bundle_in_index(*derive_manager));
+
+  // Without the flag (the GCS), totals never touch the index: the placement
+  // group manager owns it there.
+  manager->AddOrUpdateNode(node, make_msg(total));
+  ASSERT_FALSE(bundle_in_index(*manager));
+}
+
 TEST_F(ClusterResourceManagerTest, DebugStringTest) {
   // Test max_num_nodes_to_include parameter is working.
   ASSERT_EQ(std::vector<std::string>(absl::StrSplit(manager->DebugString(), "node id:"))

@@ -74,8 +74,9 @@ void ClusterResourceScheduler::Init(
     std::function<void(const rpc::NodeDeathInfo &)> shutdown_raylet_gracefully,
     ray::observability::MetricInterface &resource_usage_gauge,
     ClockInterface &clock) {
-  cluster_resource_manager_ =
-      std::make_unique<ClusterResourceManager>(std::move(periodical_runner));
+  cluster_resource_manager_ = std::make_unique<ClusterResourceManager>(
+      std::move(periodical_runner),
+      /*derive_bundle_index_from_totals=*/is_local_node_with_raylet_);
   local_resource_manager_ = std::make_unique<LocalResourceManager>(
       local_node_id_,
       local_node_resources,
@@ -191,9 +192,12 @@ scheduling::NodeID ClusterResourceScheduler::GetBestSchedulableNode(
                 .spill_on_unavailable(),
             scheduling_strategy.node_affinity_scheduling_strategy()
                 .fail_on_unavailable()));
-  } else if (IsAffinityWithBundleSchedule(scheduling_strategy) &&
-             !is_local_node_with_raylet_) {
-    // This scheduling strategy is only used for gcs scheduling for the time being.
+  } else if (IsAffinityWithBundleSchedule(scheduling_strategy)) {
+    // On the raylet the bundle location index is derived from the resource
+    // view; on the GCS it is fed by the placement group manager. The GCS keeps
+    // its historical Nil-on-unavailable behavior; the raylet falls back to a
+    // feasible-but-unavailable bundle node (mirroring the hybrid path) so the
+    // lease queues instead of being misclassified as infeasible.
     auto placement_group_id = PlacementGroupID::FromBinary(
         scheduling_strategy.placement_group_scheduling_strategy().placement_group_id());
     BundleID bundle_id =
@@ -201,7 +205,10 @@ scheduling::NodeID ClusterResourceScheduler::GetBestSchedulableNode(
                   scheduling_strategy.placement_group_scheduling_strategy()
                       .placement_group_bundle_index());
     best_node_id = scheduling_policy_->Schedule(
-        resource_request, SchedulingOptions::AffinityWithBundle(bundle_id));
+        resource_request,
+        SchedulingOptions::AffinityWithBundle(
+            bundle_id,
+            /*require_node_available=*/force_spillback || !is_local_node_with_raylet_));
   } else if (scheduling_strategy.has_node_label_scheduling_strategy()) {
     best_node_id = scheduling_policy_->Schedule(
         resource_request, SchedulingOptions::NodeLabelScheduling(scheduling_strategy));

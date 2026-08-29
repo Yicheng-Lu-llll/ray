@@ -42,6 +42,10 @@ class AffinityWithBundleSchedulingPolicy : public ISchedulingPolicy {
   const BundleLocationIndex &bundle_location_index_;
 
  private:
+  bool IsNodeFeasible(const scheduling::NodeID &node_id,
+                      const ResourceRequest &resource_request,
+                      bool avoid_gpu_nodes);
+
   bool IsNodeFeasibleAndAvailable(const scheduling::NodeID &node_id,
                                   const ResourceRequest &resource_request,
                                   bool avoid_gpu_nodes);

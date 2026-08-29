@@ -17,13 +17,12 @@
 namespace ray {
 namespace raylet_scheduling_policy {
 
-bool AffinityWithBundleSchedulingPolicy::IsNodeFeasibleAndAvailable(
+bool AffinityWithBundleSchedulingPolicy::IsNodeFeasible(
     const scheduling::NodeID &node_id,
     const ResourceRequest &resource_request,
     bool avoid_gpu_nodes) {
   if (!(nodes_.contains(node_id) && is_node_alive_(node_id) &&
-        nodes_.at(node_id).GetLocalView().IsFeasible(resource_request) &&
-        nodes_.at(node_id).GetLocalView().IsAvailable(resource_request))) {
+        nodes_.at(node_id).GetLocalView().IsFeasible(resource_request))) {
     return false;
   }
   if (!avoid_gpu_nodes) {
@@ -41,6 +40,14 @@ bool AffinityWithBundleSchedulingPolicy::IsNodeFeasibleAndAvailable(
   return !node_total.Has(scheduling::ResourceID(gpu_wildcard_resource_name));
 }
 
+bool AffinityWithBundleSchedulingPolicy::IsNodeFeasibleAndAvailable(
+    const scheduling::NodeID &node_id,
+    const ResourceRequest &resource_request,
+    bool avoid_gpu_nodes) {
+  return IsNodeFeasible(node_id, resource_request, avoid_gpu_nodes) &&
+         nodes_.at(node_id).GetLocalView().IsAvailable(resource_request);
+}
+
 scheduling::NodeID AffinityWithBundleSchedulingPolicy::Schedule(
     const ResourceRequest &resource_request, SchedulingOptions options) {
   RAY_CHECK(options.scheduling_type_ == SchedulingType::AFFINITY_WITH_BUNDLE);
@@ -55,6 +62,10 @@ scheduling::NodeID AffinityWithBundleSchedulingPolicy::Schedule(
       auto target_node_id = scheduling::NodeID(node_id_opt.value().Binary());
       if (IsNodeFeasibleAndAvailable(
               target_node_id, resource_request, /*avoid_gpu_nodes=*/false)) {
+        return target_node_id;
+      }
+      if (!options.require_node_available_ &&
+          IsNodeFeasible(target_node_id, resource_request, /*avoid_gpu_nodes=*/false)) {
         return target_node_id;
       }
     }
@@ -78,6 +89,18 @@ scheduling::NodeID AffinityWithBundleSchedulingPolicy::Schedule(
         if (IsNodeFeasibleAndAvailable(
                 target_node_id, resource_request, /*avoid_gpu_nodes=*/false)) {
           return target_node_id;
+        }
+      }
+      // Every bundle node is busy right now. If the caller can queue the
+      // request (the raylet path), hand back a feasible bundle node instead of
+      // Nil so the request is not misclassified as infeasible.
+      if (!options.require_node_available_) {
+        for (const auto &iter : *(bundle_locations_opt.value())) {
+          auto target_node_id = scheduling::NodeID(iter.second.first.Binary());
+          if (IsNodeFeasible(
+                  target_node_id, resource_request, /*avoid_gpu_nodes=*/false)) {
+            return target_node_id;
+          }
         }
       }
     }

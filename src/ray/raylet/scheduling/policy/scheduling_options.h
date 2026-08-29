@@ -106,14 +106,15 @@ struct SchedulingOptions {
   }
 
   // construct option for affinity with bundle scheduling policy.
-  static SchedulingOptions AffinityWithBundle(const BundleID &bundle_id) {
+  static SchedulingOptions AffinityWithBundle(const BundleID &bundle_id,
+                                              bool require_node_available = true) {
     auto scheduling_context =
         std::make_unique<AffinityWithBundleSchedulingContext>(bundle_id);
     return SchedulingOptions(
         SchedulingType::AFFINITY_WITH_BUNDLE,
         /*spread_threshold*/ 0,
         /*avoid_local_node*/ false,
-        /*require_node_available*/ true,
+        require_node_available,
         /*avoid_gpu_nodes*/ RayConfig::instance().scheduler_avoid_gpu_nodes(),
         /*target_topology_assignment*/ std::nullopt,
         std::move(scheduling_context));

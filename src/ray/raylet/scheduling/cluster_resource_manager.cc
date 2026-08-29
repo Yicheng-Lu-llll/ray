@@ -28,8 +28,8 @@ namespace ray {
 
 ClusterResourceManager::ClusterResourceManager(
     std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
-    bool derive_bundle_index_from_totals)
-    : derive_bundle_index_from_totals_(derive_bundle_index_from_totals),
+    bool maintain_custom_resource_node_index)
+    : maintain_custom_resource_node_index_(maintain_custom_resource_node_index),
       periodical_runner_(std::move(periodical_runner)),
       local_resource_view_node_count_gauge_(
           raylet::GetLocalResourceViewNodeCountGaugeMetric()) {
@@ -75,51 +75,95 @@ void ClusterResourceManager::AddOrUpdateNode(scheduling::NodeID node_id,
   if (it == nodes_.end()) {
     // This node is new, so add it to the map.
     nodes_.emplace(node_id, node_resources);
-    RefreshBundleLocationIndex(node_id);
+    RefreshCustomResourceNodeIndex(node_id);
   } else {
     const bool totals_changed =
-        derive_bundle_index_from_totals_ &&
+        maintain_custom_resource_node_index_ &&
         !(it->second.GetLocalView().total == node_resources.total);
     // This node exists, so update its resources.
     it->second = Node(node_resources);
     if (totals_changed) {
-      RefreshBundleLocationIndex(node_id);
+      RefreshCustomResourceNodeIndex(node_id);
     }
   }
 }
 
-void ClusterResourceManager::RefreshBundleLocationIndex(scheduling::NodeID node_id) {
-  if (!derive_bundle_index_from_totals_) {
+void ClusterResourceManager::RefreshCustomResourceNodeIndex(
+    scheduling::NodeID node_id) {
+  if (!maintain_custom_resource_node_index_) {
     return;
   }
-  // Scheduling ids interned from integers (tests) are not valid NodeID binaries.
-  if (node_id.Binary().size() != NodeID::Size()) {
+  // Clear the node's previous entries.
+  auto reverse_it = indexed_custom_resources_by_node_.find(node_id);
+  if (reverse_it != indexed_custom_resources_by_node_.end()) {
+    for (const auto &resource_id : reverse_it->second) {
+      auto it = nodes_by_custom_resource_.find(resource_id);
+      if (it != nodes_by_custom_resource_.end()) {
+        it->second.erase(node_id);
+        if (it->second.empty()) {
+          nodes_by_custom_resource_.erase(it);
+        }
+      }
+    }
+    indexed_custom_resources_by_node_.erase(reverse_it);
+  }
+  auto node_it = nodes_.find(node_id);
+  if (node_it == nodes_.end()) {
     return;
   }
-  const NodeID raylet_node_id = NodeID::FromBinary(node_id.Binary());
-  bundle_location_index_.Erase(raylet_node_id);
-  auto it = nodes_.find(node_id);
-  if (it == nodes_.end()) {
-    return;
-  }
-  // Every committed bundle puts an indexed bundle_group_<idx>_<pg> resource in
-  // the node's totals, so that one resource is a canonical marker per bundle.
-  static const std::string kBundleIndexedPrefix =
-      std::string(kBundle_ResourceLabel) + kGroupKeyword;
-  for (const auto &resource_id : it->second.GetLocalView().total.ExplicitResourceIds()) {
-    const std::string name = resource_id.Binary();
-    if (name.rfind(kBundleIndexedPrefix, 0) != 0) {
+  // Predefined resources exist on virtually every node and implicit resources
+  // default to 1 everywhere even without an explicit totals entry
+  // (NodeResourceSet::ResourceDefaultValue), so neither can narrow a scan;
+  // indexing implicit names would even under-include. ExplicitResourceIds()
+  // already excludes implicit names.
+  std::vector<scheduling::ResourceID> indexed;
+  for (const auto &resource_id :
+       node_it->second.GetLocalView().total.ExplicitResourceIds()) {
+    if (resource_id.IsPredefinedResource()) {
       continue;
     }
-    auto data = ParsePgFormattedResource(
-        name, /*for_wildcard_resource=*/false, /*for_indexed_resource=*/true);
-    if (!data) {
+    nodes_by_custom_resource_[resource_id].insert(node_id);
+    indexed.push_back(resource_id);
+  }
+  if (!indexed.empty()) {
+    indexed_custom_resources_by_node_[node_id] = std::move(indexed);
+  }
+}
+
+std::shared_ptr<const std::vector<scheduling::NodeID>>
+ClusterResourceManager::GetCandidateNodesForRequest(
+    const ResourceRequest &resource_request) const {
+  if (!maintain_custom_resource_node_index_) {
+    return nullptr;
+  }
+  const absl::flat_hash_set<scheduling::NodeID> *smallest = nullptr;
+  bool has_custom_resource = false;
+  for (const auto &resource_id : resource_request.ResourceIds()) {
+    if (resource_id.IsPredefinedResource() || resource_id.IsImplicitResource()) {
+      // No narrowing power: predefined names exist everywhere and implicit
+      // names are satisfied by default even without a totals entry.
       continue;
     }
-    bundle_location_index_.AddOrUpdateBundleLocation(
-        BundleID(PlacementGroupID::FromHex(data->group_id), data->bundle_index),
-        raylet_node_id);
+    has_custom_resource = true;
+    auto it = nodes_by_custom_resource_.find(resource_id);
+    if (it == nodes_by_custom_resource_.end()) {
+      // Some required custom resource exists on no node's totals: infeasible
+      // everywhere, which the empty candidate set expresses (the same verdict
+      // a full scan would reach).
+      return std::make_shared<const std::vector<scheduling::NodeID>>();
+    }
+    if (smallest == nullptr || it->second.size() < smallest->size()) {
+      smallest = &it->second;
+    }
   }
+  if (!has_custom_resource) {
+    return nullptr;
+  }
+  auto candidates =
+      std::make_shared<std::vector<scheduling::NodeID>>(smallest->begin(),
+                                                        smallest->end());
+  std::sort(candidates->begin(), candidates->end());
+  return candidates;
 }
 
 bool ClusterResourceManager::UpdateNode(
@@ -181,12 +225,11 @@ void ClusterResourceManager::AddOrUpdateNode(
 }
 
 bool ClusterResourceManager::RemoveNode(scheduling::NodeID node_id) {
-  if (derive_bundle_index_from_totals_ &&
-      node_id.Binary().size() == NodeID::Size()) {
-    bundle_location_index_.Erase(NodeID::FromBinary(node_id.Binary()));
-  }
   received_node_resources_.erase(node_id);
-  return nodes_.erase(node_id) != 0;
+  bool removed = nodes_.erase(node_id) != 0;
+  // With the node gone from the view, this clears its index entries.
+  RefreshCustomResourceNodeIndex(node_id);
+  return removed;
 }
 
 bool ClusterResourceManager::SetNodeDraining(const scheduling::NodeID &node_id,
@@ -252,7 +295,7 @@ void ClusterResourceManager::UpdateResourceCapacity(scheduling::NodeID node_id,
   }
   local_view->total.Set(resource_id, total);
   local_view->available.Set(resource_id, available);
-  RefreshBundleLocationIndex(node_id);
+  RefreshCustomResourceNodeIndex(node_id);
 }
 
 bool ClusterResourceManager::DeleteResources(
@@ -267,7 +310,7 @@ bool ClusterResourceManager::DeleteResources(
     local_view->total.Set(resource_id, 0);
     local_view->available.Set(resource_id, 0);
   }
-  RefreshBundleLocationIndex(node_id);
+  RefreshCustomResourceNodeIndex(node_id);
   return true;
 }
 

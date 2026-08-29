@@ -50,13 +50,13 @@ class GcsActorSchedulerTest;
 /// This class is not thread safe.
 class ClusterResourceManager {
  public:
-  /// \param derive_bundle_index_from_totals If true (raylet), keep the bundle
-  /// location index in sync with the placement-group indexed resources seen in
-  /// node totals. Must be false on the GCS, where the placement group manager
-  /// feeds the index authoritatively.
+  /// \param maintain_custom_resource_node_index If true (the raylet), keep an
+  /// inverted index from every custom resource name seen in some node's totals
+  /// to the set of nodes carrying it, so scheduling can restrict its scan to
+  /// the nodes that can ever fit a request instead of walking every node.
   explicit ClusterResourceManager(
       std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
-      bool derive_bundle_index_from_totals = false);
+      bool maintain_custom_resource_node_index = false);
 
   /// Get the resource view of the cluster.
   const absl::flat_hash_map<scheduling::NodeID, Node> &GetResourceView() const;
@@ -165,6 +165,16 @@ class ClusterResourceManager {
 
   BundleLocationIndex &GetBundleLocationIndex();
 
+  /// Candidate nodes for a resource request, from the custom-resource node
+  /// index: the smallest node set among the request's custom resource names
+  /// (any further mismatch is caught by the per-node feasibility check, so a
+  /// superset is safe). Returns an empty vector when some requested custom
+  /// resource name exists on no node's totals (infeasible everywhere), and
+  /// nullptr when the request carries no custom resource names or the index
+  /// is not maintained here (no domain restriction; scan everything).
+  std::shared_ptr<const std::vector<scheduling::NodeID>> GetCandidateNodesForRequest(
+      const ResourceRequest &resource_request) const;
+
   void SetNodeLabels(const scheduling::NodeID &node_id,
                      absl::flat_hash_map<std::string, std::string> labels);
 
@@ -191,12 +201,10 @@ class ClusterResourceManager {
   friend class ClusterResourceScheduler;
   friend class gcs::GcsActorSchedulerTest;
 
-  /// Rebuild the bundle location index entries contributed by the given node
-  /// from the placement-group indexed resources in its current totals, so that
-  /// bundle-affinity scheduling can look bundles up instead of scanning every
-  /// node. On the GCS the index is fed by the placement group manager instead;
-  /// this derivation is only wired into the raylet-side view mutations.
-  void RefreshBundleLocationIndex(scheduling::NodeID node_id);
+  /// Rebuild the custom-resource index entries contributed by the given node's
+  /// current totals. Called from every code path that mutates a node's totals
+  /// so the index can never go stale independently of the view.
+  void RefreshCustomResourceNodeIndex(scheduling::NodeID node_id);
 
   /// Return the timestamp when the resource of the node got updated by scheduler.
   ///
@@ -230,7 +238,16 @@ class ClusterResourceManager {
   BundleLocationIndex bundle_location_index_;
 
   /// See the constructor doc. True only on the raylet.
-  bool derive_bundle_index_from_totals_ = false;
+  bool maintain_custom_resource_node_index_ = false;
+  /// Inverted index: custom (non-predefined, non-implicit) resource name ->
+  /// nodes whose totals carry it. Empty entries are erased eagerly. Only
+  /// maintained when maintain_custom_resource_node_index_ is set.
+  absl::flat_hash_map<scheduling::ResourceID, absl::flat_hash_set<scheduling::NodeID>>
+      nodes_by_custom_resource_;
+  /// Reverse of the above, used to clear a node's stale entries in O(its
+  /// indexed names) when its totals change or the node is removed.
+  absl::flat_hash_map<scheduling::NodeID, std::vector<scheduling::ResourceID>>
+      indexed_custom_resources_by_node_;
 
   /// Timer to revert local changes to the resources periodically.
   std::shared_ptr<PeriodicalRunnerInterface> periodical_runner_;
@@ -260,7 +277,7 @@ class ClusterResourceManager {
   FRIEND_TEST(ClusterResourceSchedulerTest, DynamicResourceTest);
   FRIEND_TEST(ClusterLeaseManagerTestWithGPUsAtHead, RleaseAndReturnWorkerCpuResources);
   FRIEND_TEST(ClusterResourceSchedulerTest, TestForceSpillback);
-  FRIEND_TEST(ClusterResourceSchedulerTest, HybridSchedulesPgLeaseViaBundleIndexDomain);
+  FRIEND_TEST(ClusterResourceSchedulerTest, HybridSchedulesLeasesViaResourceNameIndexDomain);
   FRIEND_TEST(ClusterResourceSchedulerTest, AffinityWithBundleScheduleTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, LabelSelectorIsSchedulableOnNodeTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, LabelSelectorHardNodeAffinityTest);

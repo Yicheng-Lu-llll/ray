@@ -239,7 +239,7 @@ class ClusterResourceScheduler {
   FRIEND_TEST(ClusterResourceSchedulerTest, SchedulingModifyClusterNodeTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, SchedulingUpdateAvailableResourcesTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, SchedulingAddOrUpdateNodeTest);
-  FRIEND_TEST(ClusterResourceSchedulerTest, HybridSchedulesPgLeaseViaBundleIndexDomain);
+  FRIEND_TEST(ClusterResourceSchedulerTest, HybridSchedulesLeasesViaResourceNameIndexDomain);
   FRIEND_TEST(ClusterResourceSchedulerTest, NodeAffinitySchedulingStrategyTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, SpreadSchedulingStrategyTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, SchedulingWithPreferredNodeTest);

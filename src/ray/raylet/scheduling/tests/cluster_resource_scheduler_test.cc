@@ -1907,11 +1907,12 @@ TEST_F(ClusterResourceSchedulerTest, AffinityWithBundleScheduleTest) {
   test_schedule({{"CPU", 2}}, bundle_1, scheduling::NodeID::Nil());
 }
 
-TEST_F(ClusterResourceSchedulerTest, HybridSchedulesPgLeaseViaBundleIndexDomain) {
-  // Raylet-mode scheduler: a placement-group lease keeps the hybrid policy's
-  // selection semantics (available bucket first, unavailable-but-feasible as
-  // fallback) but scans only the bundle nodes named by the location index
-  // derived from node totals, instead of the whole cluster view.
+TEST_F(ClusterResourceSchedulerTest, HybridSchedulesLeasesViaResourceNameIndexDomain) {
+  // Raylet-mode scheduler: a lease with custom resource names (placement-group
+  // formatted names included) keeps the hybrid policy's selection semantics
+  // (available bucket first, unavailable-but-feasible as fallback) but scans
+  // only the nodes named by the custom-resource index, instead of the whole
+  // cluster view.
   auto pg = PlacementGroupID::Of(JobID::FromInt(3));
   instrumented_io_context io_context;
   ClusterResourceScheduler resource_scheduler(
@@ -2014,6 +2015,27 @@ TEST_F(ClusterResourceSchedulerTest, HybridSchedulesPgLeaseViaBundleIndexDomain)
                                           &is_infeasible)
                   .IsNil());
   ASSERT_TRUE(is_infeasible);
+
+  // A plain custom resource (no placement group involved) routes through the
+  // same index under the default strategy.
+  auto accel_node = scheduling::NodeID(NodeID::FromRandom().Binary());
+  resource_scheduler.GetClusterResourceManager().AddOrUpdateNode(
+      accel_node,
+      {{"CPU", 4.0}, {"accel", 2.0}},
+      {{"CPU", 4.0}, {"accel", 2.0}});
+  rpc::SchedulingStrategy default_strategy;
+  default_strategy.mutable_default_scheduling_strategy();
+  ResourceRequest accel_request = CreateResourceRequest(
+      std::unordered_map<std::string, double>{{"CPU", 1}, {"accel", 1}});
+  ASSERT_EQ(resource_scheduler.GetBestSchedulableNode(accel_request,
+                                                      default_strategy,
+                                                      false,
+                                                      false,
+                                                      std::string(),
+                                                      &violations,
+                                                      &is_infeasible),
+            accel_node);
+  ASSERT_FALSE(is_infeasible);
 }
 
 TEST_F(ClusterResourceSchedulerTest, LabelSelectorIsSchedulableOnNodeTest) {

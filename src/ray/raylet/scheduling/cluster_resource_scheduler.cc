@@ -76,7 +76,7 @@ void ClusterResourceScheduler::Init(
     ClockInterface &clock) {
   cluster_resource_manager_ = std::make_unique<ClusterResourceManager>(
       std::move(periodical_runner),
-      /*derive_bundle_index_from_totals=*/is_local_node_with_raylet_);
+      /*maintain_custom_resource_node_index=*/is_local_node_with_raylet_);
   local_resource_manager_ = std::make_unique<LocalResourceManager>(
       local_node_id_,
       local_node_resources,
@@ -145,40 +145,6 @@ bool IsHardNodeAffinitySchedulingStrategy(
 }
 }  // namespace
 
-namespace {
-// Candidate nodes for a placement-group lease, looked up in the bundle
-// location index instead of scanning the whole cluster view. The bundle nodes
-// are the only nodes whose totals can ever fit the lease's pg-formatted
-// resources, so restricting the scan to them changes no scheduling decision.
-// Sorted so the scheduling policy sees a deterministic order.
-std::shared_ptr<const std::vector<scheduling::NodeID>> ComputeBundleCandidateNodes(
-    const BundleLocationIndex &bundle_location_index,
-    const rpc::SchedulingStrategy &scheduling_strategy) {
-  const auto &pg_strategy = scheduling_strategy.placement_group_scheduling_strategy();
-  const auto placement_group_id =
-      PlacementGroupID::FromBinary(pg_strategy.placement_group_id());
-  auto candidates = std::make_shared<std::vector<scheduling::NodeID>>();
-  if (pg_strategy.placement_group_bundle_index() >= 0) {
-    const auto &node_id_opt = bundle_location_index.GetBundleLocation(
-        BundleID(placement_group_id, pg_strategy.placement_group_bundle_index()));
-    if (node_id_opt) {
-      candidates->emplace_back(node_id_opt->Binary());
-    }
-  } else {
-    const auto &bundle_locations_opt =
-        bundle_location_index.GetBundleLocations(placement_group_id);
-    if (bundle_locations_opt) {
-      absl::flat_hash_set<scheduling::NodeID> nodes_seen;
-      for (const auto &iter : *(bundle_locations_opt.value())) {
-        nodes_seen.insert(scheduling::NodeID(iter.second.first.Binary()));
-      }
-      candidates->assign(nodes_seen.begin(), nodes_seen.end());
-      std::sort(candidates->begin(), candidates->end());
-    }
-  }
-  return candidates;
-}
-}  // namespace
 
 bool ClusterResourceScheduler::IsAffinityWithBundleSchedule(
     const rpc::SchedulingStrategy &scheduling_strategy) {
@@ -208,11 +174,12 @@ scheduling::NodeID ClusterResourceScheduler::GetBestSchedulableNode(
   auto best_node_id = scheduling::NodeID::Nil();
   if (scheduling_strategy.scheduling_strategy_case() ==
       rpc::SchedulingStrategy::SchedulingStrategyCase::kSpreadSchedulingStrategy) {
-    best_node_id =
-        scheduling_policy_->Schedule(resource_request,
-                                     SchedulingOptions::Spread(
-                                         /*avoid_local_node*/ force_spillback,
-                                         /*require_node_available*/ force_spillback));
+    auto options = SchedulingOptions::Spread(
+        /*avoid_local_node*/ force_spillback,
+        /*require_node_available*/ force_spillback);
+    options.candidate_nodes_ =
+        cluster_resource_manager_->GetCandidateNodesForRequest(resource_request);
+    best_node_id = scheduling_policy_->Schedule(resource_request, std::move(options));
   } else if (scheduling_strategy.scheduling_strategy_case() ==
              rpc::SchedulingStrategy::SchedulingStrategyCase::
                  kNodeAffinitySchedulingStrategy) {
@@ -239,8 +206,10 @@ scheduling::NodeID ClusterResourceScheduler::GetBestSchedulableNode(
     best_node_id = scheduling_policy_->Schedule(
         resource_request, SchedulingOptions::AffinityWithBundle(bundle_id));
   } else if (scheduling_strategy.has_node_label_scheduling_strategy()) {
-    best_node_id = scheduling_policy_->Schedule(
-        resource_request, SchedulingOptions::NodeLabelScheduling(scheduling_strategy));
+    auto options = SchedulingOptions::NodeLabelScheduling(scheduling_strategy);
+    options.candidate_nodes_ =
+        cluster_resource_manager_->GetCandidateNodesForRequest(resource_request);
+    best_node_id = scheduling_policy_->Schedule(resource_request, std::move(options));
   } else {
     // TODO(Alex): Setting require_available == force_spillback is a hack in order to
     // remain bug compatible with the legacy scheduling algorithms.
@@ -248,14 +217,11 @@ scheduling::NodeID ClusterResourceScheduler::GetBestSchedulableNode(
         /*avoid_local_node*/ force_spillback,
         /*require_node_available*/ force_spillback,
         preferred_node_id);
-    if (IsAffinityWithBundleSchedule(scheduling_strategy)) {
-      // A placement-group lease on the raylet (the GCS handles this strategy
-      // in the branch above). Its pg-formatted resources exist only in the
-      // bundle nodes' totals, so restrict the hybrid scan to the bundle
-      // location index's candidate set instead of walking every node.
-      options.candidate_nodes_ = ComputeBundleCandidateNodes(
-          cluster_resource_manager_->GetBundleLocationIndex(), scheduling_strategy);
-    }
+    // Custom resource names (placement-group formatted names included) exist
+    // only in the totals of the nodes that can ever fit them, so restrict the
+    // scan to those nodes instead of walking every node in the view.
+    options.candidate_nodes_ =
+        cluster_resource_manager_->GetCandidateNodesForRequest(resource_request);
     best_node_id = scheduling_policy_->Schedule(resource_request, std::move(options));
   }
 

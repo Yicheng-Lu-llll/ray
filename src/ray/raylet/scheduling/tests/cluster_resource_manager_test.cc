@@ -15,6 +15,8 @@
 #include "ray/raylet/scheduling/cluster_resource_manager.h"
 
 #include <memory>
+#include <random>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "ray/asio/periodical_runner.h"
@@ -87,23 +89,67 @@ TEST_F(ClusterResourceManagerTest, UpdateNode) {
   ASSERT_TRUE(node_resources.last_resource_update_time.has_value());
 }
 
-TEST_F(ClusterResourceManagerTest, DeriveBundleLocationIndexFromTotals) {
+TEST_F(ClusterResourceManagerTest, CustomResourceNodeIndex) {
   static instrumented_io_context io_context;
-  auto derive_manager = std::make_unique<ClusterResourceManager>(
-      PeriodicalRunner::Create(io_context), /*derive_bundle_index_from_totals=*/true);
-  auto pg = PlacementGroupID::Of(JobID::FromInt(7));
+  auto index_manager = std::make_unique<ClusterResourceManager>(
+      PeriodicalRunner::Create(io_context),
+      /*maintain_custom_resource_node_index=*/true);
   scheduling::NodeID node(NodeID::FromRandom().Binary());
-  const BundleID bundle(pg, 0);
 
-  auto bundle_total =
-      AddPlacementGroupConstraint({{"CPU", 4.0}}, pg, /*bundle_index=*/0);
-  absl::flat_hash_map<std::string, double> total(bundle_total.begin(),
-                                                 bundle_total.end());
-
-  auto bundle_in_index = [&](ClusterResourceManager &m) {
-    auto locs = m.GetBundleLocationIndex().GetBundleLocations(pg);
-    return locs.has_value() && (*locs.value()).count(bundle) == 1;
+  auto make_msg = [](const absl::flat_hash_map<std::string, double> &resources) {
+    syncer::ResourceViewSyncMessage msg;
+    for (const auto &[name, value] : resources) {
+      (*msg.mutable_resources_total())[name] = value;
+      (*msg.mutable_resources_available())[name] = value;
+    }
+    return msg;
   };
+  auto candidates_for = [](ClusterResourceManager &m, const std::string &name) {
+    return m.GetCandidateNodesForRequest(
+        ResourceMapToResourceRequest({{name, 1.0}}, false));
+  };
+
+  // A custom resource in a node's totals lands in the index.
+  index_manager->AddOrUpdateNode(node, make_msg({{"CPU", 4.0}, {"accel", 1.0}}));
+  auto candidates = candidates_for(*index_manager, "accel");
+  ASSERT_TRUE(candidates != nullptr);
+  ASSERT_EQ(*candidates, std::vector<scheduling::NodeID>{node});
+  // Predefined names never restrict the domain.
+  ASSERT_EQ(candidates_for(*index_manager, "CPU"), nullptr);
+  // A custom name on no node gives an empty (infeasible-everywhere) domain.
+  ASSERT_TRUE(candidates_for(*index_manager, "missing")->empty());
+
+  // Removing the resource from the node's totals removes the entry.
+  index_manager->AddOrUpdateNode(node, make_msg({{"CPU", 4.0}}));
+  ASSERT_TRUE(candidates_for(*index_manager, "accel")->empty());
+
+  // Node removal clears its entries.
+  index_manager->AddOrUpdateNode(node, make_msg({{"CPU", 4.0}, {"accel", 1.0}}));
+  index_manager->RemoveNode(node);
+  ASSERT_TRUE(candidates_for(*index_manager, "accel")->empty());
+
+  // Without the flag (the GCS), queries never restrict the domain: nullptr,
+  // not an empty set, or every custom-resource request would be misjudged
+  // infeasible against the unmaintained index.
+  manager->AddOrUpdateNode(node, make_msg({{"accel", 1.0}}));
+  ASSERT_EQ(candidates_for(*manager, "accel"), nullptr);
+}
+
+TEST_F(ClusterResourceManagerTest, CustomResourceNodeIndexInvariant) {
+  // The index may never diverge from the view: after every step of a random
+  // update sequence, its answer for every name must equal what a fresh scan
+  // of the totals would answer, in both directions (no stale members, no
+  // missing members).
+  static instrumented_io_context io_context;
+  ClusterResourceManager index_manager(PeriodicalRunner::Create(io_context),
+                                       /*maintain_custom_resource_node_index=*/true);
+  std::mt19937 rng(20260829);
+  std::vector<scheduling::NodeID> node_pool;
+  for (int i = 0; i < 8; i++) {
+    node_pool.emplace_back(NodeID::FromRandom().Binary());
+  }
+  const std::vector<std::string> names = {"a", "b", "c", "d", "never_added"};
+
   auto make_msg = [](const absl::flat_hash_map<std::string, double> &resources) {
     syncer::ResourceViewSyncMessage msg;
     for (const auto &[name, value] : resources) {
@@ -113,25 +159,33 @@ TEST_F(ClusterResourceManagerTest, DeriveBundleLocationIndexFromTotals) {
     return msg;
   };
 
-  // Committed-bundle resources appearing in a node's totals populate the index.
-  derive_manager->AddOrUpdateNode(node, make_msg(total));
-  ASSERT_TRUE(bundle_in_index(*derive_manager));
-
-  // Removing the bundle resources (e.g. the placement group was destroyed)
-  // removes the entry.
-  derive_manager->AddOrUpdateNode(node, make_msg({{"CPU", 4.0}}));
-  ASSERT_FALSE(bundle_in_index(*derive_manager));
-
-  // Node removal clears its entries.
-  derive_manager->AddOrUpdateNode(node, make_msg(total));
-  ASSERT_TRUE(bundle_in_index(*derive_manager));
-  derive_manager->RemoveNode(node);
-  ASSERT_FALSE(bundle_in_index(*derive_manager));
-
-  // Without the flag (the GCS), totals never touch the index: the placement
-  // group manager owns it there.
-  manager->AddOrUpdateNode(node, make_msg(total));
-  ASSERT_FALSE(bundle_in_index(*manager));
+  for (int step = 0; step < 300; ++step) {
+    const auto &node = node_pool[rng() % node_pool.size()];
+    if (rng() % 5 == 0) {
+      index_manager.RemoveNode(node);
+    } else {
+      absl::flat_hash_map<std::string, double> resources{{"CPU", 4.0}};
+      for (size_t k = 0; k + 1 < names.size(); ++k) {
+        if (rng() % 2 == 0) {
+          resources[names[k]] = 1.0;
+        }
+      }
+      index_manager.AddOrUpdateNode(node, make_msg(resources));
+    }
+    for (const auto &name : names) {
+      std::vector<scheduling::NodeID> expected;
+      for (const auto &[node_id, node_ref] : index_manager.GetResourceView()) {
+        if (node_ref.GetLocalView().total.Get(scheduling::ResourceID(name)) > 0) {
+          expected.push_back(node_id);
+        }
+      }
+      std::sort(expected.begin(), expected.end());
+      auto got = index_manager.GetCandidateNodesForRequest(
+          ResourceMapToResourceRequest({{name, 1.0}}, false));
+      ASSERT_TRUE(got != nullptr);
+      ASSERT_EQ(*got, expected) << "step " << step << " name " << name;
+    }
+  }
 }
 
 TEST_F(ClusterResourceManagerTest, DebugStringTest) {

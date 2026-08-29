@@ -147,6 +147,48 @@ TEST_F(HybridSchedulingPolicyTest, GetBestNodePrioritizePreferredNode) {
   }
 }
 
+TEST_F(HybridSchedulingPolicyTest, CandidateNodesRestrictTheScan) {
+  // With candidate_nodes_ set, the policy considers only those nodes; the
+  // selection semantics within the set (available bucket first, then
+  // feasible-but-unavailable) are unchanged.
+  nodes.emplace(local_node, CreateNodeResources(8, 8, 0, 0, 0, 0));
+  nodes.emplace(n1, CreateNodeResources(8, 8, 0, 0, 0, 0));
+  nodes.emplace(n2, CreateNodeResources(8, 8, 0, 0, 0, 0));
+  nodes.emplace(n3, CreateNodeResources(0, 8, 0, 0, 0, 0));
+  HybridSchedulingPolicy policy{local_node, nodes, [](auto) { return true; }};
+
+  ResourceRequest request =
+      ResourceMapToResourceRequest({{"CPU", 1}}, /*requires_object_store_memory=*/false);
+
+  // Unrestricted, an idle node wins (the local node has the minimal score and
+  // is prioritized).
+  auto unrestricted = HybridOptions(0.5, false, false);
+  EXPECT_EQ(policy.Schedule(request, unrestricted), local_node);
+
+  // Restricted to {n2}, only n2 may be returned even though other nodes are
+  // available.
+  auto restricted = HybridOptions(0.5, false, false);
+  restricted.candidate_nodes_ =
+      std::make_shared<const std::vector<scheduling::NodeID>>(
+          std::vector<scheduling::NodeID>{n2});
+  EXPECT_EQ(policy.Schedule(request, restricted), n2);
+
+  // Restricted to a busy node, the feasible-but-unavailable fallback still
+  // applies within the set.
+  auto restricted_busy = HybridOptions(0.5, false, false);
+  restricted_busy.candidate_nodes_ =
+      std::make_shared<const std::vector<scheduling::NodeID>>(
+          std::vector<scheduling::NodeID>{n3});
+  EXPECT_EQ(policy.Schedule(request, restricted_busy), n3);
+
+  // Restricted to a busy node with require_node_available, nothing matches.
+  auto restricted_strict = HybridOptions(0.5, false, true);
+  restricted_strict.candidate_nodes_ =
+      std::make_shared<const std::vector<scheduling::NodeID>>(
+          std::vector<scheduling::NodeID>{n3});
+  EXPECT_TRUE(policy.Schedule(request, restricted_strict).IsNil());
+}
+
 }  // namespace raylet_scheduling_policy
 
 }  // namespace ray

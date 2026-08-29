@@ -112,6 +112,9 @@ class HybridSchedulingPolicy : public ISchedulingPolicy {
   /// scheduler guarantees k is at least equal to this fraction * the number of
   /// nodes in the cluster.
   ///
+  /// \param candidate_nodes: If non-null, restricts the scan to these nodes
+  /// instead of the whole cluster view (selection semantics are unchanged).
+  ///
   /// \return -1 if the task is unfeasible, otherwise the node id (key in `nodes`) to
   /// schedule on.
   scheduling::NodeID ScheduleImpl(const ResourceRequest &resource_request,
@@ -121,7 +124,8 @@ class HybridSchedulingPolicy : public ISchedulingPolicy {
                                   NodeFilter node_filter,
                                   const std::string &preferred_node,
                                   int32_t schedule_top_k_absolute,
-                                  float scheduler_top_k_fraction);
+                                  float scheduler_top_k_fraction,
+                                  const std::vector<scheduling::NodeID> *candidate_nodes);
 
   /// Identifier of local node.
   const scheduling::NodeID local_node_id_;

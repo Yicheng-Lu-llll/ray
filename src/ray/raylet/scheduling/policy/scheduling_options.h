@@ -216,6 +216,12 @@ struct SchedulingOptions {
   // The node where the task is preferred to be placed. By default, this node id
   // is empty, which means no preferred node.
   std::string preferred_node_id_;
+  // Optional restriction of the nodes a scanning policy may consider. When
+  // set, the policy iterates only these nodes instead of the whole cluster
+  // view; selection semantics within the set are unchanged. Produced on the
+  // raylet for placement-group leases from the bundle location index, where
+  // the bundle nodes are the only nodes that can ever hold the lease.
+  std::shared_ptr<const std::vector<scheduling::NodeID>> candidate_nodes_;
   int32_t schedule_top_k_absolute_;
   float scheduler_top_k_fraction_;
 

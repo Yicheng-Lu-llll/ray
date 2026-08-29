@@ -50,8 +50,13 @@ class GcsActorSchedulerTest;
 /// This class is not thread safe.
 class ClusterResourceManager {
  public:
+  /// \param derive_bundle_index_from_totals If true (raylet), keep the bundle
+  /// location index in sync with the placement-group indexed resources seen in
+  /// node totals. Must be false on the GCS, where the placement group manager
+  /// feeds the index authoritatively.
   explicit ClusterResourceManager(
-      std::shared_ptr<PeriodicalRunnerInterface> periodical_runner);
+      std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
+      bool derive_bundle_index_from_totals = false);
 
   /// Get the resource view of the cluster.
   const absl::flat_hash_map<scheduling::NodeID, Node> &GetResourceView() const;
@@ -186,6 +191,13 @@ class ClusterResourceManager {
   friend class ClusterResourceScheduler;
   friend class gcs::GcsActorSchedulerTest;
 
+  /// Rebuild the bundle location index entries contributed by the given node
+  /// from the placement-group indexed resources in its current totals, so that
+  /// bundle-affinity scheduling can look bundles up instead of scanning every
+  /// node. On the GCS the index is fed by the placement group manager instead;
+  /// this derivation is only wired into the raylet-side view mutations.
+  void RefreshBundleLocationIndex(scheduling::NodeID node_id);
+
   /// Return the timestamp when the resource of the node got updated by scheduler.
   ///
   /// \param node_id ID of the node to query
@@ -217,6 +229,9 @@ class ClusterResourceManager {
 
   BundleLocationIndex bundle_location_index_;
 
+  /// See the constructor doc. True only on the raylet.
+  bool derive_bundle_index_from_totals_ = false;
+
   /// Timer to revert local changes to the resources periodically.
   std::shared_ptr<PeriodicalRunnerInterface> periodical_runner_;
 
@@ -245,6 +260,7 @@ class ClusterResourceManager {
   FRIEND_TEST(ClusterResourceSchedulerTest, DynamicResourceTest);
   FRIEND_TEST(ClusterLeaseManagerTestWithGPUsAtHead, RleaseAndReturnWorkerCpuResources);
   FRIEND_TEST(ClusterResourceSchedulerTest, TestForceSpillback);
+  FRIEND_TEST(ClusterResourceSchedulerTest, HybridSchedulesPgLeaseViaBundleIndexDomain);
   FRIEND_TEST(ClusterResourceSchedulerTest, AffinityWithBundleScheduleTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, LabelSelectorIsSchedulableOnNodeTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, LabelSelectorHardNodeAffinityTest);

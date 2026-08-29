@@ -101,7 +101,8 @@ scheduling::NodeID HybridSchedulingPolicy::ScheduleImpl(
     NodeFilter node_filter,
     const std::string &preferred_node,
     int32_t schedule_top_k_absolute,
-    float scheduler_top_k_fraction) {
+    float scheduler_top_k_fraction,
+    const std::vector<scheduling::NodeID> *candidate_nodes) {
   // Nodes that are feasible and currently have available resources.
   std::vector<std::pair<scheduling::NodeID, float>> available_nodes;
   // Nodes that are feasible but currently do not have available resources.
@@ -117,11 +118,10 @@ scheduling::NodeID HybridSchedulingPolicy::ScheduleImpl(
       preferred_node_id = new_id;
     }
   }
-  for (const auto &pair : nodes_) {
-    const auto &node_id = pair.first;
-    const auto &node_resources = pair.second.GetLocalView();
+  auto consider_node = [&](const scheduling::NodeID &node_id, const Node &node) {
+    const auto &node_resources = node.GetLocalView();
     if (force_spillback && node_id == preferred_node_id) {
-      continue;
+      return;
     }
     if (IsNodeFeasible(node_id, node_filter, node_resources, resource_request)) {
       bool ignore_pull_manager_at_capacity = false;
@@ -149,6 +149,19 @@ scheduling::NodeID HybridSchedulingPolicy::ScheduleImpl(
       } else {
         feasible_and_unavailable_nodes.push_back({node_id, node_score});
       }
+    }
+  };
+  if (candidate_nodes != nullptr) {
+    for (const auto &node_id : *candidate_nodes) {
+      auto it = nodes_.find(node_id);
+      if (it == nodes_.end()) {
+        continue;
+      }
+      consider_node(it->first, it->second);
+    }
+  } else {
+    for (const auto &pair : nodes_) {
+      consider_node(pair.first, pair.second);
     }
   }
 
@@ -192,7 +205,8 @@ scheduling::NodeID HybridSchedulingPolicy::Schedule(
                         NodeFilter::kAny,
                         options.preferred_node_id_,
                         options.schedule_top_k_absolute_,
-                        options.scheduler_top_k_fraction_);
+                        options.scheduler_top_k_fraction_,
+                        options.candidate_nodes_.get());
   }
 
   // Try schedule on non-GPU nodes.
@@ -203,7 +217,8 @@ scheduling::NodeID HybridSchedulingPolicy::Schedule(
                                    NodeFilter::kNonGpu,
                                    options.preferred_node_id_,
                                    options.schedule_top_k_absolute_,
-                                   options.scheduler_top_k_fraction_);
+                                   options.scheduler_top_k_fraction_,
+                                   options.candidate_nodes_.get());
   if (!best_node_id.IsNil()) {
     return best_node_id;
   }
@@ -217,7 +232,8 @@ scheduling::NodeID HybridSchedulingPolicy::Schedule(
                       NodeFilter::kAny,
                       options.preferred_node_id_,
                       options.schedule_top_k_absolute_,
-                      options.scheduler_top_k_fraction_);
+                      options.scheduler_top_k_fraction_,
+                      options.candidate_nodes_.get());
 }
 
 }  // namespace raylet_scheduling_policy

@@ -1907,6 +1907,115 @@ TEST_F(ClusterResourceSchedulerTest, AffinityWithBundleScheduleTest) {
   test_schedule({{"CPU", 2}}, bundle_1, scheduling::NodeID::Nil());
 }
 
+TEST_F(ClusterResourceSchedulerTest, HybridSchedulesPgLeaseViaBundleIndexDomain) {
+  // Raylet-mode scheduler: a placement-group lease keeps the hybrid policy's
+  // selection semantics (available bucket first, unavailable-but-feasible as
+  // fallback) but scans only the bundle nodes named by the location index
+  // derived from node totals, instead of the whole cluster view.
+  auto pg = PlacementGroupID::Of(JobID::FromInt(3));
+  instrumented_io_context io_context;
+  ClusterResourceScheduler resource_scheduler(
+      PeriodicalRunner::Create(io_context),
+      scheduling::NodeID(NodeID::FromRandom().Binary()),
+      absl::flat_hash_map<std::string, double>({{"CPU", 8}}),
+      is_node_available_fn_,
+      fake_gauge_,
+      clock_);
+  ASSERT_TRUE(resource_scheduler.IsLocalNodeWithRaylet());
+
+  auto to_map = [](const std::unordered_map<std::string, double> &m) {
+    return absl::flat_hash_map<std::string, double>(m.begin(), m.end());
+  };
+  auto zeroed = [](absl::flat_hash_map<std::string, double> m) {
+    for (auto &entry : m) {
+      entry.second = 0.0;
+    }
+    return m;
+  };
+  auto bundle0_node = scheduling::NodeID(NodeID::FromRandom().Binary());
+  auto bundle1_node = scheduling::NodeID(NodeID::FromRandom().Binary());
+  auto totals0 = to_map(AddPlacementGroupConstraint({{"CPU", 2.0}}, pg, 0));
+  auto totals1 = to_map(AddPlacementGroupConstraint({{"CPU", 2.0}}, pg, 1));
+  resource_scheduler.GetClusterResourceManager().AddOrUpdateNode(
+      bundle0_node, totals0, totals0);
+  resource_scheduler.GetClusterResourceManager().AddOrUpdateNode(
+      bundle1_node, totals1, zeroed(totals1));
+
+  rpc::SchedulingStrategy strategy;
+  strategy.mutable_placement_group_scheduling_strategy()->set_placement_group_id(
+      pg.Binary());
+  strategy.mutable_placement_group_scheduling_strategy()
+      ->set_placement_group_bundle_index(-1);
+
+  int64_t violations;
+  bool is_infeasible;
+  // A wildcard lease goes to the available bundle node.
+  ResourceRequest wildcard_request =
+      CreateResourceRequest(AddPlacementGroupConstraint({{"CPU", 1}}, pg, -1));
+  ASSERT_EQ(resource_scheduler.GetBestSchedulableNode(wildcard_request,
+                                                      strategy,
+                                                      false,
+                                                      false,
+                                                      std::string(),
+                                                      &violations,
+                                                      &is_infeasible),
+            bundle0_node);
+  ASSERT_FALSE(is_infeasible);
+
+  // A lease pinned to bundle 1 goes to bundle 1's node even though it has no
+  // available resources right now (feasible-but-unavailable, so it queues
+  // there instead of being misclassified as infeasible).
+  rpc::SchedulingStrategy indexed_strategy;
+  indexed_strategy.mutable_placement_group_scheduling_strategy()
+      ->set_placement_group_id(pg.Binary());
+  indexed_strategy.mutable_placement_group_scheduling_strategy()
+      ->set_placement_group_bundle_index(1);
+  ResourceRequest indexed_request =
+      CreateResourceRequest(AddPlacementGroupConstraint({{"CPU", 1}}, pg, 1));
+  ASSERT_EQ(resource_scheduler.GetBestSchedulableNode(indexed_request,
+                                                      indexed_strategy,
+                                                      false,
+                                                      false,
+                                                      std::string(),
+                                                      &violations,
+                                                      &is_infeasible),
+            bundle1_node);
+  ASSERT_FALSE(is_infeasible);
+
+  // With every bundle node busy, the lease still lands on a bundle node.
+  resource_scheduler.GetClusterResourceManager().AddOrUpdateNode(
+      bundle0_node, totals0, zeroed(totals0));
+  auto busy_target = resource_scheduler.GetBestSchedulableNode(wildcard_request,
+                                                               strategy,
+                                                               false,
+                                                               false,
+                                                               std::string(),
+                                                               &violations,
+                                                               &is_infeasible);
+  ASSERT_TRUE(busy_target == bundle0_node || busy_target == bundle1_node);
+  ASSERT_FALSE(is_infeasible);
+
+  // A placement group with no bundles anywhere in the view is infeasible.
+  auto missing_pg = PlacementGroupID::Of(JobID::FromInt(4));
+  rpc::SchedulingStrategy missing_strategy;
+  missing_strategy.mutable_placement_group_scheduling_strategy()
+      ->set_placement_group_id(missing_pg.Binary());
+  missing_strategy.mutable_placement_group_scheduling_strategy()
+      ->set_placement_group_bundle_index(-1);
+  ResourceRequest missing_request =
+      CreateResourceRequest(AddPlacementGroupConstraint({{"CPU", 1}}, missing_pg, -1));
+  ASSERT_TRUE(resource_scheduler
+                  .GetBestSchedulableNode(missing_request,
+                                          missing_strategy,
+                                          false,
+                                          false,
+                                          std::string(),
+                                          &violations,
+                                          &is_infeasible)
+                  .IsNil());
+  ASSERT_TRUE(is_infeasible);
+}
+
 TEST_F(ClusterResourceSchedulerTest, LabelSelectorIsSchedulableOnNodeTest) {
   absl::flat_hash_map<std::string, double> resource_total({{"CPU", 10}});
   auto node_1 = scheduling::NodeID(NodeID::FromRandom().Binary());

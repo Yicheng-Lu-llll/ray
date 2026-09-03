@@ -16,6 +16,7 @@
 
 #include <string>
 
+#include "absl/container/flat_hash_set.h"
 #include "ray/common/id.h"
 #include "ray/ray_syncer/ray_syncer.h"
 
@@ -80,6 +81,17 @@ bool NodeState::ConsumeSyncMessage(std::shared_ptr<const RaySyncMessage> message
     receiver->ConsumeSyncMessage(message);
   }
   return true;
+}
+
+void NodeState::NotifyBatchApplied() {
+  // The same module may be registered for several message types (the raylet's
+  // NodeManager receives both RESOURCE_VIEW and COMMANDS); notify it once.
+  absl::flat_hash_set<ReceiverInterface *> notified;
+  for (auto *receiver : receivers_) {
+    if (receiver != nullptr && notified.insert(receiver).second) {
+      receiver->OnSyncBatchApplied();
+    }
+  }
 }
 
 }  // namespace ray::syncer

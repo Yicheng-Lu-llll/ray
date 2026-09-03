@@ -194,6 +194,7 @@ TEST_F(RaySyncerTest, RaySyncerBidiReactorBase) {
       /* remote_node_id */ node_id.Binary(),
       /* message_processor */
       [](std::shared_ptr<const ray::rpc::syncer::RaySyncMessage>) {},
+      /* batch_applied_callback */ []() {},
       /* max_batch_size */ 1,
       /* max_batch_delay_ms */ 0);
   sync_reactor.SetSelfRef(std::shared_ptr<MockRaySyncerBidiReactorBase<MockReactor>>(
@@ -229,15 +230,15 @@ TEST_F(RaySyncerTest, RaySyncerBidiReactorBase) {
 
 TEST_F(RaySyncerTest, RaySyncerBidiReactorBaseReadsAreNotGatedByProcessing) {
   std::vector<std::shared_ptr<const RaySyncMessage>> processed;
-  std::atomic<size_t> processed_count{0};
+  std::atomic<size_t> batches_applied{0};
   MockRaySyncerBidiReactorBase<MockReactor> sync_reactor(
       /* io_context */ io_context_,
       /* remote_node_id */ NodeID::FromRandom().Binary(),
       /* message_processor */
-      [&processed, &processed_count](std::shared_ptr<const RaySyncMessage> msg) {
+      [&processed](std::shared_ptr<const RaySyncMessage> msg) {
         processed.push_back(std::move(msg));
-        ++processed_count;
       },
+      /* batch_applied_callback */ [&batches_applied]() { ++batches_applied; },
       /* max_batch_size */ 1,
       /* max_batch_delay_ms */ 0);
   sync_reactor.SetSelfRef(std::shared_ptr<MockRaySyncerBidiReactorBase<MockReactor>>(
@@ -269,12 +270,13 @@ TEST_F(RaySyncerTest, RaySyncerBidiReactorBaseReadsAreNotGatedByProcessing) {
 
   // Every read was re-armed without waiting for the io context to apply anything.
   ASSERT_EQ(4, sync_reactor.read_count);
-  ASSERT_EQ(0, processed_count.load());
+  ASSERT_EQ(0, batches_applied.load());
 
   release_io_context.set_value();
-  // One drain applies both nodes, with the newest version winning.
-  ASSERT_TRUE(WaitForCondition(
-      [&processed_count]() { return processed_count.load() == 2; }, 5000));
+  ASSERT_TRUE(
+      WaitForCondition([&batches_applied]() { return batches_applied.load() == 1; },
+                       5000));
+  // One drain, one message per node, with the newest version winning.
   ASSERT_EQ(2, processed.size());
   for (const auto &msg : processed) {
     ASSERT_EQ(msg->node_id() == node_a.Binary() ? 2 : 1, msg->version());
@@ -289,6 +291,7 @@ TEST_F(RaySyncerTest, RaySyncerBidiReactorBaseBatchSizeTriggerSend) {
       /* remote_node_id */ node_id.Binary(),
       /* message_processor */
       [](std::shared_ptr<const ray::rpc::syncer::RaySyncMessage>) {},
+      /* batch_applied_callback */ []() {},
       /* max_batch_size */ 3,
       /* max_batch_delay_ms */ 100);
   sync_reactor.SetSelfRef(std::shared_ptr<MockRaySyncerBidiReactorBase<MockReactor>>(
@@ -330,6 +333,7 @@ TEST_F(RaySyncerTest, RaySyncerBidiReactorBaseBatchTimeoutTriggerSend) {
       /* remote_node_id */ node_id.Binary(),
       /* message_processor */
       [](std::shared_ptr<const ray::rpc::syncer::RaySyncMessage>) {},
+      /* batch_applied_callback */ []() {},
       /* max_batch_size */ 3,
       /* max_batch_delay_ms */ 100);
   sync_reactor.SetSelfRef(std::shared_ptr<MockRaySyncerBidiReactorBase<MockReactor>>(
@@ -985,6 +989,7 @@ struct MockRaySyncerService : public ray::rpc::syncer::RaySyncer::CallbackServic
                                        io_context,
                                        node_id.Binary(),
                                        message_processor,
+                                       /*batch_applied_callback=*/[]() {},
                                        cleanup_cb,
                                        nullptr,
                                        ray::rpc::AuthenticationTokenValidator::instance(),
@@ -1026,6 +1031,7 @@ class SyncerReactorTest : public ::testing::Test {
             client_node_id.Binary(),
             io_context_,
             [this](auto msg) { client_received_message.set_value(msg); },
+            /*batch_applied_callback=*/[]() {},
             [this](RaySyncerBidiReactor *reactor, bool r) {
               client_cleanup.set_value(std::make_pair(reactor->GetRemoteNodeID(), r));
             },

@@ -40,17 +40,22 @@ class RaySyncerBidiReactorBase : public RaySyncerBidiReactor, public T {
   /// \param io_context The io context for the callback.
   /// \param remote_node_id The node id connects to.
   /// \param message_processor The callback for the message received.
+  /// \param batch_applied_callback Called on the io context after every drain of
+  ///     received messages, once all messages in that drain went through
+  ///     message_processor.
   /// \param max_batch_size The maximum number of messages in a batch.
   /// \param max_batch_delay_ms The maximum delay time to wait before sending a batch.
   RaySyncerBidiReactorBase(
       instrumented_io_context &io_context,
       std::string remote_node_id,
       std::function<void(std::shared_ptr<const RaySyncMessage>)> message_processor,
+      std::function<void()> batch_applied_callback,
       size_t max_batch_size,
       uint64_t max_batch_delay_ms)
       : RaySyncerBidiReactor(std::move(remote_node_id)),
         io_context_(io_context),
         message_processor_(std::move(message_processor)),
+        batch_applied_callback_(std::move(batch_applied_callback)),
         max_batch_size_(max_batch_size),
         max_batch_delay_ms_(std::chrono::milliseconds(max_batch_delay_ms)),
         batch_timer_(io_context),
@@ -167,6 +172,9 @@ class RaySyncerBidiReactorBase : public RaySyncerBidiReactor, public T {
             << node_versions[message.message_type()]
             << ". Message type: " << message.message_type();
       }
+    }
+    if (!buffer.empty() && batch_applied_callback_) {
+      batch_applied_callback_();
     }
   }
 
@@ -312,6 +320,9 @@ class RaySyncerBidiReactorBase : public RaySyncerBidiReactor, public T {
 
   /// Handler of a message update.
   const std::function<void(std::shared_ptr<const RaySyncMessage>)> message_processor_;
+
+  /// Called after each DrainReceived that applied at least one message.
+  const std::function<void()> batch_applied_callback_;
 
  private:
   /// Buffering all the updates. Sending will be done in an async way.

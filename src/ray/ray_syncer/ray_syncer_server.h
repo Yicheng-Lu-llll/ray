@@ -40,6 +40,7 @@ class RayServerBidiReactor : public RaySyncerBidiReactorBase<ServerBidiReactor> 
       instrumented_io_context &io_context,
       const std::string &local_node_id,
       std::function<void(std::shared_ptr<const RaySyncMessage>)> message_processor,
+      std::function<void()> batch_applied_callback,
       std::function<void(RaySyncerBidiReactor *, bool)> cleanup_cb,
       std::shared_ptr<const ray::rpc::AuthenticationToken> auth_token,
       ray::rpc::AuthenticationTokenValidator &auth_token_validator,

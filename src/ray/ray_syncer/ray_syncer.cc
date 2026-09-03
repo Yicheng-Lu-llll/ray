@@ -90,6 +90,8 @@ void RaySyncer::Connect(const std::string &node_id,
             /* io_context */ io_context_,
             /* message_processor */
             [this](auto msg) { BroadcastMessage(std::move(msg)); },
+            /* batch_applied_callback */
+            [this]() { node_state_->NotifyBatchApplied(); },
             /* cleanup_cb */
             [this, channel](RaySyncerBidiReactor *bidi_reactor, bool restart) {
               const std::string &remote_node_id = bidi_reactor->GetRemoteNodeID();
@@ -231,6 +233,8 @@ ServerBidiReactor *RaySyncerService::StartSync(grpc::CallbackServerContext *cont
       syncer_.GetLocalNodeID(),
       /*message_processor=*/
       [this](auto msg) mutable { syncer_.BroadcastMessage(msg); },
+      /*batch_applied_callback=*/
+      [this]() { syncer_.node_state_->NotifyBatchApplied(); },
       /*cleanup_cb=*/
       [this](RaySyncerBidiReactor *bidi_reactor, bool reconnect) mutable {
         // No need to reconnect for server side.

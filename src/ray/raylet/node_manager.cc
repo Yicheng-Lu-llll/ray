@@ -949,6 +949,7 @@ void NodeManager::NodeAdded(const rpc::GcsNodeAddressAndLiveness &node_info) {
                                                  syncer::MessageType::RESOURCE_VIEW)) {
     if (sync_msg) {
       ConsumeSyncMessage(sync_msg);
+      OnSyncBatchApplied();
     }
   }
 }
@@ -3088,6 +3089,13 @@ void NodeManager::RecordMetrics() {
   lease_dependency_manager_.RecordMetrics();
 }
 
+void NodeManager::OnSyncBatchApplied() {
+  if (resource_view_changed_) {
+    resource_view_changed_ = false;
+    cluster_lease_manager_.ScheduleAndGrantLeases();
+  }
+}
+
 void NodeManager::ConsumeSyncMessage(
     std::shared_ptr<const syncer::RaySyncMessage> message) {
   if (message->message_type() == syncer::MessageType::RESOURCE_VIEW) {
@@ -3105,9 +3113,7 @@ void NodeManager::ConsumeSyncMessage(
     }
     const bool capacity_updated = ResourceCreateUpdated(node_id, resources);
     const bool usage_update = UpdateResourceUsage(node_id, resource_view_sync_message);
-    if (capacity_updated || usage_update) {
-      cluster_lease_manager_.ScheduleAndGrantLeases();
-    }
+    resource_view_changed_ = resource_view_changed_ || capacity_updated || usage_update;
   } else if (message->message_type() == syncer::MessageType::COMMANDS) {
     syncer::CommandsSyncMessage commands_sync_message;
     commands_sync_message.ParseFromString(message->sync_message());

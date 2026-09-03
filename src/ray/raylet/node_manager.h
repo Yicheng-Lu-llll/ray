@@ -239,6 +239,10 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   //   - COMMANDS: a request to run the Python garbage collector globally across Raylets.
   void ConsumeSyncMessage(std::shared_ptr<const syncer::RaySyncMessage> message) override;
 
+  // Runs one scheduling pass if any RESOURCE_VIEW message in the batch changed the
+  // cluster view, instead of one pass per message.
+  void OnSyncBatchApplied() override;
+
   // Generate a RaySyncer sync message to be sent to other Raylets.
   //
   // This is currently only used to generate messages for the COMMANDS channel to request
@@ -1019,6 +1023,10 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
 
   /// Ray syncer for synchronization
   syncer::RaySyncer ray_syncer_;
+
+  /// Set by ConsumeSyncMessage when a RESOURCE_VIEW message changed the cluster
+  /// view; consumed by OnSyncBatchApplied to run a single scheduling pass per batch.
+  bool resource_view_changed_ = false;
 
   /// `version` for the RaySyncer COMMANDS channel. Monotonically incremented each time
   /// we issue a GC command so that none of the messages are dropped.

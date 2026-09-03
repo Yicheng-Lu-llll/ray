@@ -76,6 +76,9 @@ class NodeState {
   /// \return true if the local node doesn't have message with newer version.
   bool ConsumeSyncMessage(std::shared_ptr<const RaySyncMessage> message);
 
+  /// Tell every receiver that a batch of messages has been consumed.
+  void NotifyBatchApplied();
+
   /// Return the cluster view of this local node.
   const absl::flat_hash_map<
       std::string,

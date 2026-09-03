@@ -71,6 +71,11 @@ struct ReceiverInterface {
   /// \param message The message received from remote node.
   virtual void ConsumeSyncMessage(std::shared_ptr<const RaySyncMessage> message) = 0;
 
+  /// Called after a batch of received messages has been consumed. Work that only
+  /// needs to happen once the view has caught up (e.g. rescheduling) belongs here
+  /// instead of in ConsumeSyncMessage.
+  virtual void OnSyncBatchApplied() {}
+
   virtual ~ReceiverInterface() {}
 };
 

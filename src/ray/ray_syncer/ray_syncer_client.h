@@ -34,6 +34,7 @@ class RayClientBidiReactor : public RaySyncerBidiReactorBase<ClientBidiReactor> 
       const std::string &local_node_id,
       instrumented_io_context &io_context,
       std::function<void(std::shared_ptr<const RaySyncMessage>)> message_processor,
+      std::function<void()> batch_applied_callback,
       std::function<void(RaySyncerBidiReactor *, bool)> cleanup_cb,
       std::unique_ptr<ray::rpc::syncer::RaySyncer::Stub> stub,
       size_t max_batch_size,

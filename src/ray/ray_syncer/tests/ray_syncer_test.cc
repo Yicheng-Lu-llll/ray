@@ -33,6 +33,8 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <atomic>
+#include <future>
 #include <vector>
 
 #include "ray/asio/periodical_runner.h"

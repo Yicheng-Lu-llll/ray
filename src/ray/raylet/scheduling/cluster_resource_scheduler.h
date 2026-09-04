@@ -216,7 +216,8 @@ class ClusterResourceScheduler {
       bool *is_infeasible);
 
   /// Judging whether it affinity with placement group bundle
-  bool IsAffinityWithBundleSchedule(const rpc::SchedulingStrategy &scheduling_strategy);
+  bool IsPlacementGroupSchedulingStrategy(
+      const rpc::SchedulingStrategy &scheduling_strategy);
   /// Identifier of local node.
   scheduling::NodeID local_node_id_;
   /// Callback to check if node is available.

@@ -1707,9 +1707,6 @@ bool ReferenceCounter::IsObjectPendingCreation(const ObjectID &object_id) const 
 }
 
 void ReferenceCounter::PushToLocationSubscribers(ReferenceTable::iterator it) {
-  if (!it->second.has_ever_had_location_subscriber) {
-    return;
-  }
   const auto &object_id = it->first;
   const auto &locations = it->second.locations;
   auto object_size = it->second.object_size_;

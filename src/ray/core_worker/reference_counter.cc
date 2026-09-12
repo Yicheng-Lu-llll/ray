@@ -796,10 +796,8 @@ void ReferenceCounter::DeleteReferenceInternal(ReferenceTable::iterator it,
 void ReferenceCounter::EraseReference(ReferenceTable::iterator it) {
   // It is possible that when ref count reaches zero, there are still subscribers.
   // See https://github.com/ray-project/ray/pull/63560 for details
-  if (it->second.has_ever_had_location_subscriber) {
-    object_info_publisher_->PublishFailure(
-        rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL, it->first.Binary());
-  }
+  object_info_publisher_->PublishFailure(
+      rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL, it->first.Binary());
 
   RAY_CHECK(it->second.ShouldDelete(lineage_pinning_enabled_));
   auto index_it = reconstructable_owned_objects_index_.find(it->first);

@@ -69,6 +69,20 @@ def _is_path(path_or_uri: str) -> bool:
         raise TypeError(f"Unsupported path type: {type(parsed_path).__name__}")
 
 
+def get_uri_path(pkg_uri: str, protocol: Protocol) -> str:
+    """Returns the on node path written into a `file://` or `local://` URI.
+
+    A Windows drive can sit behind the URI's empty authority
+    ("file:///C:/pkg.zip", which is what `Path.as_uri()` writes) or in the
+    authority itself ("file://C:/pkg.zip"). Both name the same file, so the
+    leading slash is dropped from the first.
+    """
+    path = pkg_uri[len(f"{protocol.value}://") :]
+    if path.startswith("/") and _WINDOWS_DRIVE_PATH.match(path[1:]):
+        return path[1:]
+    return path
+
+
 def parse_uri(pkg_uri: str) -> Tuple[Protocol, str]:
     """
     Parse package uri into protocol and package name based on its format.
@@ -110,10 +124,7 @@ def parse_uri(pkg_uri: str) -> Tuple[Protocol, str]:
                 "start with local://. Write local:///path/in/image, or "
                 "local://C:/path/in/image on Windows."
             )
-        path = pkg_uri[len(prefix) :]
-        if path.startswith("/") and _WINDOWS_DRIVE_PATH.match(path[1:]):
-            # A drive spelled with file://'s empty authority: "local:///C:/app".
-            path = path[1:]
+        path = get_uri_path(pkg_uri, Protocol.LOCAL)
         if not (path.startswith("/") or _WINDOWS_DRIVE_PATH.match(path)):
             raise ValueError(
                 f'Invalid "local://" runtime_env URI "{pkg_uri}": the path must be '

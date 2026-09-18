@@ -1,7 +1,7 @@
 import os
 from urllib.parse import urlparse
 
-from ray._common.runtime_env_uri import Protocol
+from ray._common.runtime_env_uri import Protocol, get_uri_path
 
 RAY_RUNTIME_ENV_HTTP_USER_AGENT_ENV_VAR = "RAY_RUNTIME_ENV_HTTP_USER_AGENT"
 RAY_RUNTIME_ENV_BEARER_TOKEN_ENV_VAR = "RAY_RUNTIME_ENV_BEARER_TOKEN"
@@ -262,7 +262,7 @@ class ProtocolsProvider:
         open_file = None
 
         if protocol == "file":
-            source_uri = source_uri[len("file://") :]
+            source_uri = get_uri_path(source_uri, Protocol.FILE)
 
             def open_file(uri, mode, *, transport_params=None):
                 return open(uri, mode)

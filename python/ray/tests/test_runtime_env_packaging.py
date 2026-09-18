@@ -1065,6 +1065,22 @@ def test_http_downloader_uses_smart_open_headers(tmp_path, monkeypatch):
     assert tp["timeout"] == 60
 
 
+def test_file_downloader_reads_a_file_uri(tmp_path):
+    """`Path.as_uri()` puts a Windows drive behind the URI's empty authority."""
+    payload = b"dummy-zip-content"
+    source_file = tmp_path / "source.zip"
+    source_file.write_bytes(payload)
+    dest_file = tmp_path / "downloaded.zip"
+
+    ProtocolsProvider.download_remote_uri(
+        protocol="file",
+        source_uri=source_file.as_uri(),
+        dest_file=str(dest_file),
+    )
+
+    assert dest_file.read_bytes() == payload
+
+
 @pytest.mark.parametrize(
     "extension,mode",
     [

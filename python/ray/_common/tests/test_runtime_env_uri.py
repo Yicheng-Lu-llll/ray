@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from ray._common.runtime_env_uri import Protocol, parse_uri
+from ray._common.runtime_env_uri import Protocol, get_uri_path, parse_uri
 
 
 def _sha1_hex(s: str) -> str:
@@ -217,6 +217,23 @@ def test_parse_uri_tar_gz():
     protocol, package_name = parse_uri("https://example.com/path/my.pkg.tar.gz")
     assert package_name.endswith(".tar.gz")
     assert "_" in package_name
+
+
+@pytest.mark.parametrize(
+    "uri,protocol,path",
+    [
+        ("file:///tmp/pkg.zip", Protocol.FILE, "/tmp/pkg.zip"),
+        ("file:///C:/app/pkg.zip", Protocol.FILE, "C:/app/pkg.zip"),
+        ("file:///C:\\app\\pkg.zip", Protocol.FILE, "C:\\app\\pkg.zip"),
+        ("file://C:/app/pkg.zip", Protocol.FILE, "C:/app/pkg.zip"),
+        ("local:///app", Protocol.LOCAL, "/app"),
+        ("local:///C:/app", Protocol.LOCAL, "C:/app"),
+        ("local://C:/app", Protocol.LOCAL, "C:/app"),
+    ],
+)
+def test_get_uri_path_reads_the_same_path_on_every_platform(uri, protocol, path):
+    """A URI is not a path: the host OS must not change which file it names."""
+    assert get_uri_path(uri, protocol) == path
 
 
 def test_parse_uri_rejects_local_path():

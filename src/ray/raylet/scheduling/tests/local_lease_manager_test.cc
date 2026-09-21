@@ -274,9 +274,11 @@ std::shared_ptr<ClusterResourceScheduler> CreateSingleNodeScheduler(
   return scheduler;
 }
 
-RayLease CreateLease(const std::unordered_map<std::string, double> &required_resources,
-                     const std::string &task_name = "default",
-                     const std::vector<std::unique_ptr<TaskArg>> &args = {}) {
+RayLease CreateLease(
+    const std::unordered_map<std::string, double> &required_resources,
+    const std::string &task_name = "default",
+    const std::vector<std::unique_ptr<TaskArg>> &args = {},
+    const rpc::SchedulingStrategy &scheduling_strategy = rpc::SchedulingStrategy()) {
   TaskSpecBuilder spec_builder;
   TaskID id = RandomTaskId();
   JobID job_id = RandomJobId();
@@ -304,7 +306,7 @@ RayLease CreateLease(const std::unordered_map<std::string, double> &required_res
       "",
       nullptr);
 
-  spec_builder.SetNormalTaskSpec(0, false, "", rpc::SchedulingStrategy(), ActorID::Nil());
+  spec_builder.SetNormalTaskSpec(0, false, "", scheduling_strategy, ActorID::Nil());
 
   for (const auto &arg : args) {
     spec_builder.AddArg(*arg);
@@ -587,6 +589,49 @@ TEST_F(LocalLeaseManagerTest, TestNoLeakOnImpossibleInfeasibleLease) {
   ASSERT_EQ(local_lease_manager_->GetLeasesToGrant().size(), 0);
   // The node is idle again as the leases are cancelled.
   ASSERT_EQ(scheduler_->GetLocalResourceManager().WasLastRecordedNodeStateIdle(), true);
+}
+
+TEST_F(LocalLeaseManagerTest, TestHardNodeAffinityFailsWhenLocalNodeFillsUp) {
+  // Tests that a lease pinned to this node with fail_on_unavailable is cancelled rather
+  // than left waiting when the node fills up between scheduling and granting.
+  auto arg_id = ObjectID::FromRandom();
+  std::vector<std::unique_ptr<TaskArg>> args;
+  args.push_back(
+      std::make_unique<TaskArgByReference>(arg_id, rpc::Address{}, "call_site"));
+  rpc::SchedulingStrategy scheduling_strategy;
+  auto *node_affinity = scheduling_strategy.mutable_node_affinity_scheduling_strategy();
+  node_affinity->set_node_id(id_.Binary());
+  node_affinity->set_soft(false);
+  node_affinity->set_fail_on_unavailable(true);
+  auto lease = CreateLease({{kCPU_ResourceLabel, 1}}, "f", args, scheduling_strategy);
+
+  EXPECT_CALL(object_manager_, Pull(_, _, _)).WillOnce(::testing::Return(1));
+  int num_callbacks_called = 0;
+  auto callback = [&num_callbacks_called](Status status,
+                                          std::function<void()> success,
+                                          std::function<void()> failure) {
+    ++num_callbacks_called;
+  };
+  rpc::RequestWorkerLeaseReply reply;
+  local_lease_manager_->QueueAndScheduleLease(std::make_shared<internal::Work>(
+      lease,
+      false,
+      false,
+      std::vector<internal::ReplyCallback>{internal::ReplyCallback(callback, &reply)},
+      internal::WorkStatus::WAITING));
+
+  // Something else takes every CPU while the lease waits for its argument.
+  ASSERT_TRUE(scheduler_->GetLocalResourceManager().AllocateLocalTaskResources(
+      absl::flat_hash_map<std::string, double>{{kCPU_ResourceLabel, 3}},
+      std::make_shared<TaskResourceInstances>()));
+
+  // The argument arrives; granting finds no CPU and must fail the lease.
+  local_lease_manager_->LeasesUnblocked({lease.GetLeaseSpecification().LeaseId()});
+
+  ASSERT_EQ(num_callbacks_called, 1);
+  ASSERT_EQ(reply.failure_type(),
+            rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_UNSCHEDULABLE);
+  ASSERT_EQ(local_lease_manager_->GetLeasesToGrant().size(), 0);
 }
 
 TEST_F(LocalLeaseManagerTest, TestNodeBusyWhenPullingTaskArguments) {

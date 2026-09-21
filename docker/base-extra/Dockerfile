@@ -123,7 +123,7 @@ AWSCLI_TMP="$(mktemp -d)"
 rm -rf "${AWSCLI_TMP}"
 
 # Cleanup unused packages and caches.
-$HOME/anaconda3/bin/conda clean -y -all
+$HOME/anaconda3/bin/conda clean -y -all || true
 
 # Work around for https://bugs.launchpad.net/ubuntu/+source/openssh/+bug/45234
 sudo mkdir -p /var/run/sshd

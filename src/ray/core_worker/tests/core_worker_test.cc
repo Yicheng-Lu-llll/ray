@@ -1794,5 +1794,38 @@ TEST_F(CoreWorkerTest, FreeLocalObjectsKeepsBufferingPastWarnThreshold) {
   warn_objects = prev;
 }
 
+TEST_F(CoreWorkerTest, LateLocationReportForFreedObjectFreesThatCopy) {
+  const NodeID node_id = core_worker_->GetCurrentNodeId();
+  auto report_location = [&](const ObjectID &object_id) {
+    rpc::UpdateObjectLocationBatchRequest request;
+    request.set_intended_worker_id(core_worker_->GetWorkerID().Binary());
+    request.set_node_id(node_id.Binary());
+    auto *update = request.add_object_location_updates();
+    update->set_object_id(object_id.Binary());
+    update->set_plasma_location_update(rpc::ObjectPlasmaLocationUpdate::ADDED);
+    rpc::UpdateObjectLocationBatchReply reply;
+    core_worker_->HandleUpdateObjectLocationBatch(
+        request, &reply, [](Status, std::function<void()>, std::function<void()>) {});
+  };
+
+  auto live_object_id = ObjectID::FromRandom();
+  rpc::Address owner_address;
+  owner_address.set_worker_id(core_worker_->GetWorkerID().Binary());
+  reference_counter_->AddOwnedObject(live_object_id,
+                                     {},
+                                     owner_address,
+                                     "",
+                                     0,
+                                     LineageReconstructionEligibility::INELIGIBLE_PUT,
+                                     /*add_local_ref=*/true);
+  report_location(live_object_id);
+  EXPECT_TRUE(local_raylet_client_->free_local_objects_batches.empty());
+
+  // The owner no longer tracks this object, so the copy it just learned about
+  // must be freed.
+  report_location(ObjectID::FromRandom());
+  EXPECT_EQ(local_raylet_client_->free_local_objects_batches, (std::vector<int>{1}));
+}
+
 }  // namespace core
 }  // namespace ray

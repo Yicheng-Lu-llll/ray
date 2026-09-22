@@ -4995,26 +4995,33 @@ std::shared_ptr<RayletClientInterface> CoreWorker::GetRayletRpcClient(
 
 void CoreWorker::FreeObjectOnNodesAsync(const ObjectID &object_id,
                                         const absl::flat_hash_set<NodeID> &locations) {
-  RAY_LOG(DEBUG) << absl::StrFormat("Freeing object %s asynchronously via request.",
-                                    object_id.Hex());
+  // Experiment: hand the whole free-send to the io thread so the thread that drops the
+  // last reference (often the Python main thread, inside ObjectRef's destructor while
+  // holding the reference counter's lock) only enqueues. Same RPCs, same count.
+  io_service_.post(
+      [this, object_id, locations]() {
+          RAY_LOG(DEBUG) << absl::StrFormat("Freeing object %s asynchronously via request.",
+                                            object_id.Hex());
 
-  const size_t warn_backlog = static_cast<size_t>(
-      RayConfig::instance().free_local_objects_backlog_warn_objects_per_node());
-  for (const auto &node_id : locations) {
-    {
-      absl::MutexLock lock(&free_batch_mu_);
-      std::deque<ObjectID> &queue = free_pending_[node_id];
-      queue.push_back(object_id);
-      // Warn on first crossing the threshold, then every 1024 objects. Keep
-      // buffering; never drop.
-      if (queue.size() >= warn_backlog && (queue.size() - warn_backlog) % 1024 == 0) {
-        RAY_LOG(WARNING) << "FreeLocalObjects backlog for node " << node_id << " is "
-                         << queue.size()
-                         << " objects; it is draining slowly or is unreachable.";
-      }
-    }
-    SendFreeLocalObjectsBatchIfNeeded(node_id);
-  }
+          const size_t warn_backlog = static_cast<size_t>(
+              RayConfig::instance().free_local_objects_backlog_warn_objects_per_node());
+          for (const auto &node_id : locations) {
+            {
+              absl::MutexLock lock(&free_batch_mu_);
+              std::deque<ObjectID> &queue = free_pending_[node_id];
+              queue.push_back(object_id);
+              // Warn on first crossing the threshold, then every 1024 objects. Keep
+              // buffering; never drop.
+              if (queue.size() >= warn_backlog && (queue.size() - warn_backlog) % 1024 == 0) {
+                RAY_LOG(WARNING) << "FreeLocalObjects backlog for node " << node_id << " is "
+                                 << queue.size()
+                                 << " objects; it is draining slowly or is unreachable.";
+              }
+            }
+            SendFreeLocalObjectsBatchIfNeeded(node_id);
+          }
+      },
+      "CoreWorker.FreeObjectOnNodesAsync");
 }
 
 void CoreWorker::SendFreeLocalObjectsBatchIfNeeded(const NodeID &node_id) {

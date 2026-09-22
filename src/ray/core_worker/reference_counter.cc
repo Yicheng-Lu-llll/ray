@@ -850,7 +850,7 @@ void ReferenceCounter::OnObjectOutOfScopeOrFreed(ReferenceTable::iterator it) {
   // must not tell the cluster to evict an object that is still owned
   // elsewhere.
   if (it->second.owned_by_us_) {
-    absl::flat_hash_set<NodeID> locations_set = it->second.locations;
+    absl::flat_hash_set<NodeID> locations_set;  // experiment: free only the primary copy
     if (it->second.pinned_at_node_id_.has_value()) {
       locations_set.insert(*it->second.pinned_at_node_id_);
     }

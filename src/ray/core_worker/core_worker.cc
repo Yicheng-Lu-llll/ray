@@ -4567,16 +4567,23 @@ std::shared_ptr<RayletClientInterface> CoreWorker::GetRayletRpcClient(
 
 void CoreWorker::FreeObjectOnNodesAsync(const ObjectID &object_id,
                                         const absl::flat_hash_set<NodeID> &locations) {
-  rpc::FreeLocalObjectsRequest request;
-  request.add_object_ids(object_id.Binary());
+  // Experiment: hand the whole free-send to the io thread so the thread that drops the
+  // last reference (often the Python main thread, inside ObjectRef's destructor while
+  // holding the reference counter's lock) only enqueues. Same RPCs, same count.
+  io_service_.post(
+      [this, object_id, locations]() {
+          rpc::FreeLocalObjectsRequest request;
+          request.add_object_ids(object_id.Binary());
 
-  for (const auto &node_id : locations) {
-    auto client = GetRayletRpcClient(node_id);
-    if (client == nullptr) {
-      continue;
-    }
-    client->FreeLocalObjects(request);
-  }
+          for (const auto &node_id : locations) {
+            auto client = GetRayletRpcClient(node_id);
+            if (client == nullptr) {
+              continue;
+            }
+            client->FreeLocalObjects(request);
+          }
+      },
+      "CoreWorker.FreeObjectOnNodesAsync");
 }
 
 }  // namespace ray::core

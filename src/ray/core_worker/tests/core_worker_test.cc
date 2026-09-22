@@ -1737,13 +1737,27 @@ TEST_F(CoreWorkerTest, AddObjectOutOfScopeCallback_FiresExactlyOnce) {
   EXPECT_EQ(fire_count, 1);
 }
 
+TEST_F(CoreWorkerTest, FreeLocalObjectsSendsFromIoServiceInOneBatch) {
+  const NodeID node_id = core_worker_->GetCurrentNodeId();
+
+  core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
+  core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
+  core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
+  EXPECT_TRUE(local_raylet_client_->free_local_objects_batches.empty());
+
+  io_service_.poll();
+  EXPECT_EQ(local_raylet_client_->free_local_objects_batches, (std::vector<int>{3}));
+}
+
 TEST_F(CoreWorkerTest, FreeLocalObjectsCoalescesWhileInFlight) {
   const NodeID node_id = core_worker_->GetCurrentNodeId();
 
   // First free goes out alone; the next two ride the batch the reply triggers.
   core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
+  io_service_.poll();
   core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
   core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
+  io_service_.poll();
   EXPECT_EQ(local_raylet_client_->free_local_objects_batches, (std::vector<int>{1}));
 
   ASSERT_TRUE(local_raylet_client_->ReplyFreeLocalObjects());
@@ -1759,7 +1773,9 @@ TEST_F(CoreWorkerTest, FreeLocalObjectsFailureDropsNodeQueue) {
   const NodeID node_id = core_worker_->GetCurrentNodeId();
 
   core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
+  io_service_.poll();
   core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
+  io_service_.poll();
   EXPECT_EQ(local_raylet_client_->free_local_objects_batches.size(), 1u);
 
   // A failed reply drops the queued id instead of resending it.
@@ -1769,6 +1785,7 @@ TEST_F(CoreWorkerTest, FreeLocalObjectsFailureDropsNodeQueue) {
 
   // The node is not wedged: a later free starts a fresh RPC.
   core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
+  io_service_.poll();
   EXPECT_EQ(local_raylet_client_->free_local_objects_batches.size(), 2u);
 }
 
@@ -1783,6 +1800,7 @@ TEST_F(CoreWorkerTest, FreeLocalObjectsKeepsBufferingPastWarnThreshold) {
   for (int i = 0; i < kNumObjects; i++) {
     core_worker_->FreeObjectOnNodesAsync(ObjectID::FromRandom(), {node_id});
   }
+  io_service_.poll();
   while (local_raylet_client_->ReplyFreeLocalObjects()) {
   }
 

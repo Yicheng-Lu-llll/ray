@@ -5005,6 +5005,7 @@ void CoreWorker::FreeObjectOnNodesAsync(const ObjectID &object_id,
   const size_t warn_backlog = static_cast<size_t>(
       RayConfig::instance().free_local_objects_backlog_warn_objects_per_node());
   for (const auto &node_id : locations) {
+    bool schedule_flush = false;
     {
       absl::MutexLock lock(&free_batch_mu_);
       std::deque<ObjectID> &queue = free_pending_[node_id];
@@ -5016,8 +5017,16 @@ void CoreWorker::FreeObjectOnNodesAsync(const ObjectID &object_id,
                          << queue.size()
                          << " objects; it is draining slowly or is unreachable.";
       }
+      // Only the object that starts a new queue needs to schedule a flush; an
+      // in-flight reply drains everything queued behind it.
+      schedule_flush = queue.size() == 1 && !free_in_flight_.contains(node_id);
     }
-    SendFreeLocalObjectsBatchIfNeeded(node_id);
+    if (schedule_flush) {
+      // Send from io_service_ so the thread that dropped the last reference is not
+      // stalled by the RPC.
+      io_service_.post([this, node_id]() { SendFreeLocalObjectsBatchIfNeeded(node_id); },
+                       "CoreWorker.SendFreeLocalObjectsBatch");
+    }
   }
 }
 

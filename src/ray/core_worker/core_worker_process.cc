@@ -275,7 +275,7 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
       local_node_id, options.node_ip_address, options.node_manager_port);
   auto local_raylet_rpc_client =
       std::make_shared<rpc::RayletClient>(std::move(raylet_address),
-                                          *client_call_manager_,
+                                          *raylet_client_call_manager_,
                                           /*raylet_unavailable_timeout_callback=*/[] {});
   auto core_worker_server =
       std::make_unique<rpc::GrpcServer>(WorkerTypeString(options.worker_type),
@@ -342,7 +342,7 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
         auto core_worker = GetCoreWorker();
         return std::make_shared<ray::rpc::RayletClient>(
             addr,
-            *client_call_manager_,
+            *raylet_client_call_manager_,
             rpc::RayletClientPool::GetDefaultUnavailableTimeoutCallback(
                 core_worker->gcs_client_.get(),
                 core_worker->raylet_client_pool_.get(),
@@ -795,6 +795,8 @@ CoreWorkerProcessImpl::CoreWorkerProcessImpl(const CoreWorkerOptions &options)
       io_work_(io_service_.get_executor()),
       object_freed_callback_service_work_(object_freed_callback_service_.get_executor()),
       client_call_manager_(std::make_unique<rpc::ClientCallManager>(
+          io_service_, /*record_stats=*/false, options.node_ip_address)),
+      raylet_client_call_manager_(std::make_unique<rpc::ClientCallManager>(
           io_service_, /*record_stats=*/false, options.node_ip_address)),
       task_execution_service_work_(task_execution_service_.get_executor()),
       service_handler_(std::make_unique<CoreWorkerServiceHandlerProxy>()) {

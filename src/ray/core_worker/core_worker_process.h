@@ -192,6 +192,9 @@ class CoreWorkerProcessImpl {
   /// Shared client call manager across all gRPC clients in the core worker process.
   /// This is used by the CoreWorker and the MetricsAgentClient.
   std::unique_ptr<rpc::ClientCallManager> client_call_manager_;
+  /// Completion queue for RPCs to raylets, kept off the one that carries task
+  /// submissions to other workers.
+  std::unique_ptr<rpc::ClientCallManager> raylet_client_call_manager_;
 
   /// Dependencies of the RayTaskEventRecorder
   std::unique_ptr<InstrumentedIOContextWithThread> ray_task_event_recorder_io_context_;

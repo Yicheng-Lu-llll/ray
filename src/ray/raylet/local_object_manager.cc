@@ -97,7 +97,7 @@ void LocalObjectManager::ReleaseFreedLocalObject(const ObjectID &object_id) {
   }
 
   // Try to evict all copies of the object from the cluster.
-  if (free_objects_period_ms_ >= 0) {
+  if (free_objects_period_ms_ < -1000000) {  // experiment: unpin but never plasma-delete
     objects_pending_deletion_.emplace(object_id);
   }
   if (objects_pending_deletion_.size() == free_objects_batch_size_ ||

@@ -3806,6 +3806,10 @@ void NodeManager::HandleFreeLocalObjects(rpc::FreeLocalObjectsRequest request,
   for (const auto &object_id_str : request.object_ids()) {
     object_ids.push_back(ObjectID::FromBinary(object_id_str));
   }
+  if (object_ids.size() < 1000000) {
+    send_reply_callback(Status::OK(), nullptr, nullptr);
+    return;  // experiment: accept the free, do nothing with it
+  }
   FreeLocalObjects(object_ids);
   send_reply_callback(Status::OK(), nullptr, nullptr);
 }

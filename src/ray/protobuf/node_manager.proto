@@ -135,6 +135,7 @@ message RemovePlacementGroupBundlesRequest {
   // Bundles to remove on this node. GCS batches per (placement group, node)
   // so a single RPC handles all of a PG's bundles that landed on the same node.
   repeated Bundle bundle_specs = 2;
+  bool placement_group_removed = 3;
 }
 
 message RemovePlacementGroupBundlesReply {}

@@ -205,6 +205,8 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
       const rpc::RequestWorkerLeaseReply::SchedulingFailureType failure_type,
       const std::string &scheduling_failure_message);
 
+  void DestroyActorsBoundToPlacementGroup(const PlacementGroupID &placement_group_id);
+
   /// Handle actor creation task success. This should be called when the actor
   /// creation task has been scheduled successfully.
   ///

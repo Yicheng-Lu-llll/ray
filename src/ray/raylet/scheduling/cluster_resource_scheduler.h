@@ -185,7 +185,8 @@ class ClusterResourceScheduler {
       const rpc::SchedulingStrategy &scheduling_strategy,
       bool actor_creation,
       bool force_spillback,
-      const std::string &preferred_node_id);
+      const std::string &preferred_node_id,
+      bool actor_acquires_lifetime_resources = false);
 
   /// Same as above, with the resource request given as a map plus a label
   /// selector.
@@ -196,7 +197,8 @@ class ClusterResourceScheduler {
       bool requires_object_store_memory,
       bool actor_creation,
       bool force_spillback,
-      const std::string &preferred_node_id);
+      const std::string &preferred_node_id,
+      bool actor_acquires_lifetime_resources = false);
 
   /// Judging whether it affinity with placement group bundle
   bool IsAffinityWithBundleSchedule(const rpc::SchedulingStrategy &scheduling_strategy);
